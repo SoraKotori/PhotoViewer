@@ -49,6 +49,8 @@ Config ParseConfig() {
         } else if (argument == L"--validation-fullscreen") {
             config.validation_fullscreen = true;
             config.validation_exit_after_present = true;
+        } else if (argument == L"--validation-short-presses") {
+            config.validation_short_presses = true;
         } else if (argument.starts_with(L"--validation-navigation=")) {
             config.validation_navigation = argument.substr(
                 std::wstring_view(L"--validation-navigation=").size());
@@ -99,6 +101,21 @@ Config ParseConfig() {
         } else if (argument.starts_with(L"--compressed-budget-mib=")) {
             config.compressed_budget_bytes =
                 ParseMibOption(argument, L"--compressed-budget-mib=");
+        } else if (argument.starts_with(L"--cpu-surface-slot-count=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--cpu-surface-slot-count=").size()));
+            if (!value || *value > 4096) throw std::invalid_argument("invalid CPU surface slot count");
+            config.cpu_surface_slot_count = *value;
+        } else if (argument.starts_with(L"--gpu-texture-slot-count=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--gpu-texture-slot-count=").size()));
+            if (!value || *value > 4096) throw std::invalid_argument("invalid GPU texture slot count");
+            config.gpu_texture_slot_count = *value;
+        } else if (argument.starts_with(L"--compressed-slot-count=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--compressed-slot-count=").size()));
+            if (!value || *value > 4096) throw std::invalid_argument("invalid compressed slot count");
+            config.compressed_slot_count = *value;
         } else if (argument.starts_with(L"--workers=")) {
             const auto value = ParsePositive(argument.substr(std::wstring_view(L"--workers=").size()));
             if (!value || *value > 256) throw std::invalid_argument("invalid worker count");

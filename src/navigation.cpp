@@ -10,6 +10,7 @@ void NavigationState::Reset(const std::size_t initial_index, const std::size_t i
     current_index_ = initial_index;
     initial_pending_ = image_count != 0;
     held_direction_ = 0;
+    last_direction_ = 0;
     committed_.clear();
     repeated_.clear();
 }
@@ -34,6 +35,7 @@ void NavigationState::Step(const int direction, const bool repeat) {
         (direction > 0 && projected + 1 >= image_count_)) {
         return;
     }
+    last_direction_ = direction;
     (repeat ? repeated_ : committed_).push_back(direction);
 }
 
@@ -89,7 +91,7 @@ int NavigationState::PreferredDirection() const noexcept {
     if (held_direction_ != 0) return held_direction_;
     if (!committed_.empty()) return committed_.front();
     if (!repeated_.empty()) return repeated_.front();
-    return 1;
+    return last_direction_;
 }
 
 }  // namespace pv

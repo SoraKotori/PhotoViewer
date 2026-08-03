@@ -60,7 +60,8 @@ Catalog BuildCatalog(const std::filesystem::path& initial_image) {
     return catalog;
 }
 
-Catalog BuildCatalogFromList(const std::filesystem::path& list_file) {
+Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
+                             const std::filesystem::path& initial_image) {
     std::ifstream input(list_file, std::ios::binary);
     if (!input) throw std::invalid_argument("validation file list does not exist");
 
@@ -77,7 +78,16 @@ Catalog BuildCatalogFromList(const std::filesystem::path& list_file) {
         catalog.items.push_back(Describe(path));
     }
     if (catalog.items.empty()) throw std::invalid_argument("validation file list is empty");
-    catalog.initial_index = 0;
+    const std::filesystem::path absolute = std::filesystem::absolute(initial_image);
+    const auto found = std::find_if(catalog.items.begin(), catalog.items.end(),
+                                    [&](const CatalogItem& item) {
+                                        return SamePath(item.path, absolute);
+                                    });
+    if (found == catalog.items.end()) {
+        throw std::invalid_argument("initial PNG is absent from validation file list");
+    }
+    catalog.initial_index = static_cast<std::size_t>(
+        std::distance(catalog.items.begin(), found));
     return catalog;
 }
 

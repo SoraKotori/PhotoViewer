@@ -20,6 +20,6 @@
     <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="tests\core_tests.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\resource_slots.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

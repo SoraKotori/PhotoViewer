@@ -20,6 +20,7 @@ struct Catalog {
 };
 
 Catalog BuildCatalog(const std::filesystem::path& initial_image);
-Catalog BuildCatalogFromList(const std::filesystem::path& list_file);
+Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
+                             const std::filesystem::path& initial_image);
 
 }  // namespace pv

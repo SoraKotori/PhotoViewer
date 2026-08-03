@@ -57,6 +57,47 @@ void TestSpng() {
                 "Decode grayscale-alpha PNG with libspng/zlib-ng fallback");
 }
 
+void TestCancelledWorkReleasesInput() {
+    pv::ResourceSlots slots(1, 1, 1, pv::MiB(1), pv::MiB(1));
+    const pv::SlotId compressed_slot = slots.AcquireCompressed(4096, 0, 1);
+    const pv::SlotId cpu_surface_slot = slots.AcquireCpuSurface(4096, 0, 1);
+    Check(compressed_slot != pv::kInvalidSlot &&
+              cpu_surface_slot != pv::kInvalidSlot,
+          "allocate cancellation test slots");
+
+    auto token = std::make_shared<pv::WorkToken>();
+    token->claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
+    pv::WorkQueue work_queue(1);
+    pv::CompletionQueue completion_queue;
+    {
+        pv::DecoderPool pool(1, work_queue, completion_queue, slots, nullptr);
+        pv::DecodeWork work{0, 1, token, compressed_slot, cpu_surface_slot};
+        Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
+
+        std::vector<pv::DecodeResult> results;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(5);
+        while (results.empty() && std::chrono::steady_clock::now() < deadline) {
+            results = completion_queue.Drain();
+            if (results.empty()) Sleep(1);
+        }
+        Check(results.size() == 1 && results.front().cancelled,
+              "worker must report work cancelled before claim");
+
+        std::vector<pv::ReleasedInput> released =
+            completion_queue.DrainReleasedInputs();
+        Check(released.size() == 1 &&
+                  released.front().compressed_slot == compressed_slot,
+              "cancelled work must release its compressed input exactly once");
+    }
+
+    slots.ReleaseCompressed(compressed_slot);
+    slots.ReleaseCpuSurface(cpu_surface_slot);
+    Check(slots.FreeCompressedCount() == 1 &&
+              slots.FreeCpuSurfaceCount() == 1,
+          "cancelled work slots must return to their free indexes");
+}
+
 void TestGraphics(const HINSTANCE instance) {
     constexpr wchar_t class_name[] = L"PhotoViewer.RuntimeTest";
     WNDCLASSW window_class{};
@@ -83,11 +124,12 @@ void TestGraphics(const HINSTANCE instance) {
             surface->pixels[offset + 2] = std::byte{0xE0};
             surface->pixels[offset + 3] = std::byte{0xFF};
         }
-        pv::UploadTicket ticket = graphics.SubmitUpload(0, 1, std::move(surface));
+        pv::GpuImage image;
+        pv::UploadTicket ticket = graphics.SubmitUpload(0, 1, *surface, image);
         graphics.ArmFence(ticket.fence_value);
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "D3D11 fence completion");
-        pv::GpuImage image = graphics.FinishUpload(ticket);
+        graphics.FinishUpload(image);
         Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
               "initial frame credit");
         graphics.Draw(image);
@@ -225,13 +267,13 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     constexpr std::size_t frames = 30;
     const auto begin = std::chrono::steady_clock::now();
     for (std::size_t index = 0; index < frames; ++index) {
-        pv::UploadTicket ticket = graphics.SubmitUpload(index, 1, std::move(surface));
+        pv::GpuImage image;
+        pv::UploadTicket ticket = graphics.SubmitUpload(index, 1, *surface, image);
         graphics.ArmFence(ticket.fence_value);
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "graphics benchmark upload fence");
-        pv::GpuImage image = graphics.FinishUpload(ticket);
+        graphics.FinishUpload(image);
         graphics.Draw(image);
-        surface = std::move(ticket.source);
         if (index + 1 < frames) {
             Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
                   "graphics benchmark frame credit");
@@ -259,8 +301,9 @@ int wmain(const int argc, wchar_t** const argv) {
             return BenchmarkDecode(argv[2], workers);
         }
         TestSpng();
+        TestCancelledWorkReleasesInput();
         TestGraphics(GetModuleHandleW(nullptr));
-        std::cout << "PASS: libspng/libdeflate decode with zlib-ng fallback, D3D11 upload/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, D3D11 upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -15,20 +15,22 @@ struct IoRequest {
     HWND window = nullptr;
     std::size_t index = 0;
     std::uint64_t generation = 0;
-    std::shared_ptr<CompressedBuffer> compressed;
+    SlotId compressed_slot = kInvalidSlot;
     std::atomic<DWORD> result{ERROR_IO_PENDING};
     std::atomic<ULONG_PTR> transferred{0};
 };
 
+enum class ImageDemandState : std::uint8_t { Outside, Requested, Failed };
+
 struct ImageRecord {
-    PipelineStage stage = PipelineStage::Outside;
+    ImageDemandState demand = ImageDemandState::Outside;
     std::uint64_t generation = 0;
     std::size_t reserved_output_bytes = 0;
     std::unique_ptr<IoRequest> io;
-    std::shared_ptr<CompressedBuffer> compressed;
     std::shared_ptr<WorkToken> work_token;
-    std::unique_ptr<CpuSurface> cpu;
-    GpuImage gpu;
+    SlotId compressed_slot = kInvalidSlot;
+    SlotId cpu_surface_slot = kInvalidSlot;
+    SlotId gpu_texture_slot = kInvalidSlot;
 };
 
 struct BufferRanges {
@@ -48,12 +50,9 @@ struct ResourceContext {
     std::uint64_t generation = 1;
 
     std::size_t compressed_bytes = 0;
-    std::size_t compressed_committed_bytes = 0;
     std::size_t reserved_output_bytes = 0;
-    std::size_t cpu_committed_bytes = 0;
     std::size_t gpu_bytes = 0;
-    std::vector<std::unique_ptr<CpuSurface>> free_surfaces;
-    std::vector<std::shared_ptr<CompressedBuffer>> free_compressed;
+    std::unique_ptr<ResourceSlots> slots;
     std::deque<UploadTicket> uploads;
 
     bool frame_credit = false;
@@ -111,12 +110,7 @@ private:
     [[nodiscard]] bool InGpuRange(std::size_t index) const noexcept;
     [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(PipelineStage stage,
                                                                  bool gpu_range) const;
-    std::unique_ptr<CpuSurface> AcquireSurface(const CatalogItem& item);
-    std::shared_ptr<CompressedBuffer> AcquireCompressed(std::size_t bytes);
-    void ReleaseCompressedBuffer(std::shared_ptr<CompressedBuffer> buffer);
-    void ReleaseSurface(std::unique_ptr<CpuSurface> surface);
-    void TrimFreeSurfaces(std::size_t bytes_needed);
-    void EvictCpuCopiesForBudget(std::size_t bytes_needed);
+    [[nodiscard]] PipelineStage StageOf(const ImageRecord& image) const noexcept;
     void ReleaseCompressed(ImageRecord& image);
     void ReleaseReservation(ImageRecord& image);
     void EvictGpu(std::size_t index);

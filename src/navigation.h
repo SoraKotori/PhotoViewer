@@ -33,6 +33,7 @@ private:
     std::size_t current_index_ = 0;
     bool initial_pending_ = false;
     int held_direction_ = 0;
+    int last_direction_ = 0;
     std::deque<int> committed_;
     std::deque<int> repeated_;
 };

@@ -124,14 +124,15 @@ void Graphics::Resize(const UINT width, const UINT height) {
 
 UploadTicket Graphics::SubmitUpload(const std::size_t index,
                                     const std::uint64_t generation,
-                                    std::unique_ptr<CpuSurface> source) {
+                                    const CpuSurface& source,
+                                    GpuImage& destination) {
     const auto begin = std::chrono::steady_clock::now();
-    if (!source || !source->pixels || source->ByteSize() == 0) {
+    if (!source.pixels || source.ByteSize() == 0) {
         throw std::invalid_argument("empty CPU surface");
     }
     D3D11_TEXTURE2D_DESC description{};
-    description.Width = source->width;
-    description.Height = source->height;
+    description.Width = source.width;
+    description.Height = source.height;
     description.MipLevels = 1;
     description.ArraySize = 1;
     description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -142,19 +143,22 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     UploadTicket ticket;
     ticket.index = index;
     ticket.generation = generation;
-    ticket.width = source->width;
-    ticket.height = source->height;
-    ticket.bytes = source->ByteSize();
+    ticket.width = source.width;
+    ticket.height = source.height;
+    ticket.bytes = source.ByteSize();
     D3D11_SUBRESOURCE_DATA initial{};
-    initial.pSysMem = source->pixels;
-    initial.SysMemPitch = source->stride;
-    initial.SysMemSlicePitch = static_cast<UINT>(source->ByteSize());
-    CheckHr(device_->CreateTexture2D(&description, &initial, &ticket.texture),
+    initial.pSysMem = source.pixels;
+    initial.SysMemPitch = source.stride;
+    initial.SysMemSlicePitch = static_cast<UINT>(source.ByteSize());
+    destination = {};
+    CheckHr(device_->CreateTexture2D(&description, &initial, &destination.texture),
             "Create initialized GPU image texture");
+    destination.width = source.width;
+    destination.height = source.height;
+    destination.bytes = source.ByteSize();
     ticket.fence_value = next_fence_value_++;
     CheckHr(context_->Signal(fence_.Get(), ticket.fence_value),
             "ID3D11DeviceContext4::Signal");
-    ticket.source = std::move(source);
     upload_nanoseconds_ += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin).count());
@@ -162,12 +166,7 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     return ticket;
 }
 
-GpuImage Graphics::FinishUpload(UploadTicket& ticket) {
-    GpuImage image;
-    image.texture = std::move(ticket.texture);
-    image.width = ticket.width;
-    image.height = ticket.height;
-    image.bytes = ticket.bytes;
+void Graphics::FinishUpload(GpuImage& image) {
     ComPtr<IDXGISurface> surface;
     CheckHr(image.texture.As(&surface), "Query uploaded IDXGISurface");
     const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
@@ -178,8 +177,6 @@ GpuImage Graphics::FinishUpload(UploadTicket& ticket) {
     CheckHr(d2d_context_->CreateBitmapFromDxgiSurface(surface.Get(), &properties,
                                                       &image.bitmap),
             "Create Direct2D source bitmap");
-    ticket.staging.Reset();
-    return image;
 }
 
 void Graphics::Draw(const GpuImage& image) {
