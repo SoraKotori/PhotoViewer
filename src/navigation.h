@@ -18,6 +18,7 @@ public:
 
     [[nodiscard]] std::pair<std::size_t, std::size_t> RequiredBounds() const;
     [[nodiscard]] int PreferredDirection() const noexcept;
+    [[nodiscard]] int HeldDirection() const noexcept { return held_direction_; }
     [[nodiscard]] std::size_t CurrentIndex() const noexcept { return current_index_; }
     [[nodiscard]] bool InitialPending() const noexcept { return initial_pending_; }
     [[nodiscard]] bool Empty() const noexcept {

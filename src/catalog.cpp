@@ -2,17 +2,10 @@
 
 #include "common.h"
 
-#include <array>
 #include <fstream>
 
 namespace pv {
 namespace {
-
-struct HandleCloser {
-    void operator()(void* value) const noexcept {
-        if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value);
-    }
-};
 
 bool IsPngExtension(const std::filesystem::path& path) {
     const std::wstring extension = path.extension().wstring();
@@ -25,25 +18,14 @@ bool SamePath(const std::filesystem::path& left, const std::filesystem::path& ri
     return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
-CatalogItem Probe(const std::filesystem::path& path) {
+CatalogItem Describe(const std::filesystem::path& path) {
     CatalogItem item;
     item.path = path;
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return item;
-    const std::unique_ptr<void, HandleCloser> close(file);
-
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) return item;
-    item.file_bytes = static_cast<std::uint64_t>(size.QuadPart);
-    std::array<std::byte, 33> header{};
-    DWORD read = 0;
-    if (!ReadFile(file, header.data(), static_cast<DWORD>(header.size()), &read, nullptr)) return item;
-    const auto parsed = ParsePngHeader(std::span(header.data(), read));
-    if (!parsed) return item;
-    item.png = *parsed;
-    item.header_valid = true;
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+    if (!error && size <= std::numeric_limits<std::uint64_t>::max()) {
+        item.file_bytes = static_cast<std::uint64_t>(size);
+    }
     return item;
 }
 
@@ -60,7 +42,7 @@ Catalog BuildCatalog(const std::filesystem::path& initial_image) {
     Catalog catalog;
     for (const auto& entry : std::filesystem::directory_iterator(absolute.parent_path())) {
         if (entry.is_regular_file() && IsPngExtension(entry.path())) {
-            catalog.items.push_back(Probe(entry.path()));
+            catalog.items.push_back(Describe(entry.path()));
         }
     }
     std::sort(catalog.items.begin(), catalog.items.end(), [](const CatalogItem& left,
@@ -92,11 +74,7 @@ Catalog BuildCatalogFromList(const std::filesystem::path& list_file) {
         if (!std::filesystem::is_regular_file(path) || !IsPngExtension(path)) {
             throw std::invalid_argument("validation file list contains an invalid PNG path");
         }
-        CatalogItem item = Probe(path);
-        if (!item.header_valid) {
-            throw std::invalid_argument("validation file list contains an invalid PNG file");
-        }
-        catalog.items.push_back(std::move(item));
+        catalog.items.push_back(Describe(path));
     }
     if (catalog.items.empty()) throw std::invalid_argument("validation file list is empty");
     catalog.initial_index = 0;

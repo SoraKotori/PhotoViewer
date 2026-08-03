@@ -19,6 +19,11 @@ public:
                               std::unique_ptr<CpuSurface> source);
     GpuImage FinishUpload(UploadTicket& ticket);
     void Draw(const GpuImage& image);
+    void ResetMetrics() noexcept;
+    [[nodiscard]] std::uint64_t UploadCount() const noexcept;
+    [[nodiscard]] std::uint64_t UploadNanoseconds() const noexcept;
+    [[nodiscard]] std::uint64_t DrawCount() const noexcept;
+    [[nodiscard]] std::uint64_t DrawNanoseconds() const noexcept;
 
     [[nodiscard]] HANDLE FrameWaitableObject() const noexcept { return frame_waitable_; }
     [[nodiscard]] HANDLE FenceEvent() const noexcept { return fence_event_; }
@@ -49,6 +54,10 @@ private:
     ComPtr<ID2D1Device2> d2d_device_;
     ComPtr<ID2D1DeviceContext2> d2d_context_;
     ComPtr<ID2D1Bitmap1> back_buffer_target_;
+    std::uint64_t upload_count_ = 0;
+    std::uint64_t upload_nanoseconds_ = 0;
+    std::uint64_t draw_count_ = 0;
+    std::uint64_t draw_nanoseconds_ = 0;
 };
 
 }  // namespace pv

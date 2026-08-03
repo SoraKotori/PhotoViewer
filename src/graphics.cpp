@@ -125,6 +125,7 @@ void Graphics::Resize(const UINT width, const UINT height) {
 UploadTicket Graphics::SubmitUpload(const std::size_t index,
                                     const std::uint64_t generation,
                                     std::unique_ptr<CpuSurface> source) {
+    const auto begin = std::chrono::steady_clock::now();
     if (!source || !source->pixels || source->ByteSize() == 0) {
         throw std::invalid_argument("empty CPU surface");
     }
@@ -154,6 +155,10 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     CheckHr(context_->Signal(fence_.Get(), ticket.fence_value),
             "ID3D11DeviceContext4::Signal");
     ticket.source = std::move(source);
+    upload_nanoseconds_ += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+    ++upload_count_;
     return ticket;
 }
 
@@ -179,6 +184,7 @@ GpuImage Graphics::FinishUpload(UploadTicket& ticket) {
 
 void Graphics::Draw(const GpuImage& image) {
     if (!image.bitmap || surface_width_ == 0 || surface_height_ == 0) return;
+    const auto begin = std::chrono::steady_clock::now();
     const float sx = static_cast<float>(surface_width_) / static_cast<float>(image.width);
     const float sy = static_cast<float>(surface_height_) / static_cast<float>(image.height);
     const float scale = std::min(sx, sy);
@@ -197,7 +203,23 @@ void Graphics::Draw(const GpuImage& image) {
                              D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, source);
     CheckHr(d2d_context_->EndDraw(), "Direct2D EndDraw");
     CheckHr(swap_chain_->Present(1, 0), "DXGI Present");
+    draw_nanoseconds_ += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+    ++draw_count_;
 }
+
+void Graphics::ResetMetrics() noexcept {
+    upload_count_ = 0;
+    upload_nanoseconds_ = 0;
+    draw_count_ = 0;
+    draw_nanoseconds_ = 0;
+}
+
+std::uint64_t Graphics::UploadCount() const noexcept { return upload_count_; }
+std::uint64_t Graphics::UploadNanoseconds() const noexcept { return upload_nanoseconds_; }
+std::uint64_t Graphics::DrawCount() const noexcept { return draw_count_; }
+std::uint64_t Graphics::DrawNanoseconds() const noexcept { return draw_nanoseconds_; }
 
 UINT64 Graphics::CompletedFenceValue() const noexcept {
     return fence_ ? fence_->GetCompletedValue() : 0;

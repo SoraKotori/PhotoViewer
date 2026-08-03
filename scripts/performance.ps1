@@ -9,6 +9,8 @@ param(
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
     [int]$Workers = 12,
+    [ValidateRange(0, 1000)]
+    [int]$NavigationIntervalMs = 0,
     [ValidateRange(0.01, 1000.0)]
     [double]$TargetFps = 30.0
 )
@@ -75,17 +77,23 @@ foreach ($file in $usedFiles) {
 $navigation = 'R' * $Steps
 $measurements = @()
 for ($run = 1; $run -le $Runs; ++$run) {
+    $report = Join-Path $resultDirectory "performance-report-$run.txt"
+    $arguments = @(
+        ('"' + $sample + '"'),
+        "--workers=$Workers",
+        "--validation-file-list=$fileList",
+        "--validation-navigation=$navigation",
+        "--validation-warmup-ms=$WarmupMs",
+        "--validation-report=$report",
+        '--validation-elapsed-exit-code',
+        '--validation-timeout-ms=60000'
+    )
+    if ($NavigationIntervalMs -gt 0) {
+        $arguments += "--validation-navigation-interval-ms=$NavigationIntervalMs"
+    }
     $process = Start-Process `
         -FilePath $viewer `
-        -ArgumentList @(
-            ('"' + $sample + '"'),
-            "--workers=$Workers",
-            "--validation-file-list=$fileList",
-            "--validation-navigation=$navigation",
-            "--validation-warmup-ms=$WarmupMs",
-            '--validation-elapsed-exit-code',
-            '--validation-timeout-ms=60000'
-        ) `
+        -ArgumentList $arguments `
         -WindowStyle Hidden `
         -Wait `
         -PassThru
@@ -119,6 +127,7 @@ $average = ($measurements | Measure-Object -Average).Average
     Workers = $Workers
     StepsPerRun = $Steps
     WarmupMs = $WarmupMs
+    NavigationIntervalMs = $NavigationIntervalMs
     TargetImagesPerSecond = $TargetFps
     MinimumImagesPerSecond = [math]::Round($minimum, 2)
     AverageImagesPerSecond = [math]::Round($average, 2)

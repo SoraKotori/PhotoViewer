@@ -74,6 +74,8 @@ private:
     static void CALLBACK IoCompletion(PTP_CALLBACK_INSTANCE instance, void* context,
                                       void* overlapped, ULONG io_result,
                                       ULONG_PTR transferred, PTP_IO io);
+    static void CALLBACK ValidationTimerCallback(PTP_CALLBACK_INSTANCE instance,
+                                                 void* context, PTP_TIMER timer);
 
     void InitializeWindow(HINSTANCE instance, int show_command);
     int EventLoop();
@@ -90,6 +92,9 @@ private:
     void OnPaint();
     void ToggleFullscreen();
     void InjectValidationNavigation();
+    void InjectValidationNavigationStep();
+    void StopValidationNavigationTimer();
+    void WriteValidationReport(std::string_view phase, bool truncate);
     void BeginFullscreenValidation();
     void OnFullscreenValidationTimer();
 
@@ -117,6 +122,7 @@ private:
     void EvictGpu(std::size_t index);
     void CancelAllIo();
     void ArmOldestFence();
+    [[nodiscard]] std::size_t CountStage(PipelineStage stage) const noexcept;
 
     Config config_;
     HWND window_ = nullptr;
@@ -131,8 +137,10 @@ private:
     LONG_PTR validation_windowed_style_ = 0;
     bool validation_script_injected_ = false;
     bool validation_script_scheduled_ = false;
+    std::size_t validation_navigation_cursor_ = 0;
     std::size_t validation_expected_index_ = 0;
     std::chrono::steady_clock::time_point validation_navigation_started_{};
+    PTP_TIMER validation_navigation_timer_ = nullptr;
     int exit_code_ = 0;
 
     Graphics graphics_;

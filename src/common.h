@@ -52,5 +52,6 @@ constexpr std::size_t MiB(const std::size_t value) noexcept {
 
 constexpr UINT kMessageIoComplete = WM_APP + 1;
 constexpr UINT kMessageWorkerComplete = WM_APP + 2;
+constexpr UINT kMessageValidationStep = WM_APP + 3;
 
 }  // namespace pv

@@ -2,7 +2,9 @@
 
 #include "common.h"
 
+#include <array>
 #include <cmath>
+#include <fstream>
 #include <numeric>
 
 namespace pv {
@@ -33,22 +35,23 @@ App::App(Config config)
     : config_(std::move(config)), work_queue_(config_.work_queue_capacity) {}
 
 App::~App() {
+    StopValidationNavigationTimer();
     decoders_.reset();
     CancelAllIo();
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
     InitializeWindow(instance, show_command);
-    graphics_.Initialize(window_);
-    graphics_ready_ = true;
     decoders_ = std::make_unique<DecoderPool>(config_.worker_count, work_queue_,
                                               completion_queue_, window_);
+    if (!config_.initial_image.empty()) OpenInitialImage();
+    graphics_.Initialize(window_);
+    graphics_ready_ = true;
     ShowWindow(window_, config_.validation_exit_after_present ? SW_HIDE : show_command);
     if (!config_.validation_exit_after_present) UpdateWindow(window_);
     if (config_.validation_exit_after_present) {
         SetTimer(window_, 1, config_.validation_timeout_ms, nullptr);
     }
-    if (!config_.initial_image.empty()) OpenInitialImage();
     return EventLoop();
 }
 
@@ -110,6 +113,9 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
         case kMessageWorkerComplete:
             OnWorkerComplete();
             return 0;
+        case kMessageValidationStep:
+            InjectValidationNavigationStep();
+            return 0;
         case WM_SIZE:
             if (graphics_ready_ && wparam != SIZE_MINIMIZED) {
                 OnSurfaceChanged(LOWORD(lparam), HIWORD(lparam));
@@ -139,6 +145,7 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
             KillTimer(window_, 1);
             KillTimer(window_, 2);
             KillTimer(window_, 3);
+            StopValidationNavigationTimer();
             running_ = false;
             PostQuitMessage(exit_code_);
             return 0;
@@ -171,7 +178,11 @@ int App::EventLoop() {
         }
 
         MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        constexpr int message_batch_limit = 8;
+        for (int processed = 0;
+             processed < message_batch_limit &&
+             PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE);
+             ++processed) {
             if (message.message == WM_QUIT) {
                 running_ = false;
                 exit_code = static_cast<int>(message.wParam);
@@ -194,7 +205,7 @@ void App::OpenInitialImage() {
     for (std::size_t index = 0; index < resources_.images.size(); ++index) {
         auto& image = resources_.images[index];
         image.generation = resources_.generation;
-        image.stage = resources_.catalog.items[index].header_valid
+        image.stage = resources_.catalog.items[index].file_bytes != 0
                           ? PipelineStage::Outside
                           : PipelineStage::Failed;
     }
@@ -226,6 +237,12 @@ void CALLBACK App::IoCompletion(PTP_CALLBACK_INSTANCE, void* context, void*,
                  reinterpret_cast<WPARAM>(request), 0);
 }
 
+void CALLBACK App::ValidationTimerCallback(PTP_CALLBACK_INSTANCE, void* context,
+                                           PTP_TIMER) {
+    auto* app = static_cast<App*>(context);
+    PostMessageW(app->window_, kMessageValidationStep, 0, 0);
+}
+
 void App::OnIoComplete(IoRequest* const request) {
     if (!request || request->index >= resources_.images.size()) return;
     ImageRecord& image = resources_.images[request->index];
@@ -245,8 +262,21 @@ void App::OnIoComplete(IoRequest* const request) {
     auto completed = std::move(image.io);
 
     if (success && current && InCpuRange(request->index)) {
-        image.compressed = std::move(completed->compressed);
-        image.stage = PipelineStage::CompressedReady;
+        CatalogItem& item = resources_.catalog.items[request->index];
+        const auto header = ParsePngHeader(std::span<const std::byte>(
+            completed->compressed->data, completed->compressed->size));
+        if (header) {
+            item.png = *header;
+            item.header_valid = true;
+            image.compressed = std::move(completed->compressed);
+            image.stage = PipelineStage::CompressedReady;
+        } else {
+            if (resources_.compressed_bytes >= allocation) {
+                resources_.compressed_bytes -= allocation;
+            }
+            ReleaseCompressedBuffer(std::move(completed->compressed));
+            image.stage = PipelineStage::Failed;
+        }
     } else {
         if (resources_.compressed_bytes >= allocation) resources_.compressed_bytes -= allocation;
         ReleaseCompressedBuffer(std::move(completed->compressed));
@@ -282,7 +312,7 @@ void App::OnWorkerComplete() {
         image.work_token.reset();
         if (result.success && InCpuRange(result.index)) {
             image.cpu = std::move(result.surface);
-            image.stage = PipelineStage::CpuReady;
+            image.stage = PipelineStage::DecodedPixelSurfaceAvailable;
         } else {
             ReleaseSurface(std::move(result.surface));
             if (!result.cancelled && FAILED(result.error) && InCpuRange(result.index)) {
@@ -292,6 +322,9 @@ void App::OnWorkerComplete() {
                                                        : PipelineStage::Outside;
             }
         }
+    }
+    if (completion_queue_.AcknowledgeNotification()) {
+        PostMessageW(window_, kMessageWorkerComplete, 0, 0);
     }
     PumpPipeline();
 }
@@ -312,13 +345,13 @@ void App::OnGpuComplete() {
                                ticket.index == resources_.navigation.CurrentIndex());
         if (keep_gpu) {
             image.gpu = graphics_.FinishUpload(ticket);
-            image.stage = PipelineStage::GpuReady;
+            image.stage = PipelineStage::PresentationTextureAvailable;
             ReleaseSurface(std::move(ticket.source));
         } else {
             if (resources_.gpu_bytes >= ticket.bytes) resources_.gpu_bytes -= ticket.bytes;
             if (ticket.generation == image.generation && InCpuRange(ticket.index)) {
                 image.cpu = std::move(ticket.source);
-                image.stage = PipelineStage::CpuReady;
+                image.stage = PipelineStage::DecodedPixelSurfaceAvailable;
             } else {
                 ReleaseSurface(std::move(ticket.source));
                 image.stage = PipelineStage::Outside;
@@ -444,19 +477,135 @@ void App::InjectValidationNavigation() {
     if (validation_script_injected_ || config_.validation_navigation.empty()) return;
     validation_script_injected_ = true;
     validation_expected_index_ = resources_.navigation.CurrentIndex();
+    validation_navigation_cursor_ = 0;
     validation_navigation_started_ = std::chrono::steady_clock::now();
-    for (const wchar_t step : config_.validation_navigation) {
-        const int direction = step == L'L' ? -1 : 1;
-        if (direction < 0 && validation_expected_index_ > 0) {
-            --validation_expected_index_;
-        } else if (direction > 0 &&
-                   validation_expected_index_ + 1 < resources_.images.size()) {
-            ++validation_expected_index_;
+    WriteValidationReport("warmup-complete", true);
+    decoders_->ResetMetrics();
+    graphics_.ResetMetrics();
+    if (config_.validation_navigation_interval_ms == 0) {
+        for (const wchar_t step : config_.validation_navigation) {
+            const int direction = step == L'L' ? -1 : 1;
+            if (direction < 0 && validation_expected_index_ > 0) {
+                --validation_expected_index_;
+            } else if (direction > 0 &&
+                       validation_expected_index_ + 1 < resources_.images.size()) {
+                ++validation_expected_index_;
+            }
+            resources_.navigation.Step(direction, false);
+            resources_.navigation.Release(direction);
+            ++validation_navigation_cursor_;
         }
-        resources_.navigation.Step(direction, false);
-        resources_.navigation.Release(direction);
+        PumpPipeline();
+        return;
+    }
+    InjectValidationNavigationStep();
+    if (validation_navigation_cursor_ < config_.validation_navigation.size()) {
+        validation_navigation_timer_ = CreateThreadpoolTimer(
+            &App::ValidationTimerCallback, this, nullptr);
+        if (!validation_navigation_timer_) {
+            ThrowLastError("CreateThreadpoolTimer validation navigation");
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(
+            config_.validation_navigation_interval_ms) * 10'000LL;
+        SetThreadpoolTimer(validation_navigation_timer_,
+                           reinterpret_cast<FILETIME*>(&due),
+                           config_.validation_navigation_interval_ms, 0);
+    }
+}
+
+void App::InjectValidationNavigationStep() {
+    if (validation_navigation_cursor_ >= config_.validation_navigation.size()) {
+        StopValidationNavigationTimer();
+        return;
+    }
+    const wchar_t step = config_.validation_navigation[validation_navigation_cursor_];
+    const int direction = step == L'L' ? -1 : 1;
+    if (direction < 0 && validation_expected_index_ > 0) {
+        --validation_expected_index_;
+    } else if (direction > 0 &&
+               validation_expected_index_ + 1 < resources_.images.size()) {
+        ++validation_expected_index_;
+    }
+    resources_.navigation.Step(direction, validation_navigation_cursor_ != 0);
+    ++validation_navigation_cursor_;
+    if (validation_navigation_cursor_ >= config_.validation_navigation.size()) {
+        StopValidationNavigationTimer();
     }
     PumpPipeline();
+    if (validation_navigation_cursor_ == 1 || validation_navigation_cursor_ == 10 ||
+        validation_navigation_cursor_ == 30 || validation_navigation_cursor_ == 60) {
+        const std::string phase = "navigation-step-" +
+                                  std::to_string(validation_navigation_cursor_);
+        WriteValidationReport(phase, false);
+    }
+}
+
+void App::StopValidationNavigationTimer() {
+    if (!validation_navigation_timer_) return;
+    SetThreadpoolTimer(validation_navigation_timer_, nullptr, 0, 0);
+    WaitForThreadpoolTimerCallbacks(validation_navigation_timer_, TRUE);
+    CloseThreadpoolTimer(validation_navigation_timer_);
+    validation_navigation_timer_ = nullptr;
+}
+
+void App::WriteValidationReport(const std::string_view phase, const bool truncate) {
+    if (config_.validation_report.empty()) return;
+    std::ofstream output(config_.validation_report,
+                         std::ios::out | (truncate ? std::ios::trunc : std::ios::app));
+    if (!output) return;
+    constexpr std::array names{"Outside", "WaitingIo", "IoInFlight", "CompressedReady",
+                               "DecodeQueued", "DecodedPixelSurfaceAvailable", "Uploading",
+                               "PresentationTextureAvailable",
+                               "CancelPending", "Failed"};
+    std::array<std::size_t, names.size()> counts{};
+    for (const ImageRecord& image : resources_.images) {
+        const std::size_t stage = static_cast<std::size_t>(image.stage);
+        if (stage < counts.size()) ++counts[stage];
+    }
+    output << "phase=" << phase << '\n';
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        output << names[index] << '=' << counts[index] << '\n';
+    }
+    const auto write_indices = [&](const std::string_view name,
+                                   const PipelineStage stage) {
+        output << name << '=';
+        bool first = true;
+        for (std::size_t index = 0; index < resources_.images.size(); ++index) {
+            if (resources_.images[index].stage != stage) continue;
+            if (!first) output << ',';
+            output << index;
+            first = false;
+        }
+        output << '\n';
+    };
+    write_indices("DecodedPixelSurfaceAvailable_indices",
+                  PipelineStage::DecodedPixelSurfaceAvailable);
+    write_indices("Uploading_indices", PipelineStage::Uploading);
+    write_indices("PresentationTextureAvailable_indices",
+                  PipelineStage::PresentationTextureAvailable);
+    output << "compressed_bytes=" << resources_.compressed_bytes << '\n'
+           << "cpu_committed_bytes=" << resources_.cpu_committed_bytes << '\n'
+           << "gpu_bytes=" << resources_.gpu_bytes << '\n'
+           << "free_surfaces=" << resources_.free_surfaces.size() << '\n'
+           << "work_queue=" << work_queue_.Size() << '\n'
+           << "uploads=" << resources_.uploads.size() << '\n'
+           << "held_direction=" << resources_.navigation.HeldDirection() << '\n'
+           << "current_index=" << resources_.navigation.CurrentIndex() << '\n'
+           << "next_index=";
+    if (const auto next = resources_.navigation.NextIndex()) {
+        output << *next;
+    } else {
+        output << "none";
+    }
+    output << '\n'
+           << "validation_cursor=" << validation_navigation_cursor_ << '\n'
+           << "decode_count=" << decoders_->DecodeCount() << '\n'
+           << "decode_nanoseconds=" << decoders_->DecodeNanoseconds() << '\n'
+           << "upload_count=" << graphics_.UploadCount() << '\n'
+           << "upload_nanoseconds=" << graphics_.UploadNanoseconds() << '\n'
+           << "draw_count=" << graphics_.DrawCount() << '\n'
+           << "draw_nanoseconds=" << graphics_.DrawNanoseconds() << '\n';
 }
 
 void App::PumpPipeline() {
@@ -469,6 +618,12 @@ void App::PumpPipeline() {
         SubmitUploads();
         if (!TryPresent()) break;
     }
+}
+
+std::size_t App::CountStage(const PipelineStage stage) const noexcept {
+    return static_cast<std::size_t>(std::count_if(
+        resources_.images.begin(), resources_.images.end(),
+        [stage](const ImageRecord& image) { return image.stage == stage; }));
 }
 
 void App::RecalculateRanges() {
@@ -484,22 +639,32 @@ void App::RecalculateRanges() {
     };
     resources_.ranges.required_low = required_low;
     resources_.ranges.required_high = required_high;
-    if (direction >= 0) {
+    if (resources_.navigation.InitialPending()) {
+        const std::size_t initial = resources_.navigation.CurrentIndex();
+        resources_.ranges.cpu_low = initial;
+        resources_.ranges.cpu_high = initial;
+        resources_.ranges.gpu_low = initial;
+        resources_.ranges.gpu_high = initial;
+    } else if (direction >= 0) {
         resources_.ranges.cpu_low = subtract(required_low, 6);
-        resources_.ranges.cpu_high = add(required_high, 24);
+        resources_.ranges.cpu_high = count - 1;
         resources_.ranges.gpu_low = subtract(required_low, 2);
-        resources_.ranges.gpu_high = add(required_high, 10);
+        resources_.ranges.gpu_high = count - 1;
     } else {
-        resources_.ranges.cpu_low = subtract(required_low, 24);
+        resources_.ranges.cpu_low = 0;
         resources_.ranges.cpu_high = add(required_high, 6);
-        resources_.ranges.gpu_low = subtract(required_low, 10);
+        resources_.ranges.gpu_low = 0;
         resources_.ranges.gpu_high = add(required_high, 2);
     }
     for (std::size_t index = resources_.ranges.cpu_low;
          index <= resources_.ranges.cpu_high; ++index) {
         ImageRecord& image = resources_.images[index];
-        if (image.stage == PipelineStage::Outside) {
-            image.stage = resources_.catalog.items[index].header_valid
+        const bool on_requested_side = direction >= 0
+                                           ? index >= required_low
+                                           : index <= required_high;
+        if (image.stage == PipelineStage::Outside &&
+            (InRequiredRange(index) || on_requested_side)) {
+            image.stage = resources_.catalog.items[index].file_bytes != 0
                               ? PipelineStage::WaitingIo
                               : PipelineStage::Failed;
         }
@@ -522,7 +687,8 @@ void App::ReclaimOutsideRanges() {
     const std::size_t current = resources_.navigation.CurrentIndex();
     for (std::size_t index = 0; index < resources_.images.size(); ++index) {
         ImageRecord& image = resources_.images[index];
-        if (image.stage == PipelineStage::GpuReady && !InGpuRange(index) &&
+        if (image.stage == PipelineStage::PresentationTextureAvailable &&
+            !InGpuRange(index) &&
             !InRequiredRange(index) && index != current) {
             EvictGpu(index);
         }
@@ -547,7 +713,7 @@ void App::ReclaimOutsideRanges() {
                 }
                 image.stage = PipelineStage::CancelPending;
                 break;
-            case PipelineStage::CpuReady:
+            case PipelineStage::DecodedPixelSurfaceAvailable:
                 ReleaseSurface(std::move(image.cpu));
                 image.stage = PipelineStage::Outside;
                 break;
@@ -582,7 +748,7 @@ void App::SubmitReads() {
     for (const std::size_t index : PrioritizedCandidates(PipelineStage::WaitingIo, false)) {
         ImageRecord& image = resources_.images[index];
         const CatalogItem& item = resources_.catalog.items[index];
-        if (!item.header_valid || item.file_bytes == 0 ||
+        if (item.file_bytes == 0 ||
             item.file_bytes > std::numeric_limits<DWORD>::max()) {
             image.stage = PipelineStage::Failed;
             continue;
@@ -644,6 +810,32 @@ void App::DispatchDecodes() {
     for (const std::size_t index : PrioritizedCandidates(PipelineStage::CompressedReady, false)) {
         if (work_queue_.Size() >= config_.work_queue_capacity) break;
         ImageRecord& image = resources_.images[index];
+        if (!resources_.catalog.items[index].header_valid) {
+            ReleaseCompressed(image);
+            image.stage = PipelineStage::Failed;
+            continue;
+        }
+        if (resources_.navigation.HeldDirection() == 0 && !InRequiredRange(index)) {
+            const CatalogItem& item = resources_.catalog.items[index];
+            const std::size_t surface_bytes = item.png.decoded_bytes + item.png.height;
+            const std::size_t surface_capacity = surface_bytes == 0
+                                                     ? 0
+                                                     : config_.cpu_cache_bytes / surface_bytes;
+            const std::size_t ready_limit = std::max<std::size_t>(1, surface_capacity);
+            const std::size_t gpu_capacity = item.png.decoded_bytes == 0
+                                                 ? 0
+                                                 : config_.gpu_cache_bytes /
+                                                       item.png.decoded_bytes;
+            const std::size_t resident_or_active =
+                CountStage(PipelineStage::PresentationTextureAvailable) +
+                CountStage(PipelineStage::Uploading) +
+                CountStage(PipelineStage::DecodedPixelSurfaceAvailable) +
+                CountStage(PipelineStage::DecodeQueued);
+            if (CountStage(PipelineStage::DecodedPixelSurfaceAvailable) >= ready_limit ||
+                resident_or_active >= gpu_capacity + ready_limit) {
+                continue;
+            }
+        }
         EvictCpuCopiesForBudget(resources_.catalog.items[index].png.decoded_bytes);
         std::unique_ptr<CpuSurface> surface = AcquireSurface(resources_.catalog.items[index]);
         if (!surface) {
@@ -656,7 +848,8 @@ void App::DispatchDecodes() {
             std::optional<std::size_t> victim;
             for (std::size_t candidate = resources_.ranges.cpu_low;
                  candidate <= resources_.ranges.cpu_high; ++candidate) {
-                if (resources_.images[candidate].stage != PipelineStage::CpuReady ||
+                if (resources_.images[candidate].stage !=
+                        PipelineStage::DecodedPixelSurfaceAvailable ||
                     !resources_.images[candidate].cpu) {
                     continue;
                 }
@@ -695,7 +888,8 @@ void App::SubmitUploads() {
         return std::tuple{value == target ? 0 : (InRequiredRange(value) ? 1 : 2),
                           Distance(value, target), preferred_side ? 0 : 1, value};
     };
-    for (const std::size_t index : PrioritizedCandidates(PipelineStage::CpuReady, true)) {
+    for (const std::size_t index : PrioritizedCandidates(
+             PipelineStage::DecodedPixelSurfaceAvailable, true)) {
         ImageRecord& image = resources_.images[index];
         const std::size_t bytes = image.cpu ? image.cpu->ByteSize() : 0;
         if (bytes == 0 || bytes > config_.gpu_cache_bytes) {
@@ -703,12 +897,42 @@ void App::SubmitUploads() {
             ReleaseSurface(std::move(image.cpu));
             continue;
         }
-        while (resources_.gpu_bytes > config_.gpu_cache_bytes - bytes) {
+        std::size_t reserved_higher_priority_bytes = 0;
+        for (std::size_t candidate = resources_.ranges.gpu_low;
+             candidate <= resources_.ranges.gpu_high; ++candidate) {
+            if (candidate == index || !(priority(candidate) < priority(index))) continue;
+            const PipelineStage stage = resources_.images[candidate].stage;
+            if (stage == PipelineStage::PresentationTextureAvailable ||
+                stage == PipelineStage::Uploading ||
+                stage == PipelineStage::Failed || stage == PipelineStage::Outside) {
+                continue;
+            }
+            const std::size_t candidate_bytes =
+                resources_.catalog.items[candidate].png.decoded_bytes != 0
+                    ? resources_.catalog.items[candidate].png.decoded_bytes
+                    : bytes;
+            if (reserved_higher_priority_bytes >
+                config_.gpu_cache_bytes - std::min(candidate_bytes,
+                                                   config_.gpu_cache_bytes)) {
+                reserved_higher_priority_bytes = config_.gpu_cache_bytes;
+                break;
+            }
+            reserved_higher_priority_bytes += candidate_bytes;
+        }
+        if (bytes > config_.gpu_cache_bytes -
+                        std::min(reserved_higher_priority_bytes,
+                                 config_.gpu_cache_bytes)) {
+            continue;
+        }
+        const std::size_t available_for_existing =
+            config_.gpu_cache_bytes - bytes - reserved_higher_priority_bytes;
+        while (resources_.gpu_bytes > available_for_existing) {
             std::optional<std::size_t> victim;
             for (std::size_t candidate = 0; candidate < resources_.images.size(); ++candidate) {
                 if (candidate == resources_.navigation.CurrentIndex() ||
                     candidate == target ||
-                    resources_.images[candidate].stage != PipelineStage::GpuReady) {
+                    resources_.images[candidate].stage !=
+                        PipelineStage::PresentationTextureAvailable) {
                     continue;
                 }
                 if (!victim || priority(candidate) > priority(*victim)) {
@@ -718,7 +942,7 @@ void App::SubmitUploads() {
             if (!victim || !(priority(index) < priority(*victim))) break;
             EvictGpu(*victim);
         }
-        if (resources_.gpu_bytes > config_.gpu_cache_bytes - bytes) continue;
+        if (resources_.gpu_bytes > available_for_existing) continue;
         UploadTicket ticket = graphics_.SubmitUpload(index, image.generation,
                                                      std::move(image.cpu));
         resources_.gpu_bytes += bytes;
@@ -733,7 +957,7 @@ bool App::TryPresent() {
     const auto next = resources_.navigation.NextIndex();
     if (next) {
         ImageRecord& image = resources_.images[*next];
-        if (image.stage != PipelineStage::GpuReady) return false;
+        if (image.stage != PipelineStage::PresentationTextureAvailable) return false;
         graphics_.Draw(image.gpu);
         resources_.frame_credit = false;
         resources_.redraw_pending = false;
@@ -754,7 +978,9 @@ bool App::TryPresent() {
                     InjectValidationNavigation();
                 }
             } else if (config_.validation_navigation.empty() ||
-                       (validation_script_injected_ && resources_.navigation.Empty())) {
+                       (validation_script_injected_ &&
+                        validation_navigation_cursor_ >= config_.validation_navigation.size() &&
+                        resources_.navigation.Empty())) {
                 if (!config_.validation_navigation.empty() &&
                     resources_.navigation.CurrentIndex() != validation_expected_index_) {
                     exit_code_ = 2;
@@ -765,6 +991,7 @@ bool App::TryPresent() {
                     exit_code_ = static_cast<int>(std::clamp<std::int64_t>(
                         elapsed.count(), 1, std::numeric_limits<int>::max()));
                 }
+                WriteValidationReport("navigation-complete", false);
                 KillTimer(window_, 1);
                 PostMessageW(window_, WM_CLOSE, 0, 0);
             }
@@ -773,7 +1000,7 @@ bool App::TryPresent() {
     }
     if (resources_.redraw_pending) {
         ImageRecord& current = resources_.images[resources_.navigation.CurrentIndex()];
-        if (current.stage == PipelineStage::GpuReady) {
+        if (current.stage == PipelineStage::PresentationTextureAvailable) {
             graphics_.Draw(current.gpu);
             resources_.frame_credit = false;
             resources_.redraw_pending = false;
@@ -893,7 +1120,9 @@ void App::EvictCpuCopiesForBudget(const std::size_t bytes_needed) {
         std::size_t victim_distance = 0;
         for (std::size_t index = 0; index < resources_.images.size(); ++index) {
             const ImageRecord& image = resources_.images[index];
-            if (image.stage != PipelineStage::GpuReady || !image.cpu) continue;
+            if (image.stage != PipelineStage::PresentationTextureAvailable || !image.cpu) {
+                continue;
+            }
             const std::size_t distance = Distance(index, target);
             if (!victim || distance > victim_distance) {
                 victim = index;
@@ -926,8 +1155,16 @@ void App::EvictGpu(const std::size_t index) {
     if (!image.gpu.texture) return;
     if (resources_.gpu_bytes >= image.gpu.bytes) resources_.gpu_bytes -= image.gpu.bytes;
     image.gpu = {};
-    if (image.cpu) image.stage = PipelineStage::CpuReady;
-    else image.stage = InCpuRange(index) ? PipelineStage::WaitingIo : PipelineStage::Outside;
+    if (image.cpu) image.stage = PipelineStage::DecodedPixelSurfaceAvailable;
+    else {
+        const std::size_t target = resources_.navigation.NextIndex().value_or(
+            resources_.navigation.CurrentIndex());
+        const int direction = resources_.navigation.PreferredDirection();
+        const bool on_requested_side = direction >= 0 ? index >= target : index <= target;
+        image.stage = InCpuRange(index) && (InRequiredRange(index) || on_requested_side)
+                          ? PipelineStage::WaitingIo
+                          : PipelineStage::Outside;
+    }
 }
 
 void App::ArmOldestFence() {

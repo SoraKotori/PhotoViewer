@@ -20,12 +20,32 @@ DecoderPool::~DecoderPool() {
     workers_.clear();
 }
 
+void DecoderPool::ResetMetrics() noexcept {
+    decode_count_.store(0, std::memory_order_relaxed);
+    decode_nanoseconds_.store(0, std::memory_order_relaxed);
+}
+
+std::uint64_t DecoderPool::DecodeCount() const noexcept {
+    return decode_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DecoderPool::DecodeNanoseconds() const noexcept {
+    return decode_nanoseconds_.load(std::memory_order_relaxed);
+}
+
 void DecoderPool::WorkerMain(const std::stop_token stop) {
     DecodeWork work;
     while (work_queue_.Pop(work, stop)) {
+        const auto begin = std::chrono::steady_clock::now();
         DecodeResult result = Decode(std::move(work));
-        completion_queue_.Push(std::move(result));
-        PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin);
+        decode_nanoseconds_.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                      std::memory_order_relaxed);
+        decode_count_.fetch_add(1, std::memory_order_relaxed);
+        if (completion_queue_.Push(std::move(result))) {
+            PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
+        }
         work = {};
     }
 }
@@ -68,8 +88,10 @@ DecodeResult DecoderPool::Decode(DecodeWork work) {
 
 void DecoderPool::ReleaseInput(DecodeWork& work) noexcept {
     if (!work.compressed) return;
-    completion_queue_.PushReleasedInput(ReleasedInput{std::move(work.compressed)});
-    PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
+    if (completion_queue_.PushReleasedInput(
+            ReleasedInput{std::move(work.compressed)})) {
+        PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
+    }
 }
 
 }  // namespace pv
