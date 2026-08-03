@@ -6,7 +6,7 @@ namespace pv {
 
 using InputConsumedCallback = void (*)(void*) noexcept;
 
-HRESULT DecodePngFast(std::span<std::byte> compressed,
+HRESULT DecodePngSpng(std::span<std::byte> compressed,
                       CpuSurface& surface,
                       InputConsumedCallback input_consumed = nullptr,
                       void* callback_context = nullptr) noexcept;

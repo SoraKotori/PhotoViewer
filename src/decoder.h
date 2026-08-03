@@ -4,10 +4,6 @@
 
 namespace pv {
 
-HRESULT DecodePngMemory(IWICImagingFactory* factory,
-                        std::span<const std::byte> compressed,
-                        CpuSurface& surface) noexcept;
-
 class DecoderPool {
 public:
     DecoderPool(std::size_t worker_count, WorkQueue& work_queue,
@@ -19,7 +15,7 @@ public:
 
 private:
     void WorkerMain(std::stop_token stop);
-    DecodeResult Decode(IWICImagingFactory* factory, DecodeWork work);
+    DecodeResult Decode(DecodeWork work);
     void ReleaseInput(DecodeWork& work) noexcept;
 
     WorkQueue& work_queue_;
