@@ -4,6 +4,9 @@
 
 namespace pv {
 
+using SlotId = std::uint32_t;
+constexpr SlotId kInvalidSlot = std::numeric_limits<SlotId>::max();
+
 enum class PipelineStage {
     Outside,
     WaitingIo,
@@ -52,6 +55,13 @@ struct CompressedBuffer {
         return true;
     }
 
+    void ReleaseAllocation() noexcept {
+        if (data) VirtualFree(data, 0, MEM_RELEASE);
+        data = nullptr;
+        size = 0;
+        allocation_size = 0;
+    }
+
     std::byte* data = nullptr;
     std::size_t size = 0;
     std::size_t allocation_size = 0;
@@ -88,6 +98,17 @@ struct CpuSurface {
         return true;
     }
 
+    void ReleaseAllocation() noexcept {
+        if (virtual_allocation) VirtualFree(virtual_allocation, 0, MEM_RELEASE);
+        virtual_allocation = nullptr;
+        pixels = nullptr;
+        allocation_bytes = 0;
+        byte_size = 0;
+        width = 0;
+        height = 0;
+        stride = 0;
+    }
+
     std::byte* virtual_allocation = nullptr;
     std::byte* pixels = nullptr;
     std::size_t allocation_bytes = 0;
@@ -107,8 +128,8 @@ struct DecodeWork {
     std::size_t index = 0;
     std::uint64_t generation = 0;
     std::shared_ptr<WorkToken> token;
-    std::shared_ptr<CompressedBuffer> compressed;
-    std::unique_ptr<CpuSurface> surface;
+    SlotId compressed_slot = kInvalidSlot;
+    SlotId cpu_surface_slot = kInvalidSlot;
 };
 
 struct DecodeResult {
@@ -117,11 +138,13 @@ struct DecodeResult {
     bool success = false;
     bool cancelled = false;
     HRESULT error = S_OK;
-    std::unique_ptr<CpuSurface> surface;
+    SlotId cpu_surface_slot = kInvalidSlot;
 };
 
 struct ReleasedInput {
-    std::shared_ptr<CompressedBuffer> compressed;
+    std::size_t index = 0;
+    std::uint64_t generation = 0;
+    SlotId compressed_slot = kInvalidSlot;
 };
 
 struct GpuImage {
@@ -136,9 +159,8 @@ struct UploadTicket {
     std::size_t index = 0;
     std::uint64_t generation = 0;
     UINT64 fence_value = 0;
-    ComPtr<ID3D11Texture2D> texture;
-    ComPtr<ID3D11Texture2D> staging;
-    std::unique_ptr<CpuSurface> source;
+    SlotId cpu_surface_slot = kInvalidSlot;
+    SlotId gpu_texture_slot = kInvalidSlot;
     UINT width = 0;
     UINT height = 0;
     std::size_t bytes = 0;

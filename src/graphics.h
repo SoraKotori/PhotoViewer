@@ -16,8 +16,8 @@ public:
     void Resize(UINT width, UINT height);
 
     UploadTicket SubmitUpload(std::size_t index, std::uint64_t generation,
-                              std::unique_ptr<CpuSurface> source);
-    GpuImage FinishUpload(UploadTicket& ticket);
+                              const CpuSurface& source, GpuImage& destination);
+    void FinishUpload(GpuImage& image);
     void Draw(const GpuImage& image);
     void ResetMetrics() noexcept;
     [[nodiscard]] std::uint64_t UploadCount() const noexcept;
