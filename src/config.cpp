@@ -1,0 +1,108 @@
+#include "config.h"
+
+#include "common.h"
+
+#include <charconv>
+
+namespace pv {
+namespace {
+
+std::optional<std::size_t> ParsePositive(std::wstring_view value) {
+    if (value.empty()) return std::nullopt;
+    std::size_t result = 0;
+    for (const wchar_t ch : value) {
+        if (ch < L'0' || ch > L'9') return std::nullopt;
+        const std::size_t digit = static_cast<std::size_t>(ch - L'0');
+        if (result > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+            return std::nullopt;
+        }
+        result = result * 10 + digit;
+    }
+    if (result == 0) return std::nullopt;
+    return result;
+}
+
+std::size_t ParseMibOption(std::wstring_view argument, std::wstring_view prefix) {
+    const auto parsed = ParsePositive(argument.substr(prefix.size()));
+    if (!parsed || *parsed > std::numeric_limits<std::size_t>::max() / MiB(1)) {
+        throw std::invalid_argument("invalid MiB option");
+    }
+    return MiB(*parsed);
+}
+
+}  // namespace
+
+Config ParseConfig() {
+    Config config;
+
+    int count = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!argv) ThrowLastError("CommandLineToArgvW");
+    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> holder(argv, &LocalFree);
+
+    for (int index = 1; index < count; ++index) {
+        const std::wstring_view argument(argv[index]);
+        if (argument == L"--validation-exit-after-present") {
+            config.validation_exit_after_present = true;
+        } else if (argument == L"--validation-elapsed-exit-code") {
+            config.validation_elapsed_exit_code = true;
+        } else if (argument == L"--validation-fullscreen") {
+            config.validation_fullscreen = true;
+            config.validation_exit_after_present = true;
+        } else if (argument.starts_with(L"--validation-navigation=")) {
+            config.validation_navigation = argument.substr(
+                std::wstring_view(L"--validation-navigation=").size());
+            if (config.validation_navigation.empty() ||
+                std::any_of(config.validation_navigation.begin(),
+                            config.validation_navigation.end(),
+                            [](const wchar_t value) { return value != L'L' && value != L'R'; })) {
+                throw std::invalid_argument("invalid validation navigation script");
+            }
+            config.validation_exit_after_present = true;
+        } else if (argument.starts_with(L"--validation-file-list=")) {
+            config.validation_file_list = argument.substr(
+                std::wstring_view(L"--validation-file-list=").size());
+            if (config.validation_file_list.empty()) {
+                throw std::invalid_argument("invalid validation file list");
+            }
+        } else if (argument.starts_with(L"--cpu-cache-mib=")) {
+            config.cpu_cache_bytes = ParseMibOption(argument, L"--cpu-cache-mib=");
+        } else if (argument.starts_with(L"--validation-timeout-ms=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--validation-timeout-ms=").size()));
+            if (!value || *value > 600000) {
+                throw std::invalid_argument("invalid validation timeout");
+            }
+            config.validation_timeout_ms = static_cast<std::uint32_t>(*value);
+        } else if (argument.starts_with(L"--validation-warmup-ms=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--validation-warmup-ms=").size()));
+            if (!value || *value > 60000) {
+                throw std::invalid_argument("invalid validation warmup");
+            }
+            config.validation_warmup_ms = static_cast<std::uint32_t>(*value);
+        } else if (argument.starts_with(L"--gpu-cache-mib=")) {
+            config.gpu_cache_bytes = ParseMibOption(argument, L"--gpu-cache-mib=");
+        } else if (argument.starts_with(L"--compressed-budget-mib=")) {
+            config.compressed_budget_bytes =
+                ParseMibOption(argument, L"--compressed-budget-mib=");
+        } else if (argument.starts_with(L"--workers=")) {
+            const auto value = ParsePositive(argument.substr(std::wstring_view(L"--workers=").size()));
+            if (!value || *value > 256) throw std::invalid_argument("invalid worker count");
+            config.worker_count = *value;
+        } else if (argument.starts_with(L"--work-queue=")) {
+            const auto value = ParsePositive(argument.substr(std::wstring_view(L"--work-queue=").size()));
+            if (!value || *value > 4096) throw std::invalid_argument("invalid work queue capacity");
+            config.work_queue_capacity = *value;
+        } else if (argument.starts_with(L"--")) {
+            throw std::invalid_argument("unknown option");
+        } else if (config.initial_image.empty()) {
+            config.initial_image = argument;
+        } else {
+            throw std::invalid_argument("multiple image paths supplied");
+        }
+    }
+    return config;
+}
+
+}  // namespace pv

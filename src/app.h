@@ -1,57 +1,145 @@
 #pragma once
 
-#include "decode_scheduler.h"
-#include "direct2d_renderer.h"
-#include "navigation_controller.h"
-#include "telemetry.h"
+#include "catalog.h"
+#include "config.h"
+#include "decoder.h"
+#include "graphics.h"
+#include "navigation.h"
 
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <vector>
-#include <windows.h>
+namespace pv {
 
-struct AppOptions
-{
-    std::filesystem::path initialImage;
-    std::filesystem::path catalogManifest;
-    std::wstring telemetryPipe;
-    std::size_t decodeWorkers{18};
-    bool noPersistentState{};
+struct IoRequest {
+    OVERLAPPED overlapped{};
+    HANDLE file = INVALID_HANDLE_VALUE;
+    PTP_IO threadpool_io = nullptr;
+    HWND window = nullptr;
+    std::size_t index = 0;
+    std::uint64_t generation = 0;
+    std::shared_ptr<CompressedBuffer> compressed;
+    std::atomic<DWORD> result{ERROR_IO_PENDING};
+    std::atomic<ULONG_PTR> transferred{0};
 };
 
-class App final
-{
-public:
-    explicit App(Telemetry& telemetry);
+struct ImageRecord {
+    PipelineStage stage = PipelineStage::Outside;
+    std::uint64_t generation = 0;
+    std::size_t reserved_output_bytes = 0;
+    std::unique_ptr<IoRequest> io;
+    std::shared_ptr<CompressedBuffer> compressed;
+    std::shared_ptr<WorkToken> work_token;
+    std::unique_ptr<CpuSurface> cpu;
+    GpuImage gpu;
+};
 
-    [[nodiscard]] bool initialize(HINSTANCE instance, int showCommand, const AppOptions& options);
-    [[nodiscard]] int run();
+struct BufferRanges {
+    std::size_t required_low = 0;
+    std::size_t required_high = 0;
+    std::size_t cpu_low = 0;
+    std::size_t cpu_high = 0;
+    std::size_t gpu_low = 0;
+    std::size_t gpu_high = 0;
+};
+
+struct ResourceContext {
+    Catalog catalog;
+    NavigationState navigation;
+    std::vector<ImageRecord> images;
+    BufferRanges ranges;
+    std::uint64_t generation = 1;
+
+    std::size_t compressed_bytes = 0;
+    std::size_t compressed_committed_bytes = 0;
+    std::size_t reserved_output_bytes = 0;
+    std::size_t cpu_committed_bytes = 0;
+    std::size_t gpu_bytes = 0;
+    std::vector<std::unique_ptr<CpuSurface>> free_surfaces;
+    std::vector<std::shared_ptr<CompressedBuffer>> free_compressed;
+    std::deque<UploadTicket> uploads;
+
+    bool frame_credit = false;
+    bool redraw_pending = true;
+    UINT64 armed_fence = 0;
+};
+
+class App {
+public:
+    explicit App(Config config);
+    ~App();
+
+    int Run(HINSTANCE instance, int show_command);
 
 private:
-    [[nodiscard]] static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
-    [[nodiscard]] LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
-    [[nodiscard]] bool buildCatalog(
-        const std::filesystem::path& initialImage,
-        const std::filesystem::path& catalogManifest);
-    void synchronizeDecodeDemand();
-    void handleImageReady(std::size_t index);
-    void handleDecodeFailed(std::size_t index);
-    void toggleFullscreen();
-    void emitSurfaceMetrics();
-    void updateWindowTitle();
+    static LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
+                                             WPARAM wparam, LPARAM lparam);
+    static void CALLBACK IoCompletion(PTP_CALLBACK_INSTANCE instance, void* context,
+                                      void* overlapped, ULONG io_result,
+                                      ULONG_PTR transferred, PTP_IO io);
 
-    Telemetry& telemetry_;
-    Direct2DRenderer renderer_;
-    DecodeScheduler decoder_;
-    NavigationController navigation_;
-    HWND window_{};
-    std::vector<std::filesystem::path> catalog_;
-    std::size_t initialIndex_{};
-    std::uint64_t announcedTargetSequence_{};
-    std::uint64_t currentRequestTimeMicroseconds_{};
-    WINDOWPLACEMENT windowedPlacement_{sizeof(WINDOWPLACEMENT)};
-    LONG_PTR windowedStyle_{};
-    bool rendererReady_{};
-    bool fullscreen_{};
+    void InitializeWindow(HINSTANCE instance, int show_command);
+    int EventLoop();
+    LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
+
+    void OpenInitialImage();
+    void OnDirection(int direction, bool repeat);
+    void OnDirectionReleased(int direction);
+    void OnIoComplete(IoRequest* request);
+    void OnWorkerComplete();
+    void OnGpuComplete();
+    void OnFrameCredit();
+    void OnSurfaceChanged(UINT width, UINT height);
+    void OnPaint();
+    void ToggleFullscreen();
+    void InjectValidationNavigation();
+    void BeginFullscreenValidation();
+    void OnFullscreenValidationTimer();
+
+    void PumpPipeline();
+    void RecalculateRanges();
+    void ReclaimOutsideRanges();
+    void SubmitReads();
+    void DispatchDecodes();
+    void SubmitUploads();
+    bool TryPresent();
+
+    [[nodiscard]] bool InRequiredRange(std::size_t index) const noexcept;
+    [[nodiscard]] bool InCpuRange(std::size_t index) const noexcept;
+    [[nodiscard]] bool InGpuRange(std::size_t index) const noexcept;
+    [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(PipelineStage stage,
+                                                                 bool gpu_range) const;
+    std::unique_ptr<CpuSurface> AcquireSurface(const CatalogItem& item);
+    std::shared_ptr<CompressedBuffer> AcquireCompressed(std::size_t bytes);
+    void ReleaseCompressedBuffer(std::shared_ptr<CompressedBuffer> buffer);
+    void ReleaseSurface(std::unique_ptr<CpuSurface> surface);
+    void TrimFreeSurfaces(std::size_t bytes_needed);
+    void EvictCpuCopiesForBudget(std::size_t bytes_needed);
+    void ReleaseCompressed(ImageRecord& image);
+    void ReleaseReservation(ImageRecord& image);
+    void EvictGpu(std::size_t index);
+    void CancelAllIo();
+    void ArmOldestFence();
+
+    Config config_;
+    HWND window_ = nullptr;
+    bool running_ = true;
+    bool graphics_ready_ = false;
+    bool fullscreen_ = false;
+    WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
+    LONG_PTR windowed_style_ = 0;
+    int validation_fullscreen_phase_ = 0;
+    RECT validation_windowed_rect_{};
+    RECT validation_monitor_rect_{};
+    LONG_PTR validation_windowed_style_ = 0;
+    bool validation_script_injected_ = false;
+    bool validation_script_scheduled_ = false;
+    std::size_t validation_expected_index_ = 0;
+    std::chrono::steady_clock::time_point validation_navigation_started_{};
+    int exit_code_ = 0;
+
+    Graphics graphics_;
+    WorkQueue work_queue_;
+    CompletionQueue completion_queue_;
+    std::unique_ptr<DecoderPool> decoders_;
+    ResourceContext resources_;
 };
+
+}  // namespace pv
