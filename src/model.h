@@ -10,9 +10,9 @@ enum class PipelineStage {
     IoInFlight,
     CompressedReady,
     DecodeQueued,
-    CpuReady,
+    DecodedPixelSurfaceAvailable,
     Uploading,
-    GpuReady,
+    PresentationTextureAvailable,
     CancelPending,
     Failed,
 };

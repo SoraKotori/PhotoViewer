@@ -50,10 +50,27 @@ void StorePixel(std::uint8_t* const destination, const __m128i value) noexcept {
 
 void AddSub(std::uint8_t* const destination, const std::uint8_t* const source,
             const std::size_t bytes) noexcept {
-    __m128i decoded = _mm_setzero_si128();
-    for (std::size_t offset = 0; offset < bytes; offset += 4) {
-        decoded = _mm_add_epi8(LoadPixel(source + offset), decoded);
-        StorePixel(destination + offset, decoded);
+    __m128i previous = _mm_setzero_si128();
+    std::size_t offset = 0;
+    for (; offset + 16 <= bytes; offset += 16) {
+        __m128i decoded = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(source + offset));
+        decoded = _mm_add_epi8(decoded, _mm_slli_si128(decoded, 4));
+        decoded = _mm_add_epi8(decoded, _mm_slli_si128(decoded, 8));
+        decoded = _mm_add_epi8(decoded, _mm_shuffle_epi32(previous, 0xFF));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + offset), decoded);
+        previous = decoded;
+    }
+    std::uint32_t prior_pixel = static_cast<std::uint32_t>(
+        _mm_extract_epi32(previous, 3));
+    for (; offset < bytes; offset += 4) {
+        std::uint32_t filtered = 0;
+        std::memcpy(&filtered, source + offset, sizeof(filtered));
+        const __m128i decoded = _mm_add_epi8(
+            _mm_cvtsi32_si128(static_cast<int>(filtered)),
+            _mm_cvtsi32_si128(static_cast<int>(prior_pixel)));
+        prior_pixel = static_cast<std::uint32_t>(_mm_cvtsi128_si32(decoded));
+        std::memcpy(destination + offset, &prior_pixel, sizeof(prior_pixel));
     }
 }
 

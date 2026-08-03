@@ -47,9 +47,12 @@ private:
 
 class CompletionQueue {
 public:
-    void Push(DecodeResult result) {
+    [[nodiscard]] bool Push(DecodeResult result) {
         std::lock_guard lock(mutex_);
         queue_.push_back(std::move(result));
+        if (notification_pending_) return false;
+        notification_pending_ = true;
+        return true;
     }
 
     std::vector<DecodeResult> Drain() {
@@ -63,9 +66,12 @@ public:
         return results;
     }
 
-    void PushReleasedInput(ReleasedInput input) {
+    [[nodiscard]] bool PushReleasedInput(ReleasedInput input) {
         std::lock_guard lock(mutex_);
         released_inputs_.push_back(std::move(input));
+        if (notification_pending_) return false;
+        notification_pending_ = true;
+        return true;
     }
 
     std::vector<ReleasedInput> DrainReleasedInputs() {
@@ -79,10 +85,19 @@ public:
         return inputs;
     }
 
+    [[nodiscard]] bool AcknowledgeNotification() {
+        std::lock_guard lock(mutex_);
+        notification_pending_ = false;
+        if (queue_.empty() && released_inputs_.empty()) return false;
+        notification_pending_ = true;
+        return true;
+    }
+
 private:
     std::mutex mutex_;
     std::deque<DecodeResult> queue_;
     std::deque<ReleasedInput> released_inputs_;
+    bool notification_pending_ = false;
 };
 
 }  // namespace pv

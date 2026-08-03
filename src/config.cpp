@@ -65,6 +65,12 @@ Config ParseConfig() {
             if (config.validation_file_list.empty()) {
                 throw std::invalid_argument("invalid validation file list");
             }
+        } else if (argument.starts_with(L"--validation-report=")) {
+            config.validation_report = argument.substr(
+                std::wstring_view(L"--validation-report=").size());
+            if (config.validation_report.empty()) {
+                throw std::invalid_argument("invalid validation report path");
+            }
         } else if (argument.starts_with(L"--cpu-cache-mib=")) {
             config.cpu_cache_bytes = ParseMibOption(argument, L"--cpu-cache-mib=");
         } else if (argument.starts_with(L"--validation-timeout-ms=")) {
@@ -81,6 +87,13 @@ Config ParseConfig() {
                 throw std::invalid_argument("invalid validation warmup");
             }
             config.validation_warmup_ms = static_cast<std::uint32_t>(*value);
+        } else if (argument.starts_with(L"--validation-navigation-interval-ms=")) {
+            const auto value = ParsePositive(argument.substr(
+                std::wstring_view(L"--validation-navigation-interval-ms=").size()));
+            if (!value || *value > 1000) {
+                throw std::invalid_argument("invalid validation navigation interval");
+            }
+            config.validation_navigation_interval_ms = static_cast<std::uint32_t>(*value);
         } else if (argument.starts_with(L"--gpu-cache-mib=")) {
             config.gpu_cache_bytes = ParseMibOption(argument, L"--gpu-cache-mib=");
         } else if (argument.starts_with(L"--compressed-budget-mib=")) {
