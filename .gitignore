@@ -1,5 +1,5 @@
-.vs/
 x64/
-test-results/
 *.user
-*.VC.db
+*.suo
+.vs/
+test-results/

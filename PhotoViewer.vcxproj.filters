@@ -1,40 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="Source Files">
-      <UniqueIdentifier>{62DE6C90-29DF-4FDA-9883-9231C9E35D8C}</UniqueIdentifier>
-      <Extensions>cpp;c;cc;cxx</Extensions>
-    </Filter>
+    <Filter Include="Source Files"><UniqueIdentifier>{E40FB60E-AD11-4B7C-91A8-2AD4C013E32E}</UniqueIdentifier><Extensions>cpp;c</Extensions></Filter>
+    <Filter Include="Header Files"><UniqueIdentifier>{EFC0780A-C1D0-4D3A-93E3-7E88D52F28AB}</UniqueIdentifier><Extensions>h;hpp</Extensions></Filter>
+    <Filter Include="Resource Files"><UniqueIdentifier>{CD1BCA1B-D193-4CD3-BDE3-E19547739A30}</UniqueIdentifier><Extensions>manifest</Extensions></Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\app.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\decode_scheduler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\direct2d_renderer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\main.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\navigation_controller.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\telemetry.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
+    <ClCompile Include="src\app.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\catalog.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\config.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\decoder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\graphics.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\main.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\navigation.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\png.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\app.h" />
-    <ClInclude Include="src\decode_scheduler.h" />
-    <ClInclude Include="src\decoded_image.h" />
-    <ClInclude Include="src\direct2d_renderer.h" />
-    <ClInclude Include="src\navigation_controller.h" />
-    <ClInclude Include="src\telemetry.h" />
+    <ClInclude Include="src\app.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\catalog.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\common.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\config.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\decoder.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\graphics.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\model.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\navigation.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\png.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\work_queue.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
-  <ItemGroup>
-    <Manifest Include="PhotoViewer.manifest" />
-  </ItemGroup>
+  <ItemGroup><Manifest Include="PhotoViewer.manifest"><Filter>Resource Files</Filter></Manifest></ItemGroup>
 </Project>
