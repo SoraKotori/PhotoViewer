@@ -30,12 +30,12 @@
     <Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences><AdditionalDependencies>d2d1.lib;d3d11.lib;dxgi.lib;ole32.lib;shell32.lib;user32.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\app.cpp" /><ClCompile Include="src\catalog.cpp" /><ClCompile Include="src\config.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\fast_png.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\main.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\wuffs_png.cpp" />
-    <ClCompile Include="third_party\libdeflate\lib\adler32.c"><CompileAs>CompileAsC</CompileAs></ClCompile><ClCompile Include="third_party\libdeflate\lib\deflate_decompress.c"><CompileAs>CompileAsC</CompileAs></ClCompile><ClCompile Include="third_party\libdeflate\lib\utils.c"><CompileAs>CompileAsC</CompileAs></ClCompile><ClCompile Include="third_party\libdeflate\lib\zlib_decompress.c"><CompileAs>CompileAsC</CompileAs></ClCompile><ClCompile Include="third_party\libdeflate\lib\x86\cpu_features.c"><CompileAs>CompileAsC</CompileAs></ClCompile>
+    <ClCompile Include="src\app.cpp" /><ClCompile Include="src\catalog.cpp" /><ClCompile Include="src\config.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\main.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\spng_decoder.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\app.h" /><ClInclude Include="src\catalog.h" /><ClInclude Include="src\common.h" /><ClInclude Include="src\config.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\fast_png.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\model.h" /><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\work_queue.h" /><ClInclude Include="src\wuffs_png.h" />
+    <ClInclude Include="src\app.h" /><ClInclude Include="src\catalog.h" /><ClInclude Include="src\common.h" /><ClInclude Include="src\config.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\model.h" /><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\spng_decoder.h" /><ClInclude Include="src\work_queue.h" />
   </ItemGroup>
+  <ItemGroup><ProjectReference Include="PhotoViewer.PngCodec.vcxproj"><Project>{55A9D4F1-5B69-4D89-AE99-80361473B839}</Project></ProjectReference></ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

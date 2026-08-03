@@ -8,6 +8,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhotoViewer.CoreTests", "Ph
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhotoViewer.RuntimeTests", "PhotoViewer.RuntimeTests.vcxproj", "{BC34F3D0-C5B2-43BE-A6D3-C2F9DDC558B1}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhotoViewer.PngCodec", "PhotoViewer.PngCodec.vcxproj", "{55A9D4F1-5B69-4D89-AE99-80361473B839}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -26,5 +28,9 @@ Global
 		{BC34F3D0-C5B2-43BE-A6D3-C2F9DDC558B1}.Debug|x64.Build.0 = Debug|x64
 		{BC34F3D0-C5B2-43BE-A6D3-C2F9DDC558B1}.Release|x64.ActiveCfg = Release|x64
 		{BC34F3D0-C5B2-43BE-A6D3-C2F9DDC558B1}.Release|x64.Build.0 = Release|x64
+		{55A9D4F1-5B69-4D89-AE99-80361473B839}.Debug|x64.ActiveCfg = Debug|x64
+		{55A9D4F1-5B69-4D89-AE99-80361473B839}.Debug|x64.Build.0 = Debug|x64
+		{55A9D4F1-5B69-4D89-AE99-80361473B839}.Release|x64.ActiveCfg = Release|x64
+		{55A9D4F1-5B69-4D89-AE99-80361473B839}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal

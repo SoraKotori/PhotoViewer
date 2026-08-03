@@ -1,13 +1,27 @@
-#include "fast_png.h"
+#include "spng_decoder.h"
 
+#define SPNG_STATIC
+#include "../third_party/libspng/spng.h"
 #include "../third_party/libdeflate/libdeflate.h"
 
-#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 
 namespace pv {
 namespace {
+
+struct SpngContextDeleter {
+    void operator()(spng_ctx* const context) const noexcept {
+        spng_ctx_free(context);
+    }
+};
+
+HRESULT SpngErrorToHresult(const int error) noexcept {
+    if (error == SPNG_OK) return S_OK;
+    if (error == SPNG_EMEM || error == SPNG_EOVERFLOW) return E_OUTOFMEMORY;
+    if (error == SPNG_EINVAL || error == SPNG_EBUFSIZ) return E_INVALIDARG;
+    return WINCODEC_ERR_BADIMAGE;
+}
 
 std::uint32_t ReadBigEndian(const std::byte* const data) noexcept {
     return (static_cast<std::uint32_t>(data[0]) << 24U) |
@@ -72,9 +86,9 @@ void AddPaeth(std::uint8_t* const destination, const std::uint8_t* const source,
         const __m128i up = _mm_unpacklo_epi8(LoadPixel(previous + offset), zero);
         const __m128i left = decoded;
         __m128i filtered = _mm_unpacklo_epi8(LoadPixel(source + offset), zero);
-        __m128i distance_left = _mm_abs_epi16(_mm_sub_epi16(up, up_left));
-        __m128i distance_up = _mm_abs_epi16(_mm_sub_epi16(left, up_left));
-        __m128i distance_upper_left = _mm_abs_epi16(
+        const __m128i distance_left = _mm_abs_epi16(_mm_sub_epi16(up, up_left));
+        const __m128i distance_up = _mm_abs_epi16(_mm_sub_epi16(left, up_left));
+        const __m128i distance_upper_left = _mm_abs_epi16(
             _mm_add_epi16(_mm_sub_epi16(up, up_left),
                           _mm_sub_epi16(left, up_left)));
         const __m128i smallest = _mm_min_epi16(
@@ -140,32 +154,10 @@ bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
     return true;
 }
 
-}  // namespace
-
-HRESULT DecodePngFast(const std::span<std::byte> compressed,
-                      CpuSurface& surface,
-                      const InputConsumedCallback input_consumed,
-                      void* const callback_context) noexcept {
-    constexpr std::byte signature[] = {
-        std::byte{0x89}, std::byte{0x50}, std::byte{0x4E}, std::byte{0x47},
-        std::byte{0x0D}, std::byte{0x0A}, std::byte{0x1A}, std::byte{0x0A}};
-    if (compressed.size() < 33 ||
-        !std::equal(std::begin(signature), std::end(signature), compressed.begin()) ||
-        ReadBigEndian(compressed.data() + 8) != 13 ||
-        !IsType(compressed.data() + 12, "IHDR") || compressed[24] != std::byte{8} ||
-        compressed[25] != std::byte{6} || compressed[26] != std::byte{0} ||
-        compressed[27] != std::byte{0} || compressed[28] != std::byte{0}) {
-        return WINCODEC_ERR_COMPONENTNOTFOUND;
-    }
-    const std::uint32_t width = ReadBigEndian(compressed.data() + 16);
-    const std::uint32_t height = ReadBigEndian(compressed.data() + 20);
-    if (width != surface.width || height != surface.height || !surface.pixels) {
-        return E_INVALIDARG;
-    }
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-    const std::size_t filtered_bytes = (row_bytes + 1) * height;
-    if (surface.allocation_bytes < filtered_bytes) return WINCODEC_ERR_COMPONENTNOTFOUND;
-
+HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
+                        CpuSurface& surface,
+                        const InputConsumedCallback input_consumed,
+                        void* const callback_context) noexcept {
     std::size_t idat_bytes = 0;
     bool found_idat = false;
     bool found_end = false;
@@ -185,7 +177,9 @@ HRESULT DecodePngFast(const std::span<std::byte> compressed,
         }
         offset += static_cast<std::size_t>(length) + 12;
     }
-    if (!found_idat || !found_end || idat_bytes < 6) return WINCODEC_ERR_BADIMAGE;
+    if (!found_idat || !found_end || idat_bytes < 6) {
+        return WINCODEC_ERR_BADIMAGE;
+    }
 
     std::size_t write_offset = 0;
     for (std::size_t offset = 8; offset + 12 <= compressed.size();) {
@@ -201,6 +195,12 @@ HRESULT DecodePngFast(const std::span<std::byte> compressed,
         offset += static_cast<std::size_t>(length) + 12;
     }
 
+    const std::size_t row_bytes = static_cast<std::size_t>(surface.width) * 4;
+    const std::size_t filtered_bytes = (row_bytes + 1) * surface.height;
+    if (surface.allocation_bytes < filtered_bytes) {
+        return E_OUTOFMEMORY;
+    }
+
     const auto* const zlib = reinterpret_cast<const std::uint8_t*>(compressed.data());
     const std::uint16_t header = static_cast<std::uint16_t>((zlib[0] << 8U) | zlib[1]);
     if ((header % 31U) != 0 || (header & 0x0F00U) != 0x0800U ||
@@ -208,7 +208,7 @@ HRESULT DecodePngFast(const std::span<std::byte> compressed,
         return WINCODEC_ERR_BADIMAGE;
     }
     struct DecompressorDeleter {
-        void operator()(libdeflate_decompressor* value) const noexcept {
+        void operator()(libdeflate_decompressor* const value) const noexcept {
             libdeflate_free_decompressor(value);
         }
     };
@@ -222,8 +222,69 @@ HRESULT DecodePngFast(const std::span<std::byte> compressed,
     if (result != LIBDEFLATE_SUCCESS || actual != filtered_bytes) {
         return WINCODEC_ERR_BADIMAGE;
     }
+
     if (input_consumed) input_consumed(callback_context);
-    return Unfilter(surface.pixels, row_bytes, height) ? S_OK : WINCODEC_ERR_BADIMAGE;
+    return Unfilter(surface.pixels, row_bytes, surface.height)
+               ? S_OK
+               : WINCODEC_ERR_BADIMAGE;
+}
+
+}  // namespace
+
+HRESULT DecodePngSpng(const std::span<std::byte> compressed,
+                      CpuSurface& surface,
+                      const InputConsumedCallback input_consumed,
+                      void* const callback_context) noexcept {
+    if (compressed.empty() || !surface.pixels || surface.width == 0 ||
+        surface.height == 0 || surface.stride != surface.width * 4U) {
+        return E_INVALIDARG;
+    }
+
+    std::unique_ptr<spng_ctx, SpngContextDeleter> context(
+        spng_ctx_new(SPNG_CTX_IGNORE_ADLER32));
+    if (!context) return E_OUTOFMEMORY;
+
+    int result = spng_set_crc_action(context.get(), SPNG_CRC_USE, SPNG_CRC_USE);
+    if (result == SPNG_OK) {
+        result = spng_set_png_buffer(context.get(), compressed.data(), compressed.size());
+    }
+
+    spng_ihdr header{};
+    if (result == SPNG_OK) result = spng_get_ihdr(context.get(), &header);
+    if (result == SPNG_OK &&
+        (header.width != surface.width || header.height != surface.height)) {
+        return E_INVALIDARG;
+    }
+
+    if (result == SPNG_OK && header.bit_depth == 8 &&
+        header.color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA &&
+        header.compression_method == 0 && header.filter_method == 0 &&
+        header.interlace_method == SPNG_INTERLACE_NONE) {
+        context.reset();
+        return DecodeRgba8Fast(compressed, surface, input_consumed,
+                               callback_context);
+    }
+
+    const int output_format =
+        header.bit_depth == 8 &&
+                header.color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA
+            ? SPNG_FMT_PNG
+            : SPNG_FMT_RGBA8;
+    std::size_t decoded_bytes = 0;
+    if (result == SPNG_OK) {
+        result = spng_decoded_image_size(context.get(), output_format,
+                                         &decoded_bytes);
+    }
+    if (result == SPNG_OK && decoded_bytes != surface.ByteSize()) {
+        return E_INVALIDARG;
+    }
+    if (result == SPNG_OK) {
+        result = spng_decode_image(context.get(), surface.pixels,
+                                   surface.ByteSize(), output_format, 0);
+    }
+    context.reset();
+    if (result == SPNG_OK && input_consumed) input_consumed(callback_context);
+    return SpngErrorToHresult(result);
 }
 
 }  // namespace pv

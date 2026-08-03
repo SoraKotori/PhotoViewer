@@ -1,10 +1,10 @@
 #include "common.h"
 #include "decoder.h"
-#include "fast_png.h"
 #include "graphics.h"
-#include "wuffs_png.h"
+#include "spng_decoder.h"
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -16,7 +16,7 @@ void Check(const bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void TestWic() {
+void TestSpng() {
     const std::array<unsigned char, 70> raw{
         0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
         0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
@@ -30,16 +30,31 @@ void TestWic() {
     std::array<std::byte, raw.size()> png{};
     for (std::size_t index = 0; index < raw.size(); ++index) png[index] = std::byte{raw[index]};
 
-    pv::ComPtr<IWICImagingFactory> factory;
-    pv::CheckHr(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                 IID_PPV_ARGS(&factory)), "Create WIC factory");
     pv::CpuSurface surface;
     surface.width = 1;
     surface.height = 1;
     surface.stride = 4;
-    Check(surface.Allocate(4), "allocate decoded surface");
-    pv::CheckHr(pv::DecodePngMemory(factory.Get(), png, surface), "Decode embedded PNG");
+    Check(surface.Allocate(5), "allocate decoded surface and PNG filter byte");
+    surface.byte_size = 4;
+    pv::CheckHr(pv::DecodePngSpng(png, surface), "Decode embedded PNG with libspng");
     Check(surface.pixels[3] == std::byte{0xFF}, "decoded alpha channel");
+
+    const std::array<unsigned char, 68> fallback_raw{
+        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+        0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x08,0x04,0x00,0x00,0x00,0xB5,0x1C,0x0C,0x02,
+        0x00,0x00,0x00,0x0B,0x49,0x44,0x41,0x54,
+        0x78,0xDA,0x63,0x64,0xF8,0x0F,0x00,0x01,
+        0x05,0x01,0x01,0x27,0x18,0xE3,0x66,
+        0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,
+        0xAE,0x42,0x60,0x82};
+    std::array<std::byte, fallback_raw.size()> fallback_png{};
+    for (std::size_t index = 0; index < fallback_raw.size(); ++index) {
+        fallback_png[index] = std::byte{fallback_raw[index]};
+    }
+    pv::CheckHr(pv::DecodePngSpng(fallback_png, surface),
+                "Decode grayscale-alpha PNG with libspng/zlib-ng fallback");
 }
 
 void TestGraphics(const HINSTANCE instance) {
@@ -91,8 +106,7 @@ std::uint32_t ReadBigEndian(const std::byte* const data) {
            static_cast<std::uint32_t>(data[3]);
 }
 
-int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers,
-                    const bool fast) {
+int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers) {
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
         if (entry.is_regular_file() && entry.path().extension() == L".png") {
@@ -128,8 +142,8 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
         surface->width = width;
         surface->height = height;
         surface->stride = width * 4;
-        Check(surface->Allocate(decoded_bytes + (fast ? height : 0)),
-              "allocate benchmark surface");
+        Check(surface->Allocate(decoded_bytes + height), "allocate benchmark surface");
+        surface->byte_size = decoded_bytes;
         surface->byte_size = decoded_bytes;
         compressed_images.push_back(std::move(compressed));
         surfaces.push_back(std::move(surface));
@@ -139,17 +153,17 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     std::latch ready(static_cast<std::ptrdiff_t>(workers));
     std::latch start(1);
     std::vector<HRESULT> results(workers, E_PENDING);
-    const std::vector<std::byte> reference_compressed =
-        fast ? compressed_images.front() : std::vector<std::byte>{};
+    std::vector<double> worker_milliseconds(workers, 0.0);
     std::vector<std::jthread> threads;
     threads.reserve(workers);
     for (std::size_t index = 0; index < workers; ++index) {
         threads.emplace_back([&, index] {
             ready.count_down();
             start.wait();
-            results[index] = fast
-                                 ? pv::DecodePngFast(compressed_images[index], *surfaces[index])
-                                 : pv::DecodePngWuffs(compressed_images[index], *surfaces[index]);
+            const auto worker_begin = std::chrono::steady_clock::now();
+            results[index] = pv::DecodePngSpng(compressed_images[index], *surfaces[index]);
+            worker_milliseconds[index] = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - worker_begin).count();
         });
     }
     ready.wait();
@@ -159,33 +173,27 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     Check(std::all_of(results.begin(), results.end(),
                       [](const HRESULT result) { return SUCCEEDED(result); }),
-          "Wuffs benchmark decode");
-    bool pixel_match = true;
-    if (fast) {
-        pv::CpuSurface reference;
-        reference.width = surfaces.front()->width;
-        reference.height = surfaces.front()->height;
-        reference.stride = reference.width * 4;
-        const std::size_t reference_bytes =
-            static_cast<std::size_t>(reference.stride) * reference.height;
-        Check(reference.Allocate(reference_bytes), "allocate reference surface");
-        Check(SUCCEEDED(pv::DecodePngWuffs(reference_compressed, reference)),
-              "decode Wuffs reference");
-        pixel_match = std::memcmp(reference.pixels, surfaces.front()->pixels,
-                                  reference_bytes) == 0;
-        Check(pixel_match, "fast decoder differs from Wuffs reference");
-    }
+          "PNG benchmark decode");
+    std::sort(worker_milliseconds.begin(), worker_milliseconds.end());
+    const auto percentile = [&](const double value) {
+        const std::size_t rank = static_cast<std::size_t>(
+            std::ceil(value * static_cast<double>(worker_milliseconds.size())));
+        return worker_milliseconds[std::min(worker_milliseconds.size() - 1,
+                                            std::max<std::size_t>(1, rank) - 1)];
+    };
     const double seconds = std::chrono::duration<double>(elapsed).count();
     const double load_seconds = std::chrono::duration<double>(load_elapsed).count();
     std::cout << "FileRead images=" << workers
               << " elapsed_ms=" << (load_seconds * 1000.0)
               << " mib_per_second=" << ((compressed_bytes / 1048576.0) / load_seconds)
               << '\n';
-    std::cout << (fast ? "FastDecode" : "WuffsDecode")
+    std::cout << "LibdeflateDecode"
               << " workers=" << workers << " images=" << workers
-              << " elapsed_ms=" << (seconds * 1000.0)
+              << " batch_elapsed_ms=" << (seconds * 1000.0)
               << " images_per_second=" << (workers / seconds)
-              << " pixel_match=" << (pixel_match ? "true" : "false") << '\n';
+              << " p50_worker_ms=" << percentile(0.50)
+              << " p95_worker_ms=" << percentile(0.95)
+              << " max_worker_ms=" << worker_milliseconds.back() << '\n';
     return 0;
 }
 
@@ -245,19 +253,14 @@ int wmain(const int argc, wchar_t** const argv) {
         if (argc == 2 && std::wstring_view(argv[1]) == L"--graphics-benchmark") {
             return BenchmarkGraphics(GetModuleHandleW(nullptr));
         }
-        if (argc == 4 &&
-            (std::wstring_view(argv[1]) == L"--decode-benchmark" ||
-             std::wstring_view(argv[1]) == L"--fast-decode-benchmark")) {
+        if (argc == 4 && std::wstring_view(argv[1]) == L"--decode-benchmark") {
             const std::size_t workers = std::stoull(argv[3]);
             Check(workers > 0 && workers <= 64, "invalid benchmark worker count");
-            return BenchmarkDecode(argv[2], workers,
-                                   std::wstring_view(argv[1]) == L"--fast-decode-benchmark");
+            return BenchmarkDecode(argv[2], workers);
         }
-        pv::CheckHr(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "CoInitializeEx");
-        TestWic();
+        TestSpng();
         TestGraphics(GetModuleHandleW(nullptr));
-        CoUninitialize();
-        std::cout << "PASS: WIC decode, D3D11 staging/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: libspng/libdeflate decode with zlib-ng fallback, D3D11 upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
