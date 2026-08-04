@@ -27,7 +27,7 @@ if ($SamplePng) {
         -ArgumentList @(
             '--validation-fullscreen',
             '--validation-navigation=R',
-            '--workers=12',
+            '--workers=10',
             ('"' + $sample + '"')
         ) `
         -WindowStyle Hidden `
@@ -49,7 +49,7 @@ if ($SamplePng) {
             '--cpu-cache-mib=512',
             '--gpu-cache-mib=256',
             '--compressed-budget-mib=256',
-            '--workers=12',
+            '--workers=10',
             ('"' + $sample + '"')
         ) `
         -WindowStyle Hidden `
