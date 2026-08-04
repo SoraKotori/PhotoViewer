@@ -41,18 +41,27 @@ bool NavigationInputPending(const HWND window) noexcept {
 App::App(Config config)
     : config_(std::move(config)), work_queue_(config_.work_queue_capacity) {
     resources_.slots = std::make_unique<ResourceSlots>(
-        config_.compressed_slot_count, config_.cpu_surface_slot_count,
+        config_.compressed_slot_count, config_.staging_slot_count,
         config_.gpu_texture_slot_count, config_.compressed_budget_bytes,
-        config_.cpu_cache_bytes);
+        config_.staging_cache_bytes);
 }
 
 App::~App() {
     StopValidationNavigationTimer();
     decoders_.reset();
+    if (graphics_ready_ && resources_.slots) {
+        for (SlotId id = 0; id < resources_.slots->StagingCount(); ++id) {
+            DecodeStaging& staging = resources_.slots->StagingAt(id).resource;
+            if (staging.mapped) graphics_.UnmapDecodeStaging(staging);
+        }
+    }
     CancelAllIo();
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
+        ThrowLastError("Set main thread priority");
+    }
     InitializeWindow(instance, show_command);
     decoders_ = std::make_unique<DecoderPool>(config_.worker_count, work_queue_,
                                               completion_queue_, *resources_.slots,
@@ -145,6 +154,7 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
                 exit_code_ = next && *next < resources_.images.size()
                                  ? 100 + static_cast<int>(StageOf(resources_.images[*next]))
                                  : 199;
+                WriteValidationReport("timeout", false);
                 KillTimer(window_, 1);
                 DestroyWindow(window_);
             } else if (wparam == 2 && config_.validation_exit_after_present) {
@@ -265,7 +275,21 @@ void CALLBACK App::ValidationTimerCallback(PTP_CALLBACK_INSTANCE, void* context,
     PostMessageW(app->window_, kMessageValidationStep, 0, 0);
 }
 
-void App::OnIoComplete(IoRequest* const request) {
+void App::OnIoComplete(IoRequest* request) {
+    for (;;) {
+        CompleteIoRequest(request);
+        MSG pending{};
+        if (!PeekMessageW(&pending, nullptr, 0, 0, PM_NOREMOVE) ||
+            pending.hwnd != window_ || pending.message != kMessageIoComplete) {
+            break;
+        }
+        PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE);
+        request = reinterpret_cast<IoRequest*>(pending.wParam);
+    }
+    PumpPipeline();
+}
+
+void App::CompleteIoRequest(IoRequest* const request) {
     if (!request || request->index >= resources_.images.size()) return;
     ImageRecord& image = resources_.images[request->index];
     if (!image.io || image.io.get() != request) return;
@@ -285,7 +309,7 @@ void App::OnIoComplete(IoRequest* const request) {
     const bool current = request->generation == image.generation;
     auto completed = std::move(image.io);
 
-    if (success && current && InCpuRange(request->index)) {
+    if (success && current && InDecodeRange(request->index)) {
         CatalogItem& item = resources_.catalog.items[request->index];
         const auto header = ParsePngHeader(std::span<const std::byte>(
             slot.resource.data, slot.resource.size));
@@ -306,15 +330,14 @@ void App::OnIoComplete(IoRequest* const request) {
         resources_.slots->ReleaseCompressed(compressed_slot);
         image.compressed_slot = kInvalidSlot;
         ReleaseReservation(image);
-        if (current && io_result != ERROR_OPERATION_ABORTED && InCpuRange(request->index)) {
+        if (current && io_result != ERROR_OPERATION_ABORTED && InDecodeRange(request->index)) {
             image.demand = ImageDemandState::Failed;
         } else {
-            image.demand = current && InCpuRange(request->index)
+            image.demand = current && InDecodeRange(request->index)
                                ? ImageDemandState::Requested
                                : ImageDemandState::Outside;
         }
     }
-    PumpPipeline();
 }
 
 void App::OnWorkerComplete() {
@@ -334,27 +357,29 @@ void App::OnWorkerComplete() {
         resources_.slots->ReleaseCompressed(input.compressed_slot);
     }
     for (DecodeResult& result : completion_queue_.Drain()) {
+        if (result.staging_slot == kInvalidSlot) continue;
+        StagingSlot& slot = resources_.slots->StagingAt(result.staging_slot);
+        graphics_.UnmapDecodeStaging(slot.resource);
         if (result.index >= resources_.images.size()) {
-            resources_.slots->ReleaseCpuSurface(result.cpu_surface_slot);
+            resources_.slots->ReleaseStaging(result.staging_slot);
             continue;
         }
         ImageRecord& image = resources_.images[result.index];
         if (result.generation != image.generation) {
-            resources_.slots->ReleaseCpuSurface(result.cpu_surface_slot);
+            resources_.slots->ReleaseStaging(result.staging_slot);
             continue;
         }
         image.work_token.reset();
-        if (result.success && InCpuRange(result.index)) {
-            CpuSurfaceSlot& slot = resources_.slots->CpuSurfaceAt(result.cpu_surface_slot);
-            slot.state = CpuSurfaceSlotState::DecodedPixelsAvailable;
+        if (result.success && InDecodeRange(result.index)) {
+            slot.state = StagingSlotState::DecodedPixelsAvailable;
         } else {
-            resources_.slots->ReleaseCpuSurface(result.cpu_surface_slot);
-            image.cpu_surface_slot = kInvalidSlot;
-            if (!result.cancelled && FAILED(result.error) && InCpuRange(result.index)) {
+            resources_.slots->ReleaseStaging(result.staging_slot);
+            image.staging_slot = kInvalidSlot;
+            if (!result.cancelled && FAILED(result.error) && InDecodeRange(result.index)) {
                 image.demand = ImageDemandState::Failed;
             } else {
-                image.demand = InCpuRange(result.index) ? ImageDemandState::Requested
-                                                        : ImageDemandState::Outside;
+                image.demand = InDecodeRange(result.index) ? ImageDemandState::Requested
+                                                           : ImageDemandState::Outside;
             }
         }
     }
@@ -371,8 +396,8 @@ void App::OnGpuComplete() {
         UploadTicket ticket = std::move(resources_.uploads.front());
         resources_.uploads.pop_front();
         if (ticket.index >= resources_.images.size()) {
-            resources_.slots->ReleaseCpuSurface(ticket.cpu_surface_slot);
             resources_.slots->ReleaseGpuTexture(ticket.gpu_texture_slot);
+            resources_.slots->ReleaseStaging(ticket.staging_slot);
             continue;
         }
         ImageRecord& image = resources_.images[ticket.index];
@@ -383,20 +408,18 @@ void App::OnGpuComplete() {
             GpuTextureSlot& gpu = resources_.slots->GpuTextureAt(ticket.gpu_texture_slot);
             graphics_.FinishUpload(gpu.resource);
             gpu.state = GpuTextureSlotState::Presentable;
-            resources_.slots->ReleaseCpuSurface(ticket.cpu_surface_slot);
-            image.cpu_surface_slot = kInvalidSlot;
         } else {
             if (resources_.gpu_bytes >= ticket.bytes) resources_.gpu_bytes -= ticket.bytes;
             resources_.slots->ReleaseGpuTexture(ticket.gpu_texture_slot);
             image.gpu_texture_slot = kInvalidSlot;
-            if (ticket.generation == image.generation && InCpuRange(ticket.index)) {
-                resources_.slots->CpuSurfaceAt(ticket.cpu_surface_slot).state =
-                    CpuSurfaceSlotState::DecodedPixelsAvailable;
-            } else {
-                resources_.slots->ReleaseCpuSurface(ticket.cpu_surface_slot);
-                image.cpu_surface_slot = kInvalidSlot;
-                image.demand = ImageDemandState::Outside;
-            }
+            image.demand = ticket.generation == image.generation &&
+                                   InDecodeRange(ticket.index)
+                               ? ImageDemandState::Requested
+                               : ImageDemandState::Outside;
+        }
+        resources_.slots->ReleaseStaging(ticket.staging_slot);
+        if (image.staging_slot == ticket.staging_slot) {
+            image.staging_slot = kInvalidSlot;
         }
     }
     resources_.armed_fence = 0;
@@ -604,7 +627,7 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
                          std::ios::out | (truncate ? std::ios::trunc : std::ios::app));
     if (!output) return;
     constexpr std::array names{"Outside", "WaitingIo", "IoInFlight", "CompressedReady",
-                               "DecodeQueued", "DecodedPixelSurfaceAvailable", "Uploading",
+                               "DecodeQueued", "DecodedStagingAvailable", "Uploading",
                                "PresentationTextureAvailable",
                                "CancelPending", "Failed"};
     std::array<std::size_t, names.size()> counts{};
@@ -628,18 +651,18 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
         }
         output << '\n';
     };
-    write_indices("DecodedPixelSurfaceAvailable_indices",
-                  PipelineStage::DecodedPixelSurfaceAvailable);
+    write_indices("DecodedStagingAvailable_indices",
+                  PipelineStage::DecodedStagingAvailable);
     write_indices("Uploading_indices", PipelineStage::Uploading);
     write_indices("PresentationTextureAvailable_indices",
                   PipelineStage::PresentationTextureAvailable);
     output << "compressed_bytes=" << resources_.compressed_bytes << '\n'
            << "compressed_committed_bytes="
            << resources_.slots->CompressedCommittedBytes() << '\n'
-           << "cpu_committed_bytes=" << resources_.slots->CpuCommittedBytes() << '\n'
+           << "staging_committed_bytes=" << resources_.slots->StagingCommittedBytes() << '\n'
            << "gpu_bytes=" << resources_.gpu_bytes << '\n'
            << "free_compressed_slots=" << resources_.slots->FreeCompressedCount() << '\n'
-           << "free_cpu_surface_slots=" << resources_.slots->FreeCpuSurfaceCount() << '\n'
+           << "free_staging_slots=" << resources_.slots->FreeStagingCount() << '\n'
            << "free_gpu_texture_slots=" << resources_.slots->FreeGpuTextureCount() << '\n'
            << "work_queue=" << work_queue_.Size() << '\n'
            << "uploads=" << resources_.uploads.size() << '\n'
@@ -685,6 +708,9 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     output << '\n'
            << "decode_count=" << decoders_->DecodeCount() << '\n'
            << "decode_nanoseconds=" << decoders_->DecodeNanoseconds() << '\n'
+           << "selected_cpu_set_count=" << decoders_->SelectedCpuSetCount() << '\n'
+           << "unthrottled_worker_count=" << decoders_->UnthrottledWorkerCount() << '\n'
+           << "elevated_worker_count=" << decoders_->ElevatedWorkerCount() << '\n'
            << "upload_count=" << graphics_.UploadCount() << '\n'
            << "upload_nanoseconds=" << graphics_.UploadNanoseconds() << '\n'
            << "draw_count=" << graphics_.DrawCount() << '\n'
@@ -723,17 +749,17 @@ PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
                 break;
         }
     }
-    if (image.cpu_surface_slot != kInvalidSlot) {
-        switch (resources_.slots->CpuSurfaceAt(image.cpu_surface_slot).state) {
-            case CpuSurfaceSlotState::DecodeOutput:
+    if (image.staging_slot != kInvalidSlot) {
+        switch (resources_.slots->StagingAt(image.staging_slot).state) {
+            case StagingSlotState::DecodeOutputMapped:
                 return PipelineStage::DecodeQueued;
-            case CpuSurfaceSlotState::DecodedPixelsAvailable:
-                return PipelineStage::DecodedPixelSurfaceAvailable;
-            case CpuSurfaceSlotState::UploadSource:
+            case StagingSlotState::DecodedPixelsAvailable:
+                return PipelineStage::DecodedStagingAvailable;
+            case StagingSlotState::GpuCopySource:
                 return PipelineStage::Uploading;
-            case CpuSurfaceSlotState::CancellationPending:
+            case StagingSlotState::CancellationPending:
                 return PipelineStage::CancelPending;
-            case CpuSurfaceSlotState::Free:
+            case StagingSlotState::Free:
                 break;
         }
     }
@@ -771,32 +797,32 @@ void App::RecalculateRanges() {
     resources_.ranges.required_high = required_high;
     if (resources_.navigation.InitialPending()) {
         const std::size_t initial = resources_.navigation.CurrentIndex();
-        resources_.ranges.cpu_low = initial;
-        resources_.ranges.cpu_high = initial;
+        resources_.ranges.decode_low = initial;
+        resources_.ranges.decode_high = initial;
         resources_.ranges.gpu_low = initial;
         resources_.ranges.gpu_high = initial;
     } else if (direction > 0) {
-        resources_.ranges.cpu_low = subtract(required_low, 6);
-        resources_.ranges.cpu_high = count - 1;
+        resources_.ranges.decode_low = subtract(required_low, 6);
+        resources_.ranges.decode_high = count - 1;
         resources_.ranges.gpu_low = subtract(required_low, 2);
         resources_.ranges.gpu_high = count - 1;
     } else if (direction < 0) {
-        resources_.ranges.cpu_low = 0;
-        resources_.ranges.cpu_high = add(required_high, 6);
+        resources_.ranges.decode_low = 0;
+        resources_.ranges.decode_high = add(required_high, 6);
         resources_.ranges.gpu_low = 0;
         resources_.ranges.gpu_high = add(required_high, 2);
     } else {
-        resources_.ranges.cpu_low = subtract(
-            required_low, config_.cpu_surface_slot_count);
-        resources_.ranges.cpu_high = add(
-            required_high, config_.cpu_surface_slot_count);
+        resources_.ranges.decode_low = subtract(
+            required_low, config_.staging_slot_count);
+        resources_.ranges.decode_high = add(
+            required_high, config_.staging_slot_count);
         resources_.ranges.gpu_low = subtract(
             required_low, config_.gpu_texture_slot_count);
         resources_.ranges.gpu_high = add(
             required_high, config_.gpu_texture_slot_count);
     }
-    for (std::size_t index = resources_.ranges.cpu_low;
-         index <= resources_.ranges.cpu_high; ++index) {
+    for (std::size_t index = resources_.ranges.decode_low;
+         index <= resources_.ranges.decode_high; ++index) {
         ImageRecord& image = resources_.images[index];
         const bool on_requested_side = direction > 0
                                            ? index >= required_low
@@ -815,8 +841,8 @@ bool App::InRequiredRange(const std::size_t index) const noexcept {
     return index >= resources_.ranges.required_low && index <= resources_.ranges.required_high;
 }
 
-bool App::InCpuRange(const std::size_t index) const noexcept {
-    return index >= resources_.ranges.cpu_low && index <= resources_.ranges.cpu_high;
+bool App::InDecodeRange(const std::size_t index) const noexcept {
+    return index >= resources_.ranges.decode_low && index <= resources_.ranges.decode_high;
 }
 
 bool App::InGpuRange(const std::size_t index) const noexcept {
@@ -832,7 +858,7 @@ void App::ReclaimOutsideRanges() {
             !InRequiredRange(index) && index != current) {
             EvictGpu(index);
         }
-        if (InCpuRange(index)) continue;
+        if (InDecodeRange(index)) continue;
         switch (StageOf(image)) {
             case PipelineStage::WaitingIo:
                 image.demand = ImageDemandState::Outside;
@@ -859,15 +885,15 @@ void App::ReclaimOutsideRanges() {
                     resources_.slots->Compressed(image.compressed_slot).state =
                         CompressedSlotState::CancellationPending;
                 }
-                if (image.cpu_surface_slot != kInvalidSlot) {
-                    resources_.slots->CpuSurfaceAt(image.cpu_surface_slot).state =
-                        CpuSurfaceSlotState::CancellationPending;
+                if (image.staging_slot != kInvalidSlot) {
+                    resources_.slots->StagingAt(image.staging_slot).state =
+                        StagingSlotState::CancellationPending;
                 }
                 image.demand = ImageDemandState::Outside;
                 break;
-            case PipelineStage::DecodedPixelSurfaceAvailable:
-                resources_.slots->ReleaseCpuSurface(image.cpu_surface_slot);
-                image.cpu_surface_slot = kInvalidSlot;
+            case PipelineStage::DecodedStagingAvailable:
+                resources_.slots->ReleaseStaging(image.staging_slot);
+                image.staging_slot = kInvalidSlot;
                 image.demand = ImageDemandState::Outside;
                 break;
             default:
@@ -879,8 +905,8 @@ void App::ReclaimOutsideRanges() {
 std::vector<std::size_t> App::PrioritizedCandidates(const PipelineStage stage,
                                                      const bool gpu_range) const {
     std::vector<std::size_t> candidates;
-    const std::size_t low = gpu_range ? resources_.ranges.gpu_low : resources_.ranges.cpu_low;
-    const std::size_t high = gpu_range ? resources_.ranges.gpu_high : resources_.ranges.cpu_high;
+    const std::size_t low = gpu_range ? resources_.ranges.gpu_low : resources_.ranges.decode_low;
+    const std::size_t high = gpu_range ? resources_.ranges.gpu_high : resources_.ranges.decode_high;
     for (std::size_t index = low; index <= high; ++index) {
         if (StageOf(resources_.images[index]) == stage) candidates.push_back(index);
     }
@@ -985,38 +1011,39 @@ void App::DispatchDecodes() {
             continue;
         }
         const CatalogItem& item = resources_.catalog.items[index];
-        const std::size_t required = item.png.decoded_bytes + item.png.height;
-        const std::size_t surface_capacity = required == 0
+        const std::size_t staging_bytes = item.png.decoded_bytes +
+            item.png.height + static_cast<std::size_t>(item.png.width) * 4;
+        const std::size_t staging_capacity = staging_bytes == 0
             ? 0
-            : std::min(config_.cpu_surface_slot_count,
-                       config_.cpu_cache_bytes / required);
-        if (surface_capacity == 0) {
+            : std::min(config_.staging_slot_count,
+                       config_.staging_cache_bytes / staging_bytes);
+        if (staging_capacity == 0) {
             ReleaseCompressed(image);
             image.demand = ImageDemandState::Failed;
             continue;
         }
 
-        std::size_t higher_priority_cpu_demand = 0;
-        for (std::size_t candidate = resources_.ranges.cpu_low;
-             candidate <= resources_.ranges.cpu_high; ++candidate) {
+        std::size_t higher_priority_staging_demand = 0;
+        for (std::size_t candidate = resources_.ranges.decode_low;
+             candidate <= resources_.ranges.decode_high; ++candidate) {
             if (candidate == index || !(priority(candidate) < priority(index))) continue;
             switch (StageOf(resources_.images[candidate])) {
                 case PipelineStage::IoInFlight:
                 case PipelineStage::CompressedReady:
                 case PipelineStage::DecodeQueued:
-                case PipelineStage::DecodedPixelSurfaceAvailable:
+                case PipelineStage::DecodedStagingAvailable:
                 case PipelineStage::Uploading:
                 case PipelineStage::CancelPending:
-                    ++higher_priority_cpu_demand;
+                    ++higher_priority_staging_demand;
                     break;
                 default:
                     break;
             }
         }
-        if (higher_priority_cpu_demand >= surface_capacity) continue;
+        if (higher_priority_staging_demand >= staging_capacity) continue;
 
         if (resources_.navigation.HeldDirection() == 0 && !InRequiredRange(index)) {
-            const std::size_t ready_limit = std::max<std::size_t>(1, surface_capacity);
+            const std::size_t ready_limit = std::max<std::size_t>(1, staging_capacity);
             const std::size_t gpu_capacity = item.png.decoded_bytes == 0
                 ? 0
                 : std::min(config_.gpu_texture_slot_count,
@@ -1024,56 +1051,57 @@ void App::DispatchDecodes() {
             const std::size_t resident_or_active =
                 CountStage(PipelineStage::PresentationTextureAvailable) +
                 CountStage(PipelineStage::Uploading) +
-                CountStage(PipelineStage::DecodedPixelSurfaceAvailable) +
+                CountStage(PipelineStage::DecodedStagingAvailable) +
                 CountStage(PipelineStage::DecodeQueued);
-            if (CountStage(PipelineStage::DecodedPixelSurfaceAvailable) >= ready_limit ||
+            if (CountStage(PipelineStage::DecodedStagingAvailable) >= ready_limit ||
                 resident_or_active >= gpu_capacity + ready_limit) {
                 continue;
             }
         }
-        SlotId surface_slot = resources_.slots->AcquireCpuSurface(
-            required, index, image.generation);
-        if (surface_slot == kInvalidSlot) {
+        SlotId staging_slot = resources_.slots->AcquireStaging(
+            staging_bytes, index, image.generation);
+        while (staging_slot == kInvalidSlot) {
             std::optional<std::size_t> victim;
-            for (std::size_t candidate = resources_.ranges.cpu_low;
-                 candidate <= resources_.ranges.cpu_high; ++candidate) {
+            for (std::size_t candidate = resources_.ranges.decode_low;
+                 candidate <= resources_.ranges.decode_high; ++candidate) {
                 if (StageOf(resources_.images[candidate]) !=
-                    PipelineStage::DecodedPixelSurfaceAvailable) {
+                        PipelineStage::DecodedStagingAvailable ||
+                    !(priority(index) < priority(candidate))) {
                     continue;
                 }
                 if (!victim || priority(candidate) > priority(*victim)) {
                     victim = candidate;
                 }
             }
-            if (victim && priority(index) < priority(*victim)) {
-                ImageRecord& victim_image = resources_.images[*victim];
-                resources_.slots->ReleaseCpuSurface(victim_image.cpu_surface_slot);
-                victim_image.cpu_surface_slot = kInvalidSlot;
-                victim_image.demand = ImageDemandState::Requested;
-                surface_slot = resources_.slots->AcquireCpuSurface(
-                    required, index, image.generation);
-            }
+            if (!victim) break;
+            ImageRecord& displaced = resources_.images[*victim];
+            resources_.slots->ReleaseStaging(displaced.staging_slot);
+            displaced.staging_slot = kInvalidSlot;
+            displaced.demand = InDecodeRange(*victim)
+                                   ? ImageDemandState::Requested
+                                   : ImageDemandState::Outside;
+            staging_slot = resources_.slots->AcquireStaging(
+                staging_bytes, index, image.generation);
         }
-        if (surface_slot == kInvalidSlot) {
+        if (staging_slot == kInvalidSlot) {
             continue;
         }
-        CpuSurface& surface = resources_.slots->CpuSurfaceAt(surface_slot).resource;
-        surface.width = item.png.width;
-        surface.height = item.png.height;
-        surface.stride = item.png.width * 4U;
-        surface.byte_size = item.png.decoded_bytes;
+        DecodeStaging& staging = resources_.slots->StagingAt(staging_slot).resource;
+        graphics_.MapDecodeStaging(staging, item.png.width, item.png.height,
+                                   item.png.decoded_bytes);
         auto token = std::make_shared<WorkToken>();
         DecodeWork work{index, image.generation, token, image.compressed_slot,
-                        surface_slot};
+                        staging_slot};
         resources_.slots->Compressed(image.compressed_slot).state =
             CompressedSlotState::DecodeInput;
         if (!work_queue_.TryPush(work)) {
-            resources_.slots->ReleaseCpuSurface(surface_slot);
+            graphics_.UnmapDecodeStaging(staging);
+            resources_.slots->ReleaseStaging(staging_slot);
             resources_.slots->Compressed(image.compressed_slot).state =
                 CompressedSlotState::CompressedDataAvailable;
             break;
         }
-        image.cpu_surface_slot = surface_slot;
+        image.staging_slot = staging_slot;
         image.work_token = std::move(token);
     }
 }
@@ -1088,14 +1116,14 @@ void App::SubmitUploads() {
                           Distance(value, target), preferred_side ? 0 : 1, value};
     };
     for (const std::size_t index : PrioritizedCandidates(
-             PipelineStage::DecodedPixelSurfaceAvailable, true)) {
+             PipelineStage::DecodedStagingAvailable, true)) {
         ImageRecord& image = resources_.images[index];
-        CpuSurfaceSlot& cpu_slot = resources_.slots->CpuSurfaceAt(
-            image.cpu_surface_slot);
-        const std::size_t bytes = cpu_slot.resource.ByteSize();
+        StagingSlot& staging_slot = resources_.slots->StagingAt(
+            image.staging_slot);
+        const std::size_t bytes = staging_slot.resource.surface.ByteSize();
         if (bytes == 0 || bytes > config_.gpu_cache_bytes) {
-            resources_.slots->ReleaseCpuSurface(image.cpu_surface_slot);
-            image.cpu_surface_slot = kInvalidSlot;
+            resources_.slots->ReleaseStaging(image.staging_slot);
+            image.staging_slot = kInvalidSlot;
             image.demand = ImageDemandState::Failed;
             continue;
         }
@@ -1163,11 +1191,11 @@ void App::SubmitUploads() {
         if (gpu_slot_id == kInvalidSlot) continue;
         GpuTextureSlot& gpu_slot = resources_.slots->GpuTextureAt(gpu_slot_id);
         UploadTicket ticket = graphics_.SubmitUpload(
-            index, image.generation, cpu_slot.resource, gpu_slot.resource);
-        ticket.cpu_surface_slot = image.cpu_surface_slot;
+            index, image.generation, image.staging_slot,
+            staging_slot.resource, gpu_slot.resource);
         ticket.gpu_texture_slot = gpu_slot_id;
         resources_.gpu_bytes += bytes;
-        cpu_slot.state = CpuSurfaceSlotState::UploadSource;
+        staging_slot.state = StagingSlotState::GpuCopySource;
         image.gpu_texture_slot = gpu_slot_id;
         resources_.uploads.push_back(std::move(ticket));
         if (NavigationInputPending(window_)) break;
@@ -1260,18 +1288,13 @@ void App::EvictGpu(const std::size_t index) {
     }
     resources_.slots->ReleaseGpuTexture(image.gpu_texture_slot);
     image.gpu_texture_slot = kInvalidSlot;
-    if (image.cpu_surface_slot != kInvalidSlot) {
-        resources_.slots->CpuSurfaceAt(image.cpu_surface_slot).state =
-            CpuSurfaceSlotState::DecodedPixelsAvailable;
-    } else {
-        const std::size_t target = resources_.navigation.NextIndex().value_or(
-            resources_.navigation.CurrentIndex());
-        const int direction = resources_.navigation.PreferredDirection();
-        const bool on_requested_side = direction >= 0 ? index >= target : index <= target;
-        image.demand = InCpuRange(index) && (InRequiredRange(index) || on_requested_side)
-                           ? ImageDemandState::Requested
-                           : ImageDemandState::Outside;
-    }
+    const std::size_t target = resources_.navigation.NextIndex().value_or(
+        resources_.navigation.CurrentIndex());
+    const int direction = resources_.navigation.PreferredDirection();
+    const bool on_requested_side = direction >= 0 ? index >= target : index <= target;
+    image.demand = InDecodeRange(index) && (InRequiredRange(index) || on_requested_side)
+                       ? ImageDemandState::Requested
+                       : ImageDemandState::Outside;
 }
 
 void App::ArmOldestFence() {

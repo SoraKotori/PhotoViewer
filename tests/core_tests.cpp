@@ -125,8 +125,8 @@ void ResourceSlotTests() {
     pv::ResourceSlots slots(2, 2, 2, 8192, 8192);
     Check(slots.CompressedCount() == 2 && slots.FreeCompressedCount() == 2,
           "compressed slot storage and free index must start at configured count");
-    Check(slots.CpuSurfaceCount() == 2 && slots.FreeCpuSurfaceCount() == 2,
-          "CPU slot storage and free index must start at configured count");
+    Check(slots.StagingCount() == 2 && slots.FreeStagingCount() == 2,
+          "staging slot storage and free index must start at configured count");
     Check(slots.GpuTextureCount() == 2 && slots.FreeGpuTextureCount() == 2,
           "GPU slot storage and free index must start at configured count");
 
@@ -148,20 +148,21 @@ void ResourceSlotTests() {
               slots.Compressed(compressed0).state == pv::CompressedSlotState::Free,
           "compressed release must restore state and free index together");
 
-    const pv::SlotId cpu0 = slots.AcquireCpuSurface(4096, 3, 7);
-    const pv::SlotId cpu1 = slots.AcquireCpuSurface(4096, 4, 7);
-    Check(cpu0 != pv::kInvalidSlot && cpu1 != pv::kInvalidSlot,
-          "configured CPU surface slots must be allocatable");
-    Check(slots.AcquireCpuSurface(1, 5, 7) == pv::kInvalidSlot,
-          "CPU surface slot count must be a hard limit");
-    Check(slots.CpuSurfaceAt(cpu0).state == pv::CpuSurfaceSlotState::DecodeOutput,
-          "CPU acquisition state must describe its pipeline phase");
-    slots.CpuSurfaceAt(cpu0).state =
-        pv::CpuSurfaceSlotState::DecodedPixelsAvailable;
-    slots.ReleaseCpuSurface(cpu0);
-    Check(slots.FreeCpuSurfaceCount() == 1 &&
-              slots.CpuSurfaceAt(cpu0).state == pv::CpuSurfaceSlotState::Free,
-          "CPU release must restore state and free index together");
+    const pv::SlotId staging0 = slots.AcquireStaging(4096, 3, 7);
+    const pv::SlotId staging1 = slots.AcquireStaging(4096, 4, 7);
+    Check(staging0 != pv::kInvalidSlot && staging1 != pv::kInvalidSlot,
+          "configured staging slots must be allocatable");
+    Check(slots.AcquireStaging(1, 5, 7) == pv::kInvalidSlot,
+          "staging slot count must be a hard limit");
+    Check(slots.StagingAt(staging0).state ==
+              pv::StagingSlotState::DecodeOutputMapped,
+          "staging acquisition state must describe its pipeline phase");
+    slots.StagingAt(staging0).state =
+        pv::StagingSlotState::DecodedPixelsAvailable;
+    slots.ReleaseStaging(staging0);
+    Check(slots.FreeStagingCount() == 1 &&
+              slots.StagingAt(staging0).state == pv::StagingSlotState::Free,
+          "staging release must restore state and free index together");
 
     const pv::SlotId gpu0 = slots.AcquireGpuTexture(3, 7);
     const pv::SlotId gpu1 = slots.AcquireGpuTexture(4, 7);
@@ -183,10 +184,10 @@ void ResourceSlotTests() {
           "compressed byte budget must allow one exact allocation");
     Check(budget_limited.AcquireCompressed(1, 1, 1) == pv::kInvalidSlot,
           "compressed byte budget and slot count must both be enforced");
-    Check(budget_limited.AcquireCpuSurface(4096, 0, 1) != pv::kInvalidSlot,
-          "CPU byte budget must allow one exact allocation");
-    Check(budget_limited.AcquireCpuSurface(1, 1, 1) == pv::kInvalidSlot,
-          "CPU byte budget and slot count must both be enforced");
+    Check(budget_limited.AcquireStaging(4096, 0, 1) != pv::kInvalidSlot,
+          "staging byte budget must allow one exact allocation");
+    Check(budget_limited.AcquireStaging(1, 1, 1) == pv::kInvalidSlot,
+          "staging byte budget and slot count must both be enforced");
 }
 
 }  // namespace

@@ -223,30 +223,46 @@ bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
     return true;
 }
 
-HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
-                        CpuSurface& surface,
-                        const InputConsumedCallback input_consumed,
-                        void* const callback_context,
-                        PngDecodeTimings* const timings) noexcept {
-    const auto compaction_begin = timings ? std::chrono::steady_clock::now()
-                                          : std::chrono::steady_clock::time_point{};
-    std::size_t idat_bytes = 0;
-    std::size_t idat_begin = 0;
+bool ExpandRowsToPitch(DecodeSurface& surface) noexcept {
+    const std::size_t row_bytes = static_cast<std::size_t>(surface.width) * 4;
+    if (surface.stride < row_bytes ||
+        surface.allocation_bytes < static_cast<std::size_t>(surface.stride) *
+                                       surface.height) {
+        return false;
+    }
+    if (surface.stride == row_bytes) return true;
+    for (std::uint32_t row = surface.height; row-- > 0;) {
+        std::memmove(surface.pixels + static_cast<std::size_t>(row) * surface.stride,
+                     surface.pixels + static_cast<std::size_t>(row) * row_bytes,
+                     row_bytes);
+    }
+    return true;
+}
+
+struct IdatData {
+    std::size_t begin = 0;
+    std::size_t bytes = 0;
+};
+
+HRESULT CompactIdat(const std::span<std::byte> compressed, IdatData& idat,
+                    PngDecodeTimings* const timings) noexcept {
+    const auto begin = timings ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     std::size_t write_offset = 0;
-    bool found_idat = false;
+    bool found = false;
     bool found_end = false;
     for (std::size_t offset = 8; offset + 12 <= compressed.size();) {
         const std::uint32_t length = ReadBigEndian(compressed.data() + offset);
         if (length > compressed.size() - offset - 12) return WINCODEC_ERR_BADIMAGE;
         const std::byte* const type = compressed.data() + offset + 4;
         if (IsType(type, "IDAT")) {
-            if (idat_bytes > std::numeric_limits<std::size_t>::max() - length) {
+            if (idat.bytes > std::numeric_limits<std::size_t>::max() - length) {
                 return E_OUTOFMEMORY;
             }
             const std::size_t payload_offset = offset + 8;
-            if (!found_idat) {
-                found_idat = true;
-                idat_begin = payload_offset;
+            if (!found) {
+                found = true;
+                idat.begin = payload_offset;
                 write_offset = payload_offset;
             }
             if (write_offset != payload_offset) {
@@ -254,22 +270,31 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
                              compressed.data() + payload_offset, length);
             }
             write_offset += length;
-            idat_bytes += length;
+            idat.bytes += length;
         } else if (IsType(type, "IEND")) {
             found_end = true;
             break;
         }
         offset += static_cast<std::size_t>(length) + 12;
     }
-    if (!found_idat || !found_end || idat_bytes < 6) {
-        return WINCODEC_ERR_BADIMAGE;
-    }
+    if (!found || !found_end || idat.bytes < 6) return WINCODEC_ERR_BADIMAGE;
     if (timings) {
         timings->chunk_scan_nanoseconds = 0;
         timings->idat_compaction_nanoseconds = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - compaction_begin).count());
+                std::chrono::steady_clock::now() - begin).count());
     }
+    return S_OK;
+}
+
+HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
+                        DecodeSurface& surface,
+                        const InputConsumedCallback input_consumed,
+                        void* const callback_context,
+                        PngDecodeTimings* const timings) noexcept {
+    IdatData idat;
+    const HRESULT compacted = CompactIdat(compressed, idat, timings);
+    if (FAILED(compacted)) return compacted;
 
     const std::size_t row_bytes = static_cast<std::size_t>(surface.width) * 4;
     const std::size_t filtered_bytes = (row_bytes + 1) * surface.height;
@@ -278,7 +303,7 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     }
 
     const auto* const zlib = reinterpret_cast<const std::uint8_t*>(
-        compressed.data() + idat_begin);
+        compressed.data() + idat.begin);
     const std::uint16_t header = static_cast<std::uint16_t>((zlib[0] << 8U) | zlib[1]);
     if ((header % 31U) != 0 || (header & 0x0F00U) != 0x0800U ||
         (header & 0x0020U) != 0) {
@@ -296,7 +321,7 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     const auto deflate_begin = timings ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     const libdeflate_result result = libdeflate_deflate_decompress(
-        decompressor.get(), zlib + 2, idat_bytes - 6, surface.pixels,
+        decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
         filtered_bytes, &actual);
     if (timings) {
         timings->deflate_nanoseconds = static_cast<std::uint64_t>(
@@ -317,18 +342,20 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - unfilter_begin).count());
     }
-    return unfiltered ? S_OK : WINCODEC_ERR_BADIMAGE;
+    return unfiltered && ExpandRowsToPitch(surface)
+               ? S_OK
+               : WINCODEC_ERR_BADIMAGE;
 }
 
 }  // namespace
 
 HRESULT DecodePngSpng(const std::span<std::byte> compressed,
-                      CpuSurface& surface,
+                      DecodeSurface& surface,
                       const InputConsumedCallback input_consumed,
                       void* const callback_context,
                       PngDecodeTimings* const timings) noexcept {
     if (compressed.empty() || !surface.pixels || surface.width == 0 ||
-        surface.height == 0 || surface.stride != surface.width * 4U) {
+        surface.height == 0 || surface.stride < surface.width * 4U) {
         return E_INVALIDARG;
     }
 
@@ -377,7 +404,26 @@ HRESULT DecodePngSpng(const std::span<std::byte> compressed,
     if (result == SPNG_OK && decoded_bytes != surface.ByteSize()) {
         return E_INVALIDARG;
     }
-    if (result == SPNG_OK) {
+    const std::size_t row_bytes = static_cast<std::size_t>(surface.width) * 4;
+    if (result == SPNG_OK && surface.stride != row_bytes) {
+        result = spng_decode_image(context.get(), nullptr, 0, output_format,
+                                   SPNG_DECODE_PROGRESSIVE);
+        while (result == SPNG_OK) {
+            spng_row_info row{};
+            result = spng_get_row_info(context.get(), &row);
+            if (result != SPNG_OK) break;
+            if (row.row_num >= surface.height) {
+                result = SPNG_EOVERFLOW;
+                break;
+            }
+            result = spng_decode_row(
+                context.get(),
+                surface.pixels + static_cast<std::size_t>(row.row_num) *
+                                     surface.stride,
+                row_bytes);
+        }
+        if (result == SPNG_EOI) result = SPNG_OK;
+    } else if (result == SPNG_OK) {
         result = spng_decode_image(context.get(), surface.pixels,
                                    surface.ByteSize(), output_format, 0);
     }

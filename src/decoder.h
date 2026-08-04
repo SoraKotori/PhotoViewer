@@ -15,6 +15,9 @@ public:
     void ResetMetrics() noexcept;
     [[nodiscard]] std::uint64_t DecodeCount() const noexcept;
     [[nodiscard]] std::uint64_t DecodeNanoseconds() const noexcept;
+    [[nodiscard]] std::size_t SelectedCpuSetCount() const noexcept;
+    [[nodiscard]] std::size_t UnthrottledWorkerCount() const noexcept;
+    [[nodiscard]] std::size_t ElevatedWorkerCount() const noexcept;
 
     DecoderPool(const DecoderPool&) = delete;
     DecoderPool& operator=(const DecoderPool&) = delete;
@@ -37,6 +40,9 @@ private:
     std::vector<std::jthread> workers_;
     std::atomic<std::uint64_t> decode_count_{0};
     std::atomic<std::uint64_t> decode_nanoseconds_{0};
+    std::atomic<std::size_t> selected_cpu_set_count_{0};
+    std::atomic<std::size_t> unthrottled_worker_count_{0};
+    std::atomic<std::size_t> elevated_worker_count_{0};
 };
 
 }  // namespace pv

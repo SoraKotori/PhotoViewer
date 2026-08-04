@@ -30,12 +30,8 @@ void TestSpng() {
     std::array<std::byte, raw.size()> png{};
     for (std::size_t index = 0; index < raw.size(); ++index) png[index] = std::byte{raw[index]};
 
-    pv::CpuSurface surface;
-    surface.width = 1;
-    surface.height = 1;
-    surface.stride = 4;
-    Check(surface.Allocate(5), "allocate decoded surface and PNG filter byte");
-    surface.byte_size = 4;
+    std::array<std::byte, 8> decoded{};
+    pv::DecodeSurface surface{decoded.data(), decoded.size(), 4, 1, 1, 4};
     pv::CheckHr(pv::DecodePngSpng(png, surface), "Decode embedded PNG with libspng");
     Check(surface.pixels[3] == std::byte{0xFF}, "decoded alpha channel");
 
@@ -60,9 +56,9 @@ void TestSpng() {
 void TestCancelledWorkReleasesInput() {
     pv::ResourceSlots slots(1, 1, 1, pv::MiB(1), pv::MiB(1));
     const pv::SlotId compressed_slot = slots.AcquireCompressed(4096, 0, 1);
-    const pv::SlotId cpu_surface_slot = slots.AcquireCpuSurface(4096, 0, 1);
+    const pv::SlotId staging_slot = slots.AcquireStaging(4096, 0, 1);
     Check(compressed_slot != pv::kInvalidSlot &&
-              cpu_surface_slot != pv::kInvalidSlot,
+              staging_slot != pv::kInvalidSlot,
           "allocate cancellation test slots");
 
     auto token = std::make_shared<pv::WorkToken>();
@@ -71,7 +67,7 @@ void TestCancelledWorkReleasesInput() {
     pv::CompletionQueue completion_queue;
     {
         pv::DecoderPool pool(1, work_queue, completion_queue, slots, nullptr);
-        pv::DecodeWork work{0, 1, token, compressed_slot, cpu_surface_slot};
+        pv::DecodeWork work{0, 1, token, compressed_slot, staging_slot};
         Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
 
         std::vector<pv::DecodeResult> results;
@@ -92,10 +88,84 @@ void TestCancelledWorkReleasesInput() {
     }
 
     slots.ReleaseCompressed(compressed_slot);
-    slots.ReleaseCpuSurface(cpu_surface_slot);
+    slots.ReleaseStaging(staging_slot);
     Check(slots.FreeCompressedCount() == 1 &&
-              slots.FreeCpuSurfaceCount() == 1,
+              slots.FreeStagingCount() == 1,
           "cancelled work slots must return to their free indexes");
+}
+
+void TestManagedStagingUpload() {
+    pv::ComPtr<ID3D11Device> device;
+    pv::ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL feature_level{};
+    constexpr std::array feature_levels{D3D_FEATURE_LEVEL_11_1,
+                                        D3D_FEATURE_LEVEL_11_0};
+    pv::CheckHr(D3D11CreateDevice(
+                    nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                    feature_levels.data(), static_cast<UINT>(feature_levels.size()),
+                    D3D11_SDK_VERSION, &device, &feature_level, &context),
+                "Create D3D11 device for managed staging test");
+
+    constexpr UINT width = 16;
+    constexpr UINT height = 16;
+    constexpr UINT stride = width * 4;
+    std::array<std::byte, stride * height> source{};
+    for (std::size_t offset = 0; offset < source.size(); offset += 4) {
+        source[offset + 0] = std::byte{0x12};
+        source[offset + 1] = std::byte{0x34};
+        source[offset + 2] = std::byte{0x56};
+        source[offset + 3] = std::byte{0xFF};
+    }
+
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = width;
+    description.Height = height;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    pv::ComPtr<ID3D11Texture2D> texture;
+    pv::CheckHr(device->CreateTexture2D(&description, nullptr, &texture),
+                "Create destination texture for managed staging test");
+
+    description.Usage = D3D11_USAGE_STAGING;
+    description.BindFlags = 0;
+    description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    pv::ComPtr<ID3D11Texture2D> upload;
+    pv::CheckHr(device->CreateTexture2D(&description, nullptr, &upload),
+                "Create managed upload staging texture");
+    D3D11_MAPPED_SUBRESOURCE upload_mapping{};
+    pv::CheckHr(context->Map(upload.Get(), 0, D3D11_MAP_WRITE, 0,
+                            &upload_mapping),
+                "Map managed upload staging texture");
+    for (UINT row = 0; row < height; ++row) {
+        std::memcpy(static_cast<std::byte*>(upload_mapping.pData) +
+                        static_cast<std::size_t>(row) * upload_mapping.RowPitch,
+                    source.data() + static_cast<std::size_t>(row) * stride,
+                    stride);
+    }
+    context->Unmap(upload.Get(), 0);
+
+    std::memset(source.data(), 0xA5, source.size());
+    context->CopyResource(texture.Get(), upload.Get());
+
+    description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    pv::ComPtr<ID3D11Texture2D> readback;
+    pv::CheckHr(device->CreateTexture2D(&description, nullptr, &readback),
+                "Create readback staging texture for managed staging test");
+    context->CopyResource(readback.Get(), texture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    pv::CheckHr(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+                "Read texture uploaded through managed staging");
+    const auto* const pixel = static_cast<const std::byte*>(mapped.pData);
+    const bool retained = pixel[0] == std::byte{0x12} &&
+                          pixel[1] == std::byte{0x34} &&
+                          pixel[2] == std::byte{0x56} &&
+                          pixel[3] == std::byte{0xFF};
+    context->Unmap(readback.Get(), 0);
+    Check(retained, "managed staging upload must preserve source pixels");
 }
 
 void TestGraphics(const HINSTANCE instance) {
@@ -113,19 +183,21 @@ void TestGraphics(const HINSTANCE instance) {
     {
         pv::Graphics graphics;
         graphics.Initialize(window);
-        auto surface = std::make_unique<pv::CpuSurface>();
-        surface->width = 64;
-        surface->height = 64;
-        surface->stride = 64 * 4;
-        Check(surface->Allocate(64 * 64 * 4), "allocate upload surface");
-        for (std::size_t offset = 0; offset < surface->ByteSize(); offset += 4) {
-            surface->pixels[offset + 0] = std::byte{0x20};
-            surface->pixels[offset + 1] = std::byte{0x80};
-            surface->pixels[offset + 2] = std::byte{0xE0};
-            surface->pixels[offset + 3] = std::byte{0xFF};
+        pv::DecodeStaging staging;
+        graphics.MapDecodeStaging(staging, 64, 64, 64 * 64 * 4);
+        for (UINT row = 0; row < staging.surface.height; ++row) {
+            std::byte* const pixels = staging.surface.pixels +
+                static_cast<std::size_t>(row) * staging.surface.stride;
+            for (UINT column = 0; column < staging.surface.width; ++column) {
+                pixels[column * 4 + 0] = std::byte{0x20};
+                pixels[column * 4 + 1] = std::byte{0x80};
+                pixels[column * 4 + 2] = std::byte{0xE0};
+                pixels[column * 4 + 3] = std::byte{0xFF};
+            }
         }
+        graphics.UnmapDecodeStaging(staging);
         pv::GpuImage image;
-        pv::UploadTicket ticket = graphics.SubmitUpload(0, 1, *surface, image);
+        pv::UploadTicket ticket = graphics.SubmitUpload(0, 1, 0, staging, image);
         graphics.ArmFence(ticket.fence_value);
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "D3D11 fence completion");
@@ -165,7 +237,9 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     const auto load_begin = std::chrono::steady_clock::now();
     std::size_t compressed_bytes = 0;
 
-    std::vector<std::unique_ptr<pv::CpuSurface>> surfaces;
+    std::vector<std::vector<std::byte>> pixel_storage;
+    std::vector<pv::DecodeSurface> surfaces;
+    pixel_storage.reserve(workers);
     surfaces.reserve(workers);
     for (std::size_t index = 0; index < workers; ++index) {
         std::ifstream input(*(first + index), std::ios::binary | std::ios::ate);
@@ -180,13 +254,10 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
         const std::uint32_t width = ReadBigEndian(compressed.data() + 16);
         const std::uint32_t height = ReadBigEndian(compressed.data() + 20);
         const std::size_t decoded_bytes = static_cast<std::size_t>(width) * height * 4;
-        auto surface = std::make_unique<pv::CpuSurface>();
-        surface->width = width;
-        surface->height = height;
-        surface->stride = width * 4;
-        Check(surface->Allocate(decoded_bytes + height), "allocate benchmark surface");
-        surface->byte_size = decoded_bytes;
-        surface->byte_size = decoded_bytes;
+        pixel_storage.emplace_back(decoded_bytes + height);
+        pv::DecodeSurface surface{pixel_storage.back().data(),
+                                  pixel_storage.back().size(), decoded_bytes,
+                                  width, height, width * 4};
         compressed_images.push_back(std::move(compressed));
         surfaces.push_back(std::move(surface));
     }
@@ -205,7 +276,7 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
             start.wait();
             const auto worker_begin = std::chrono::steady_clock::now();
             results[index] = pv::DecodePngSpng(compressed_images[index],
-                                               *surfaces[index], nullptr, nullptr,
+                                               surfaces[index], nullptr, nullptr,
                                                &decode_timings[index]);
             worker_milliseconds[index] = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - worker_begin).count();
@@ -221,12 +292,12 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
           "PNG benchmark decode");
     std::uint64_t sampled_digest = 1469598103934665603ULL;
     for (const auto& surface : surfaces) {
-        for (std::size_t offset = 0; offset < surface->ByteSize(); offset += 4096) {
-            sampled_digest ^= static_cast<std::uint8_t>(surface->pixels[offset]);
+        for (std::size_t offset = 0; offset < surface.ByteSize(); offset += 4096) {
+            sampled_digest ^= static_cast<std::uint8_t>(surface.pixels[offset]);
             sampled_digest *= 1099511628211ULL;
         }
         sampled_digest ^= static_cast<std::uint8_t>(
-            surface->pixels[surface->ByteSize() - 1]);
+            surface.pixels[surface.ByteSize() - 1]);
         sampled_digest *= 1099511628211ULL;
     }
     std::sort(worker_milliseconds.begin(), worker_milliseconds.end());
@@ -294,13 +365,18 @@ int BenchmarkGraphics(const HINSTANCE instance) {
 
     pv::Graphics graphics;
     graphics.Initialize(window);
-    auto surface = std::make_unique<pv::CpuSurface>();
-    surface->width = 7680;
-    surface->height = 4320;
-    surface->stride = surface->width * 4;
-    Check(surface->Allocate(static_cast<std::size_t>(surface->stride) * surface->height),
-          "allocate graphics benchmark surface");
-    std::memset(surface->pixels, 0x80, surface->ByteSize());
+    pv::DecodeStaging staging;
+    constexpr UINT width = 7680;
+    constexpr UINT height = 4320;
+    constexpr std::size_t decoded_bytes =
+        static_cast<std::size_t>(width) * height * 4;
+    graphics.MapDecodeStaging(staging, width, height, decoded_bytes);
+    for (UINT row = 0; row < height; ++row) {
+        std::memset(staging.surface.pixels +
+                        static_cast<std::size_t>(row) * staging.surface.stride,
+                    0x80, static_cast<std::size_t>(width) * 4);
+    }
+    graphics.UnmapDecodeStaging(staging);
     Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
           "initial graphics benchmark frame credit");
 
@@ -308,7 +384,7 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     const auto begin = std::chrono::steady_clock::now();
     for (std::size_t index = 0; index < frames; ++index) {
         pv::GpuImage image;
-        pv::UploadTicket ticket = graphics.SubmitUpload(index, 1, *surface, image);
+        pv::UploadTicket ticket = graphics.SubmitUpload(index, 1, 0, staging, image);
         graphics.ArmFence(ticket.fence_value);
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "graphics benchmark upload fence");
@@ -342,8 +418,9 @@ int wmain(const int argc, wchar_t** const argv) {
         }
         TestSpng();
         TestCancelledWorkReleasesInput();
+        TestManagedStagingUpload();
         TestGraphics(GetModuleHandleW(nullptr));
-        std::cout << "PASS: pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, D3D11 upload/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

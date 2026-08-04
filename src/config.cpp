@@ -73,8 +73,8 @@ Config ParseConfig() {
             if (config.validation_report.empty()) {
                 throw std::invalid_argument("invalid validation report path");
             }
-        } else if (argument.starts_with(L"--cpu-cache-mib=")) {
-            config.cpu_cache_bytes = ParseMibOption(argument, L"--cpu-cache-mib=");
+        } else if (argument.starts_with(L"--staging-cache-mib=")) {
+            config.staging_cache_bytes = ParseMibOption(argument, L"--staging-cache-mib=");
         } else if (argument.starts_with(L"--validation-timeout-ms=")) {
             const auto value = ParsePositive(argument.substr(
                 std::wstring_view(L"--validation-timeout-ms=").size()));
@@ -101,11 +101,11 @@ Config ParseConfig() {
         } else if (argument.starts_with(L"--compressed-budget-mib=")) {
             config.compressed_budget_bytes =
                 ParseMibOption(argument, L"--compressed-budget-mib=");
-        } else if (argument.starts_with(L"--cpu-surface-slot-count=")) {
+        } else if (argument.starts_with(L"--staging-slot-count=")) {
             const auto value = ParsePositive(argument.substr(
-                std::wstring_view(L"--cpu-surface-slot-count=").size()));
-            if (!value || *value > 4096) throw std::invalid_argument("invalid CPU surface slot count");
-            config.cpu_surface_slot_count = *value;
+                std::wstring_view(L"--staging-slot-count=").size()));
+            if (!value || *value > 4096) throw std::invalid_argument("invalid staging slot count");
+            config.staging_slot_count = *value;
         } else if (argument.starts_with(L"--gpu-texture-slot-count=")) {
             const auto value = ParsePositive(argument.substr(
                 std::wstring_view(L"--gpu-texture-slot-count=").size()));

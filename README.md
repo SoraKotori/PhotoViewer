@@ -36,12 +36,12 @@
 
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
-| `--workers=` | 10 | Worker thread 數量 |
+| `--workers=` | 8 | Worker thread 數量 |
 | `--work-queue=` | 64 | Work Queue 最大工作數 |
 | `--compressed-budget-mib=` | 1024 | 壓縮 PNG Slot Storage 記憶體上限 |
 | `--compressed-slot-count=` | 64 | 壓縮 PNG slot 數量上限 |
-| `--cpu-cache-mib=` | 2048 | CPU surface Slot Storage 記憶體上限 |
-| `--cpu-surface-slot-count=` | 32 | CPU surface slot 數量上限 |
+| `--staging-cache-mib=` | 2048 | 解碼 staging texture Slot Storage 記憶體上限 |
+| `--staging-slot-count=` | 32 | 解碼 staging texture slot 數量上限 |
 | `--gpu-cache-mib=` | 768 | GPU texture 記憶體上限 |
 | `--gpu-texture-slot-count=` | 16 | GPU texture slot 數量上限 |
 
@@ -65,11 +65,11 @@
 - Main Thread 負責事件處理、導航授權、Producer、非同步檔案 I/O 提交與完成處理、工作派發、slot 狀態轉換、GPU 上傳及圖片呈現。
 - 事件只來自外部輸入、Windows 與 DXGI 訊號或非同步工作完成。
 - Main Thread 每次重新規劃後，依需求範圍與固定記憶體額度批次提交目前可執行的全部非同步檔案讀取。
-- 壓縮資料、CPU surface 與 GPU texture 都由固定 Slot Storage 持續擁有；管線只傳遞 Slot ID，不移動大型資源所有權。
+- 壓縮資料、解碼 staging texture 與 GPU texture 都由固定 Slot Storage 持續擁有；管線只傳遞 Slot ID，不移動大型資源所有權。
 - 每個 slot 的狀態直接表示該資源目前能被誰使用；可分配索引只收錄狀態為「可分配」的 Slot ID，供 Main Thread 快速取得。
-- 提交檔案讀取前取得壓縮 slot；實際 CPU surface slot 在工作進入 Work Queue 前取得，使其占用期間從解碼工作派發開始。
-- Workers 從 Work Queue 取得壓縮 slot 與 CPU surface slot 的 ID，解碼後將結果及 Slot ID 寫入 Completion Queue。
-- Main Thread 取得 GPU texture slot 後非同步提交上傳，以 GPU 完成事件更新 slot 狀態；CPU surface slot 在上傳完成後回到「可分配」。
+- 提交檔案讀取前取得壓縮 slot；解碼工作派發前取得 staging slot，由 Main Thread 建立或重用 `D3D11_USAGE_STAGING` texture 並映射其內容。
+- Workers 從 Work Queue 取得壓縮 slot 與已映射 staging slot 的 ID，直接在 staging texture 內完成解壓縮與反濾鏡，再將結果及 Slot ID 寫入 Completion Queue。
+- Main Thread 收到 Worker 完成結果後解除映射，取得 GPU texture slot，以 `CopySubresourceRegion` 提交非同步複製；GPU fence 完成後 staging slot 才回到「可分配」。
 - 元件邊界、狀態所有權、控制與資料流程及架構約束以本文件的[控制架構文字圖](#控制架構文字圖)為準。
 
 ## 控制架構文字圖
@@ -140,7 +140,7 @@
 │
 ├─擁有→ [狀態] 緩衝需求
 │         ├─必須依序呈現範圍
-│         ├─CPU 預取範圍
+│         ├─解碼預取範圍
 │         └─GPU 預取範圍
 │
 ├─擁有→ [狀態] 每張圖片的需求狀態
@@ -149,7 +149,7 @@
 │         └─失敗
 ├─擁有→ [索引] 每張圖片目前關聯的 Slot ID
 │         ├─壓縮 PNG Slot ID
-│         └─CPU surface Slot ID
+│         └─解碼 staging texture Slot ID
 │
 ├─擁有→ [Slot Storage] 壓縮 PNG slots [內容寫入：Windows I/O；內容讀取：Worker]
 │         └─[Slot 狀態]
@@ -161,15 +161,15 @@
 ├─擁有→ [可分配索引] 壓縮 PNG Slot ID
 ├─擁有→ [狀態] 壓縮資料記憶體使用量與預估解碼輸出保留額度
 │
-├─擁有→ [Slot Storage] CPU surface slots [內容寫入：取得工作的單一 Worker；內容讀取：GPU]
+├─擁有→ [Slot Storage] 解碼 staging texture slots [內容寫入：取得工作的單一 Worker；內容讀取：GPU]
 │         └─[Slot 狀態]
 │             ├─可分配
-│             ├─解碼器正在寫入
-│             ├─可供 GPU 上傳
+│             ├─已映射且解碼器正在寫入
+│             ├─已解碼且可供 GPU 複製
 │             ├─GPU 正在讀取
 │             └─等待解碼結束後回收
-├─擁有→ [可分配索引] CPU surface Slot ID
-├─擁有→ [狀態] CPU 記憶體使用量
+├─擁有→ [可分配索引] 解碼 staging texture Slot ID
+├─擁有→ [狀態] staging 記憶體使用量
 ├─擁有→ [共享通道] Work Queue [Producer：批次填充 Work Queue；Consumers：Workers]
 ├─擁有→ [共享通道] Completion Queue [Producers：Workers；Consumer：Worker 工作完成 Handler]
 │
@@ -185,7 +185,7 @@
 ├─擁有→ [狀態] GPU 記憶體使用量
 ├─擁有→ [狀態] GPU 上傳工作
 │         ├─圖片索引
-│         ├─CPU surface Slot ID
+│         ├─解碼 staging texture Slot ID
 │         ├─GPU texture Slot ID
 │         └─完成值
 │
@@ -211,7 +211,7 @@
 ├─讀取→ 目前呈現索引
 │
 ├─寫入→ 必須依序呈現範圍
-├─寫入→ CPU 預取範圍
+├─寫入→ 解碼預取範圍
 └─寫入→ GPU 預取範圍
 ```
 
@@ -223,15 +223,15 @@
 [共用流程] 回收範圍外工作與 slots
 │
 ├─讀取→ 必須依序呈現範圍
-├─讀取→ CPU 預取範圍
+├─讀取→ 解碼預取範圍
 ├─讀取→ GPU 預取範圍
 ├─讀寫→ 每張圖片的需求狀態與關聯 Slot ID
 ├─讀寫→ Work Queue 的 Producer 端與工作取消旗標
 ├─讀寫→ 壓縮 PNG slot 狀態與可分配索引
-├─讀寫→ CPU surface slot 狀態與可分配索引
+├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
 ├─讀寫→ GPU texture slot 狀態與可分配索引
 ├─讀寫→ 可呈現 GPU 圖片索引
-├─讀寫→ CPU 與 GPU 記憶體使用量
+├─讀寫→ staging 與 GPU 記憶體使用量
 │
 ├─判斷→ 已要求且尚未取得 slot 的索引離開需求範圍
 │   └─寫入→ 需求狀態為範圍外
@@ -242,8 +242,8 @@
 │   └─寫入→ 以工作項目的原子旗標取消；只有尚未被 Worker 取得時立即釋放資源
 ├─判斷→ Worker 已取出且索引已離開需求範圍
 │   └─寫入→ 完成後可直接釋放
-├─判斷→ CPU surface 位於保留範圍外且未被 GPU 讀取
-│   └─寫入→ CPU surface slot 為可分配並加入可分配索引
+├─判斷→ 解碼 staging texture 位於保留範圍外且未被 Worker 或 GPU 使用
+│   └─寫入→ staging slot 為可分配並加入可分配索引
 └─判斷→ 可呈現 GPU 圖片位於保留範圍外且不是目前畫面
     ├─寫入→ 從可呈現 GPU 圖片索引移除圖片
     └─寫入→ 對應 GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
@@ -257,13 +257,13 @@ Slot Storage 在整個工作階段持續擁有實體資源；回收只解除圖�
 [共用流程] 批次提交可執行的檔案讀取
 │
 ├─讀取→ 必須依序呈現範圍
-├─讀取→ CPU 預取範圍
+├─讀取→ 解碼預取範圍
 ├─讀取→ 圖片路徑表
 ├─讀取→ 每張圖片的需求狀態與關聯 Slot ID
 ├─讀寫→ 壓縮 PNG slot 狀態與可分配索引
 ├─讀取→ 壓縮資料記憶體使用量
 ├─讀取→ 預估解碼輸出保留額度
-├─讀取→ CPU 記憶體額度
+├─讀取→ staging 記憶體額度
 │
 ├─計算→ 範圍內已要求且尚未關聯任何 slot 的圖片
 ├─計算→ 必須呈現的相鄰圖片優先，其次才是預取圖片
@@ -283,25 +283,25 @@ Slot Storage 在整個工作階段持續擁有實體資源；回收只解除圖�
 [共用流程] 批次填充 Work Queue
 │
 ├─讀取→ 必須依序呈現範圍
-├─讀取→ CPU 預取範圍
+├─讀取→ 解碼預取範圍
 ├─讀取→ 每張圖片的需求狀態與關聯 Slot ID
 ├─讀寫→ 壓縮 PNG slot 狀態
-├─讀寫→ CPU surface slot 狀態與可分配索引
+├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
 ├─讀寫→ Work Queue 的 Producer 端
 │
 ├─計算→ 壓縮資料可用且仍需要解碼的圖片
 ├─計算→ 必須呈現的相鄰圖片優先，其次才是預取圖片
-├─判斷→ 對每個可取得 CPU surface 的圖片
-│   ├─寫入→ 取得可分配的 CPU surface slot 並設為解碼器正在寫入
+├─判斷→ 對每個可取得解碼 staging texture 的圖片
+│   ├─寫入→ 取得可分配的 staging slot，建立或重用 staging texture 並映射
 │   ├─寫入→ 壓縮 slot 為解碼器正在讀取
-│   ├─寫入→ 圖片關聯 CPU surface Slot ID
+│   ├─寫入→ 圖片關聯解碼 staging texture Slot ID
 │   └─寫入→ Work Queue 工作
 │       ├─壓縮 PNG Slot ID
-│       └─CPU surface Slot ID
-└─判斷→ 可解碼圖片已全部派發、surface 全部使用中或 Work Queue 已達安全容量時結束
+│       └─解碼 staging texture Slot ID
+└─判斷→ 可解碼圖片已全部派發、staging texture 全部使用中或 Work Queue 已達安全容量時結束
 ```
 
-CPU surface slot 在此呼叫實際取得。Worker 只依 Work Queue 內的 Slot ID 執行解碼；Main Thread 管理圖片關聯、slot 狀態與可分配索引。
+解碼 staging texture slot 在此呼叫實際取得並由 Main Thread 映射。若額度被較低優先的已解碼 staging 佔滿，先回收最低優先且尚未交由 GPU 的 staging，再派發下一張必須呈現的圖片。Worker 只依 Work Queue 內的 Slot ID 執行解碼；Main Thread 管理圖片關聯、slot 狀態與可分配索引。
 
 #### 批次提交可執行的 GPU 上傳
 
@@ -310,27 +310,29 @@ CPU surface slot 在此呼叫實際取得。Worker 只依 Work Queue 內的 Slot
 │
 ├─讀取→ 必須依序呈現範圍
 ├─讀取→ GPU 預取範圍
-├─讀取→ 每張圖片的需求狀態與關聯 CPU Slot ID
+├─讀取→ 每張圖片的需求狀態與關聯 staging Slot ID
 ├─讀取→ 可呈現 GPU 圖片索引
-├─讀寫→ CPU surface slot 狀態
+├─讀寫→ 解碼 staging texture slot 狀態
 ├─讀寫→ GPU texture slot 狀態與可分配索引
 ├─讀寫→ GPU 記憶體使用量
 ├─讀寫→ GPU 上傳工作
 │
-├─計算→ 關聯可供 GPU 上傳的 CPU surface slot，且不在可呈現 GPU 圖片索引或 GPU 上傳工作中的圖片
+├─計算→ 關聯已解碼 staging slot，且不在可呈現 GPU 圖片索引或 GPU 上傳工作中的圖片
 ├─計算→ 下一張必須呈現的圖片優先，其次依距離排序
 ├─判斷→ 對每個目前可提交的圖片
 │   ├─寫入→ 取得可分配的 GPU texture slot 並設為 GPU 正在寫入
-│   ├─寫入→ CPU surface slot 為 GPU 正在讀取
 │   ├─寫入→ GPU 上傳工作
 │   │   ├─圖片索引
-│   │   ├─CPU surface Slot ID
-│   │   └─GPU texture Slot ID
-│   └─提交→ GPU CopyResource 與完成值
+│   │   ├─解碼 staging texture Slot ID
+│   │   ├─GPU texture Slot ID
+│   │   └─GPU fence 完成值
+│   ├─提交→ 以空白初始資料建立 GPU texture
+│   ├─提交→ 從 staging texture 複製原始圖片範圍至 GPU texture
+│   └─寫入→ staging slot 為 GPU 正在讀取
 └─判斷→ 待上傳圖片已全部提交、GPU 記憶體或 slot 數量上限或提交容量已用完時結束
 ```
 
-CopyResource 是非同步提交。Main Thread 記錄上傳狀態並由 GPU 完成事件繼續處理；Worker 持續取得下一項解碼工作。
+GPU texture 建立不傳入初始像素資料。staging texture 在 fence 完成前持續作為非同步複製來源；Main Thread 不等待 GPU，Worker 持續取得其他 staging slot 執行解碼。
 
 #### 嘗試提交下一張畫面
 
@@ -465,13 +467,14 @@ CopyResource 是非同步提交。Main Thread 記錄上傳狀態並由 GPU 完�
 │   ├─讀取→ Completion Queue 目前全部結果
 │   ├─讀寫→ 每張圖片的需求狀態與關聯 Slot ID
 │   ├─讀寫→ 壓縮 PNG slot 狀態與可分配索引
-│   ├─讀寫→ CPU surface slot 狀態與可分配索引
+│   ├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
+│   ├─命令→ 解除完成工作的 staging texture 映射
 │   ├─判斷→ 成功且仍需要
-│   │   └─寫入→ CPU surface slot 為可供 GPU 上傳
+│   │   └─寫入→ staging slot 為已解碼且可供 GPU 複製
 │   ├─判斷→ 成功且索引已離開需求範圍
-│   │   └─寫入→ CPU surface slot 為可分配並加入可分配索引
+│   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   ├─判斷→ 失敗
-│   │   └─寫入→ 需求狀態為失敗並釋放 CPU surface slot
+│   │   └─寫入→ 需求狀態為失敗並釋放 staging slot
 │   └─判斷→ 每個完成結果
 │       └─寫入→ 釋放已消耗的壓縮資料
 │
@@ -481,7 +484,7 @@ CopyResource 是非同步提交。Main Thread 記錄上傳狀態並由 GPU 完�
 └─呼叫→ 嘗試提交下一張畫面
 ```
 
-Worker 完成事件會依結果轉換 CPU surface slot，並釋放對應的壓縮 slot；所有釋放 slot 或記憶體額度的事件都會呼叫共用 I/O 提交流程。
+Worker 完成事件先解除 staging texture 映射，再依結果轉換 staging slot，並釋放對應的壓縮 slot；所有釋放 slot 或記憶體額度的事件都會呼叫共用 I/O 提交流程。
 
 #### GPU 上傳完成事件
 
@@ -492,19 +495,19 @@ Worker 完成事件會依結果轉換 CPU surface slot，並釋放對應的壓�
 │   ├─讀取→ 目前全部 GPU 上傳完成結果
 │   ├─讀寫→ GPU 上傳工作
 │   ├─讀寫→ GPU texture slot 狀態與可分配索引
-│   ├─讀寫→ CPU surface slot 狀態與可分配索引
+│   ├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
 │   ├─讀寫→ 可呈現 GPU 圖片索引
 │   ├─判斷→ 成功且圖片仍在 GPU 保留範圍
 │   │   ├─寫入→ GPU texture slot 為可供 Direct2D 繪製
 │   │   ├─寫入→ 可呈現 GPU 圖片索引
 │   │   │   └─圖片索引 → GPU texture Slot ID
-│   │   └─寫入→ CPU surface slot 為可分配並加入可分配索引
+│   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   ├─判斷→ 成功但圖片已離開 GPU 保留範圍
 │   │   ├─寫入→ GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
-│   │   └─寫入→ CPU surface slot 為可分配並加入可分配索引
+│   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   ├─判斷→ 失敗
 │   │   ├─寫入→ GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
-│   │   └─寫入→ 依 CPU 預取範圍將 CPU surface slot 恢復為可供 GPU 上傳，或設為可分配並加入可分配索引
+│   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   └─判斷→ 每個完成結果
 │       └─寫入→ 移除對應 GPU 上傳工作
 │
@@ -514,7 +517,7 @@ Worker 完成事件會依結果轉換 CPU surface slot，並釋放對應的壓�
 └─呼叫→ 嘗試提交下一張畫面
 ```
 
-GPU 完成會釋放 CPU surface slot 或使既有 CPU surface 回到可上傳狀態，讓等待解碼或等待讀取的既有需求重新進入執行判斷；導航需求由輸入事件建立。
+GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的既有需求重新進入執行判斷；導航需求由輸入事件建立。
 
 #### Frame 提交額度可用事件
 
@@ -568,7 +571,7 @@ GPU 完成會釋放 CPU surface slot 或使既有 CPU surface 回到可上傳狀
 │
 ├─讀寫→ Work Queue 的 Consumer 端與工作取消旗標
 ├─讀取→ Work Queue 指定的壓縮 PNG slot [Windows 非同步檔案 I/O 寫入]
-├─寫入→ Work Queue 指定的 CPU surface slot 像素內容
+├─寫入→ Work Queue 指定且已映射的解碼 staging texture slot 像素內容
 ├─讀寫→ Completion Queue 的 Producer 端
 └─事件→ Worker 工作完成 [主事件迴圈]
 ```
@@ -584,7 +587,7 @@ GPU 完成會釋放 CPU surface slot 或使既有 CPU surface 回到可上傳狀
 ```text
 [執行者] GPU 上傳
 │
-├─讀取→ GPU 正在讀取的 CPU surface slot
+├─讀取→ GPU 上傳工作指定的解碼 staging texture slot
 ├─寫入→ GPU 正在寫入的 GPU texture slot
 └─事件→ GPU 上傳完成 [主事件迴圈]
 ```
@@ -626,7 +629,7 @@ Work Queue 與 Completion Queue 是 Main Thread 和 Workers 之間的共享通�
 
 [資源擁有者] 資源上下文
 │
-├─擁有→ 壓縮 PNG、CPU surface 與 GPU texture Slot Storage
+├─擁有→ 壓縮 PNG、解碼 staging texture 與 GPU texture Slot Storage
 ├─擁有→ 各類可分配索引與 slot 狀態
 ├─擁有→ 可呈現 GPU 圖片索引與 GPU 上傳工作
 ├─擁有→ Work Queue [共享：Workers]
@@ -652,9 +655,9 @@ Work Queue 與 Completion Queue 是 Main Thread 和 Workers 之間的共享通�
 - 每個索引同時最多存在一條進行中的檔案讀取與解碼流程；同一張圖片取消後依當下索引狀態重新派發。
 - 檔案讀取以需求範圍及固定記憶體額度為準，一次批次提交全部可執行要求；在途 I/O 數量由提交結果產生。
 - Worker 的工作範圍為取得 Work Queue、解碼工作專屬記憶體資料，以及填充 Completion Queue。
-- CPU surface slot 從派發給 Worker 到解碼完成期間由該 Worker 獨占寫入，並在 GPU 上傳完成後成為「可分配」。
+- 解碼 staging texture slot 從派發給 Worker 到解碼完成期間由該 Worker 獨占寫入；Main Thread 解除映射並提交 GPU 複製後，slot 持續作為 GPU 來源，直到 fence 完成才成為「可分配」。
 - GPU texture slot 由 Slot Storage 持續擁有；驅逐時解除圖片關聯，等待先前繪製完成後成為「可分配」。
-- 呈現授權由輸入事件建立；CPU 與 GPU 推測性預取負責提前準備圖片資源。
+- 呈現授權由輸入事件建立；解碼與 GPU 推測性預取負責提前準備圖片資源。
 - 每個有效呈現授權依相鄰索引順序獲得獨立呈現機會。
 - 每個 Windows repeat 最多增加一張暫定授權；方向鍵放開時捨棄待呈現的 repeat 並保留待完成短按承諾。
 - 每份 Frame 提交額度最多推進一張圖片。

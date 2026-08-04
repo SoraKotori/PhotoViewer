@@ -8,9 +8,9 @@ param(
     [ValidateRange(1, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
-    [int]$Workers = 10,
+    [int]$Workers = 8,
     [ValidateRange(1, 4096)]
-    [int]$CpuSurfaceSlots = 32,
+    [int]$StagingSlots = 32,
     [ValidateRange(1, 4096)]
     [int]$GpuTextureSlots = 16,
     [ValidateRange(1, 4096)]
@@ -100,7 +100,7 @@ for ($run = 1; $run -le $Runs; ++$run) {
     $arguments = @(
         ('"' + $sample + '"'),
         "--workers=$Workers",
-        "--cpu-surface-slot-count=$CpuSurfaceSlots",
+        "--staging-slot-count=$StagingSlots",
         "--gpu-texture-slot-count=$GpuTextureSlots",
         "--compressed-slot-count=$CompressedSlots",
         "--validation-file-list=$fileList",
@@ -167,7 +167,7 @@ $average = ($measurements | Measure-Object -Average).Average
 [pscustomobject]@{
     Runs = $Runs
     Workers = $Workers
-    CpuSurfaceSlots = $CpuSurfaceSlots
+    StagingSlots = $StagingSlots
     GpuTextureSlots = $GpuTextureSlots
     CompressedSlots = $CompressedSlots
     Direction = $Direction
