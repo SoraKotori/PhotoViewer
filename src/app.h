@@ -29,15 +29,15 @@ struct ImageRecord {
     std::unique_ptr<IoRequest> io;
     std::shared_ptr<WorkToken> work_token;
     SlotId compressed_slot = kInvalidSlot;
-    SlotId cpu_surface_slot = kInvalidSlot;
+    SlotId staging_slot = kInvalidSlot;
     SlotId gpu_texture_slot = kInvalidSlot;
 };
 
 struct BufferRanges {
     std::size_t required_low = 0;
     std::size_t required_high = 0;
-    std::size_t cpu_low = 0;
-    std::size_t cpu_high = 0;
+    std::size_t decode_low = 0;
+    std::size_t decode_high = 0;
     std::size_t gpu_low = 0;
     std::size_t gpu_high = 0;
 };
@@ -84,6 +84,7 @@ private:
     void OnDirection(int direction, bool repeat, std::size_t repeat_count);
     void OnDirectionReleased(int direction);
     void OnIoComplete(IoRequest* request);
+    void CompleteIoRequest(IoRequest* request);
     void OnWorkerComplete();
     void OnGpuComplete();
     void OnFrameCredit();
@@ -106,7 +107,7 @@ private:
     bool TryPresent();
 
     [[nodiscard]] bool InRequiredRange(std::size_t index) const noexcept;
-    [[nodiscard]] bool InCpuRange(std::size_t index) const noexcept;
+    [[nodiscard]] bool InDecodeRange(std::size_t index) const noexcept;
     [[nodiscard]] bool InGpuRange(std::size_t index) const noexcept;
     [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(PipelineStage stage,
                                                                  bool gpu_range) const;

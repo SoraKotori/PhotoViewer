@@ -12,11 +12,11 @@ enum class CompressedSlotState : std::uint8_t {
     CancellationPending,
 };
 
-enum class CpuSurfaceSlotState : std::uint8_t {
+enum class StagingSlotState : std::uint8_t {
     Free,
-    DecodeOutput,
+    DecodeOutputMapped,
     DecodedPixelsAvailable,
-    UploadSource,
+    GpuCopySource,
     CancellationPending,
 };
 
@@ -34,9 +34,9 @@ struct CompressedSlot {
     std::uint64_t generation = 0;
 };
 
-struct CpuSurfaceSlot {
-    CpuSurface resource;
-    CpuSurfaceSlotState state = CpuSurfaceSlotState::Free;
+struct StagingSlot {
+    DecodeStaging resource;
+    StagingSlotState state = StagingSlotState::Free;
     std::size_t image = 0;
     std::uint64_t generation = 0;
 };
@@ -50,12 +50,12 @@ struct GpuTextureSlot {
 
 class ResourceSlots {
 public:
-    ResourceSlots(std::size_t compressed_count, std::size_t cpu_surface_count,
+    ResourceSlots(std::size_t compressed_count, std::size_t staging_count,
                   std::size_t gpu_texture_count, std::size_t compressed_budget,
-                  std::size_t cpu_budget)
-        : compressed_budget_(compressed_budget), cpu_budget_(cpu_budget) {
+                  std::size_t staging_budget)
+        : compressed_budget_(compressed_budget), staging_budget_(staging_budget) {
         Initialize(compressed_, free_compressed_, compressed_count);
-        Initialize(cpu_surfaces_, free_cpu_surfaces_, cpu_surface_count);
+        Initialize(staging_, free_staging_, staging_count);
         Initialize(gpu_textures_, free_gpu_textures_, gpu_texture_count);
     }
 
@@ -91,28 +91,25 @@ public:
         return id;
     }
 
-    [[nodiscard]] SlotId AcquireCpuSurface(std::size_t bytes, std::size_t image,
-                                           std::uint64_t generation) {
-        if (bytes == 0 || bytes > cpu_budget_ || free_cpu_surfaces_.empty()) {
+    [[nodiscard]] SlotId AcquireStaging(std::size_t bytes, std::size_t image,
+                                        std::uint64_t generation) {
+        if (bytes == 0 || bytes > staging_budget_ || free_staging_.empty()) {
             return kInvalidSlot;
         }
-        const SlotId id = BestCpuSurface(bytes);
-        CpuSurfaceSlot& slot = CpuSurfaceAt(id);
-        const std::size_t before = slot.resource.allocation_bytes;
+        const SlotId id = BestStaging(bytes);
+        StagingSlot& slot = StagingAt(id);
+        const std::size_t before = slot.resource.committed_bytes;
         if (before < bytes) {
-            TrimCpu(bytes, id);
-            if (cpu_committed_bytes_ - before > cpu_budget_ - bytes) {
+            TrimStaging(bytes, id);
+            if (staging_committed_bytes_ - before > staging_budget_ - bytes) {
                 return kInvalidSlot;
             }
+            slot.resource.ReleaseAllocation();
+            slot.resource.committed_bytes = bytes;
+            staging_committed_bytes_ = staging_committed_bytes_ - before + bytes;
         }
-        if (!slot.resource.Allocate(bytes)) {
-            cpu_committed_bytes_ -= before;
-            return kInvalidSlot;
-        }
-        cpu_committed_bytes_ = cpu_committed_bytes_ - before +
-                               slot.resource.allocation_bytes;
-        RemoveFree(free_cpu_surfaces_, id);
-        slot.state = CpuSurfaceSlotState::DecodeOutput;
+        RemoveFree(free_staging_, id);
+        slot.state = StagingSlotState::DecodeOutputMapped;
         slot.image = image;
         slot.generation = generation;
         return id;
@@ -143,20 +140,20 @@ public:
         free_compressed_.push_back(id);
     }
 
-    void ReleaseCpuSurface(SlotId id) {
+    void ReleaseStaging(SlotId id) {
         if (id == kInvalidSlot) return;
-        CpuSurfaceSlot& slot = CpuSurfaceAt(id);
-        if (slot.state == CpuSurfaceSlotState::Free) {
-            throw std::logic_error("CPU surface slot released twice");
+        StagingSlot& slot = StagingAt(id);
+        if (slot.state == StagingSlotState::Free) {
+            throw std::logic_error("staging slot released twice");
         }
-        slot.resource.width = 0;
-        slot.resource.height = 0;
-        slot.resource.stride = 0;
-        slot.resource.byte_size = 0;
-        slot.state = CpuSurfaceSlotState::Free;
+        if (slot.resource.mapped) {
+            throw std::logic_error("mapped staging slot released");
+        }
+        slot.resource.ResetView();
+        slot.state = StagingSlotState::Free;
         slot.image = 0;
         slot.generation = 0;
-        free_cpu_surfaces_.push_back(id);
+        free_staging_.push_back(id);
     }
 
     void ReleaseGpuTexture(SlotId id) {
@@ -179,11 +176,11 @@ public:
     [[nodiscard]] const CompressedSlot& Compressed(SlotId id) const {
         return *compressed_.at(id);
     }
-    [[nodiscard]] CpuSurfaceSlot& CpuSurfaceAt(SlotId id) {
-        return *cpu_surfaces_.at(id);
+    [[nodiscard]] StagingSlot& StagingAt(SlotId id) {
+        return *staging_.at(id);
     }
-    [[nodiscard]] const CpuSurfaceSlot& CpuSurfaceAt(SlotId id) const {
-        return *cpu_surfaces_.at(id);
+    [[nodiscard]] const StagingSlot& StagingAt(SlotId id) const {
+        return *staging_.at(id);
     }
     [[nodiscard]] GpuTextureSlot& GpuTextureAt(SlotId id) {
         return *gpu_textures_.at(id);
@@ -195,20 +192,20 @@ public:
     [[nodiscard]] std::size_t CompressedCommittedBytes() const noexcept {
         return compressed_committed_bytes_;
     }
-    [[nodiscard]] std::size_t CpuCommittedBytes() const noexcept {
-        return cpu_committed_bytes_;
+    [[nodiscard]] std::size_t StagingCommittedBytes() const noexcept {
+        return staging_committed_bytes_;
     }
     [[nodiscard]] std::size_t FreeCompressedCount() const noexcept {
         return free_compressed_.size();
     }
-    [[nodiscard]] std::size_t FreeCpuSurfaceCount() const noexcept {
-        return free_cpu_surfaces_.size();
+    [[nodiscard]] std::size_t FreeStagingCount() const noexcept {
+        return free_staging_.size();
     }
     [[nodiscard]] std::size_t FreeGpuTextureCount() const noexcept {
         return free_gpu_textures_.size();
     }
-    [[nodiscard]] std::size_t CpuSurfaceCount() const noexcept {
-        return cpu_surfaces_.size();
+    [[nodiscard]] std::size_t StagingCount() const noexcept {
+        return staging_.size();
     }
     [[nodiscard]] std::size_t CompressedCount() const noexcept {
         return compressed_.size();
@@ -262,16 +259,16 @@ private:
         return best;
     }
 
-    [[nodiscard]] SlotId BestCpuSurface(const std::size_t bytes) const {
-        SlotId best = free_cpu_surfaces_.front();
+    [[nodiscard]] SlotId BestStaging(const std::size_t bytes) const {
+        SlotId best = free_staging_.front();
         bool adequate = false;
-        for (const SlotId id : free_cpu_surfaces_) {
-            const std::size_t capacity = CpuSurfaceAt(id).resource.allocation_bytes;
+        for (const SlotId id : free_staging_) {
+            const std::size_t capacity = StagingAt(id).resource.committed_bytes;
             if (capacity >= bytes &&
-                (!adequate || capacity < CpuSurfaceAt(best).resource.allocation_bytes)) {
+                (!adequate || capacity < StagingAt(best).resource.committed_bytes)) {
                 best = id;
                 adequate = true;
-            } else if (!adequate && capacity < CpuSurfaceAt(best).resource.allocation_bytes) {
+            } else if (!adequate && capacity < StagingAt(best).resource.committed_bytes) {
                 best = id;
             }
         }
@@ -296,34 +293,34 @@ private:
         }
     }
 
-    void TrimCpu(std::size_t bytes, SlotId protected_id) {
-        while (cpu_committed_bytes_ - CpuSurfaceAt(protected_id).resource.allocation_bytes >
-               cpu_budget_ - bytes) {
+    void TrimStaging(std::size_t bytes, SlotId protected_id) {
+        while (staging_committed_bytes_ - StagingAt(protected_id).resource.committed_bytes >
+               staging_budget_ - bytes) {
             SlotId victim = kInvalidSlot;
-            for (const SlotId id : free_cpu_surfaces_) {
-                if (id == protected_id || CpuSurfaceAt(id).resource.allocation_bytes == 0) continue;
+            for (const SlotId id : free_staging_) {
+                if (id == protected_id || StagingAt(id).resource.committed_bytes == 0) continue;
                 if (victim == kInvalidSlot ||
-                    CpuSurfaceAt(id).resource.allocation_bytes >
-                        CpuSurfaceAt(victim).resource.allocation_bytes) {
+                    StagingAt(id).resource.committed_bytes >
+                        StagingAt(victim).resource.committed_bytes) {
                     victim = id;
                 }
             }
             if (victim == kInvalidSlot) break;
-            cpu_committed_bytes_ -= CpuSurfaceAt(victim).resource.allocation_bytes;
-            CpuSurfaceAt(victim).resource.ReleaseAllocation();
+            staging_committed_bytes_ -= StagingAt(victim).resource.committed_bytes;
+            StagingAt(victim).resource.ReleaseAllocation();
         }
     }
 
     std::vector<std::unique_ptr<CompressedSlot>> compressed_;
-    std::vector<std::unique_ptr<CpuSurfaceSlot>> cpu_surfaces_;
+    std::vector<std::unique_ptr<StagingSlot>> staging_;
     std::vector<std::unique_ptr<GpuTextureSlot>> gpu_textures_;
     std::vector<SlotId> free_compressed_;
-    std::vector<SlotId> free_cpu_surfaces_;
+    std::vector<SlotId> free_staging_;
     std::vector<SlotId> free_gpu_textures_;
     std::size_t compressed_budget_ = 0;
-    std::size_t cpu_budget_ = 0;
+    std::size_t staging_budget_ = 0;
     std::size_t compressed_committed_bytes_ = 0;
-    std::size_t cpu_committed_bytes_ = 0;
+    std::size_t staging_committed_bytes_ = 0;
 };
 
 }  // namespace pv

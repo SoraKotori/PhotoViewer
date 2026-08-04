@@ -15,8 +15,12 @@ public:
     void Initialize(HWND window);
     void Resize(UINT width, UINT height);
 
+    void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
+                          std::size_t decoded_bytes);
+    void UnmapDecodeStaging(DecodeStaging& staging) noexcept;
     UploadTicket SubmitUpload(std::size_t index, std::uint64_t generation,
-                              const CpuSurface& source, GpuImage& destination);
+                              SlotId staging_slot, const DecodeStaging& source,
+                              GpuImage& destination);
     void FinishUpload(GpuImage& image);
     void Draw(const GpuImage& image);
     void ResetMetrics() noexcept;

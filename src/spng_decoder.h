@@ -18,7 +18,7 @@ struct PngDecodeTimings {
 };
 
 HRESULT DecodePngSpng(std::span<std::byte> compressed,
-                      CpuSurface& surface,
+                      DecodeSurface& surface,
                       InputConsumedCallback input_consumed = nullptr,
                       void* callback_context = nullptr,
                       PngDecodeTimings* timings = nullptr) noexcept;
