@@ -26,17 +26,22 @@ std::size_t NavigationState::ProjectedIndex() const noexcept {
     return value;
 }
 
-void NavigationState::Step(const int direction, const bool repeat) {
-    if (image_count_ == 0 || (direction != -1 && direction != 1)) return;
+void NavigationState::Step(const int direction, const bool repeat,
+                           const std::size_t count) {
+    if (image_count_ == 0 || count == 0 ||
+        (direction != -1 && direction != 1)) return;
     if (held_direction_ != 0 && held_direction_ != direction) repeated_.clear();
     held_direction_ = direction;
-    const std::size_t projected = ProjectedIndex();
-    if ((direction < 0 && projected == 0) ||
-        (direction > 0 && projected + 1 >= image_count_)) {
-        return;
+    std::size_t projected = ProjectedIndex();
+    for (std::size_t remaining = count; remaining != 0; --remaining) {
+        if ((direction < 0 && projected == 0) ||
+            (direction > 0 && projected + 1 >= image_count_)) {
+            break;
+        }
+        (repeat ? repeated_ : committed_).push_back(direction);
+        projected = Apply(projected, direction);
+        last_direction_ = direction;
     }
-    last_direction_ = direction;
-    (repeat ? repeated_ : committed_).push_back(direction);
 }
 
 void NavigationState::Release(const int direction) {

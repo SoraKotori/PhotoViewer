@@ -196,6 +196,7 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     std::latch start(1);
     std::vector<HRESULT> results(workers, E_PENDING);
     std::vector<double> worker_milliseconds(workers, 0.0);
+    std::vector<pv::PngDecodeTimings> decode_timings(workers);
     std::vector<std::jthread> threads;
     threads.reserve(workers);
     for (std::size_t index = 0; index < workers; ++index) {
@@ -203,7 +204,9 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
             ready.count_down();
             start.wait();
             const auto worker_begin = std::chrono::steady_clock::now();
-            results[index] = pv::DecodePngSpng(compressed_images[index], *surfaces[index]);
+            results[index] = pv::DecodePngSpng(compressed_images[index],
+                                               *surfaces[index], nullptr, nullptr,
+                                               &decode_timings[index]);
             worker_milliseconds[index] = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - worker_begin).count();
         });
@@ -216,6 +219,16 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     Check(std::all_of(results.begin(), results.end(),
                       [](const HRESULT result) { return SUCCEEDED(result); }),
           "PNG benchmark decode");
+    std::uint64_t sampled_digest = 1469598103934665603ULL;
+    for (const auto& surface : surfaces) {
+        for (std::size_t offset = 0; offset < surface->ByteSize(); offset += 4096) {
+            sampled_digest ^= static_cast<std::uint8_t>(surface->pixels[offset]);
+            sampled_digest *= 1099511628211ULL;
+        }
+        sampled_digest ^= static_cast<std::uint8_t>(
+            surface->pixels[surface->ByteSize() - 1]);
+        sampled_digest *= 1099511628211ULL;
+    }
     std::sort(worker_milliseconds.begin(), worker_milliseconds.end());
     const auto percentile = [&](const double value) {
         const std::size_t rank = static_cast<std::size_t>(
@@ -225,6 +238,20 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
     };
     const double seconds = std::chrono::duration<double>(elapsed).count();
     const double load_seconds = std::chrono::duration<double>(load_elapsed).count();
+    pv::PngDecodeTimings total_timings;
+    for (const auto& timing : decode_timings) {
+        total_timings.header_nanoseconds += timing.header_nanoseconds;
+        total_timings.chunk_scan_nanoseconds += timing.chunk_scan_nanoseconds;
+        total_timings.idat_compaction_nanoseconds += timing.idat_compaction_nanoseconds;
+        total_timings.deflate_nanoseconds += timing.deflate_nanoseconds;
+        total_timings.unfilter_nanoseconds += timing.unfilter_nanoseconds;
+        for (std::size_t filter = 0; filter < total_timings.filter_rows.size(); ++filter) {
+            total_timings.filter_rows[filter] += timing.filter_rows[filter];
+        }
+    }
+    const auto average_ms = [workers](const std::uint64_t nanoseconds) {
+        return static_cast<double>(nanoseconds) / static_cast<double>(workers) / 1.0e6;
+    };
     std::cout << "FileRead images=" << workers
               << " elapsed_ms=" << (load_seconds * 1000.0)
               << " mib_per_second=" << ((compressed_bytes / 1048576.0) / load_seconds)
@@ -236,6 +263,19 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
               << " p50_worker_ms=" << percentile(0.50)
               << " p95_worker_ms=" << percentile(0.95)
               << " max_worker_ms=" << worker_milliseconds.back() << '\n';
+    std::cout << "DecodeStages"
+              << " header_ms=" << average_ms(total_timings.header_nanoseconds)
+              << " chunk_scan_ms=" << average_ms(total_timings.chunk_scan_nanoseconds)
+              << " idat_compaction_ms="
+              << average_ms(total_timings.idat_compaction_nanoseconds)
+              << " deflate_ms=" << average_ms(total_timings.deflate_nanoseconds)
+              << " unfilter_ms=" << average_ms(total_timings.unfilter_nanoseconds)
+              << " filter_none=" << total_timings.filter_rows[0]
+              << " filter_sub=" << total_timings.filter_rows[1]
+              << " filter_up=" << total_timings.filter_rows[2]
+              << " filter_average=" << total_timings.filter_rows[3]
+              << " filter_paeth=" << total_timings.filter_rows[4]
+              << " sampled_digest=" << sampled_digest << '\n';
     return 0;
 }
 

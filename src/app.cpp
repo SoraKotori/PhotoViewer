@@ -29,6 +29,13 @@ bool SameRect(const RECT& left, const RECT& right) noexcept {
            left.right == right.right && left.bottom == right.bottom;
 }
 
+bool NavigationInputPending(const HWND window) noexcept {
+    MSG message{};
+    return PeekMessageW(&message, window, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE) ||
+           PeekMessageW(&message, window, kMessageValidationStep,
+                        kMessageValidationStep, PM_NOREMOVE);
+}
+
 }  // namespace
 
 App::App(Config config)
@@ -104,8 +111,10 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
     switch (message) {
         case WM_KEYDOWN: {
             const bool repeat = (lparam & (1LL << 30)) != 0;
-            if (wparam == VK_LEFT) OnDirection(-1, repeat);
-            else if (wparam == VK_RIGHT) OnDirection(1, repeat);
+            const std::size_t repeat_count = std::max<std::size_t>(
+                1, LOWORD(static_cast<DWORD_PTR>(lparam)));
+            if (wparam == VK_LEFT) OnDirection(-1, repeat, repeat_count);
+            else if (wparam == VK_RIGHT) OnDirection(1, repeat, repeat_count);
             else if (wparam == VK_F11 && !repeat) ToggleFullscreen();
             return 0;
         }
@@ -222,9 +231,15 @@ void App::OpenInitialImage() {
     PumpPipeline();
 }
 
-void App::OnDirection(const int direction, const bool repeat) {
+void App::OnDirection(const int direction, const bool repeat,
+                      const std::size_t repeat_count) {
     if (resources_.images.empty()) return;
-    resources_.navigation.Step(direction, repeat);
+    if (!repeat && repeat_count > 1) {
+        resources_.navigation.Step(direction, false);
+        resources_.navigation.Step(direction, true, repeat_count - 1);
+    } else {
+        resources_.navigation.Step(direction, repeat, repeat_count);
+    }
     PumpPipeline();
 }
 
@@ -505,6 +520,7 @@ void App::InjectValidationNavigation() {
     validation_expected_index_ = resources_.navigation.CurrentIndex();
     validation_navigation_cursor_ = 0;
     validation_navigation_started_ = std::chrono::steady_clock::now();
+    validation_navigation_injection_finished_ = {};
     WriteValidationReport("warmup-complete", true);
     decoders_->ResetMetrics();
     graphics_.ResetMetrics();
@@ -521,6 +537,7 @@ void App::InjectValidationNavigation() {
             resources_.navigation.Release(direction);
             ++validation_navigation_cursor_;
         }
+        validation_navigation_injection_finished_ = std::chrono::steady_clock::now();
         PumpPipeline();
         return;
     }
@@ -561,6 +578,7 @@ void App::InjectValidationNavigationStep() {
     }
     ++validation_navigation_cursor_;
     if (validation_navigation_cursor_ >= config_.validation_navigation.size()) {
+        validation_navigation_injection_finished_ = std::chrono::steady_clock::now();
         StopValidationNavigationTimer();
     }
     PumpPipeline();
@@ -635,6 +653,36 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     }
     output << '\n'
            << "validation_cursor=" << validation_navigation_cursor_ << '\n'
+           << "navigation_injection_nanoseconds=";
+    if (validation_navigation_started_ != std::chrono::steady_clock::time_point{} &&
+        validation_navigation_injection_finished_ !=
+            std::chrono::steady_clock::time_point{}) {
+        output << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      validation_navigation_injection_finished_ -
+                      validation_navigation_started_)
+                      .count();
+    } else {
+        output << 0;
+    }
+    const auto report_time = std::chrono::steady_clock::now();
+    output << '\n' << "navigation_completion_nanoseconds=";
+    if (validation_navigation_started_ != std::chrono::steady_clock::time_point{}) {
+        output << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      report_time - validation_navigation_started_)
+                      .count();
+    } else {
+        output << 0;
+    }
+    output << '\n' << "navigation_pipeline_tail_nanoseconds=";
+    if (validation_navigation_injection_finished_ !=
+        std::chrono::steady_clock::time_point{}) {
+        output << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      report_time - validation_navigation_injection_finished_)
+                      .count();
+    } else {
+        output << 0;
+    }
+    output << '\n'
            << "decode_count=" << decoders_->DecodeCount() << '\n'
            << "decode_nanoseconds=" << decoders_->DecodeNanoseconds() << '\n'
            << "upload_count=" << graphics_.UploadCount() << '\n'
@@ -949,14 +997,10 @@ void App::DispatchDecodes() {
         }
 
         std::size_t higher_priority_cpu_demand = 0;
-        std::size_t higher_priority_waiting_io = 0;
         for (std::size_t candidate = resources_.ranges.cpu_low;
              candidate <= resources_.ranges.cpu_high; ++candidate) {
             if (candidate == index || !(priority(candidate) < priority(index))) continue;
             switch (StageOf(resources_.images[candidate])) {
-                case PipelineStage::WaitingIo:
-                    ++higher_priority_waiting_io;
-                    break;
                 case PipelineStage::IoInFlight:
                 case PipelineStage::CompressedReady:
                 case PipelineStage::DecodeQueued:
@@ -970,12 +1014,6 @@ void App::DispatchDecodes() {
             }
         }
         if (higher_priority_cpu_demand >= surface_capacity) continue;
-        const std::size_t waiting_reservation = std::min(
-            higher_priority_waiting_io,
-            surface_capacity > 0 ? surface_capacity - 1 : 0);
-        if (higher_priority_cpu_demand + waiting_reservation >= surface_capacity) {
-            continue;
-        }
 
         if (resources_.navigation.HeldDirection() == 0 && !InRequiredRange(index)) {
             const std::size_t ready_limit = std::max<std::size_t>(1, surface_capacity);
@@ -1132,6 +1170,7 @@ void App::SubmitUploads() {
         cpu_slot.state = CpuSurfaceSlotState::UploadSource;
         image.gpu_texture_slot = gpu_slot_id;
         resources_.uploads.push_back(std::move(ticket));
+        if (NavigationInputPending(window_)) break;
     }
     ArmOldestFence();
 }

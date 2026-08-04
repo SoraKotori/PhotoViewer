@@ -81,7 +81,7 @@ private:
     LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
     void OpenInitialImage();
-    void OnDirection(int direction, bool repeat);
+    void OnDirection(int direction, bool repeat, std::size_t repeat_count);
     void OnDirectionReleased(int direction);
     void OnIoComplete(IoRequest* request);
     void OnWorkerComplete();
@@ -134,6 +134,7 @@ private:
     std::size_t validation_navigation_cursor_ = 0;
     std::size_t validation_expected_index_ = 0;
     std::chrono::steady_clock::time_point validation_navigation_started_{};
+    std::chrono::steady_clock::time_point validation_navigation_injection_finished_{};
     PTP_TIMER validation_navigation_timer_ = nullptr;
     int exit_code_ = 0;
 

@@ -36,7 +36,7 @@
 
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
-| `--workers=` | 12 | Worker thread 數量 |
+| `--workers=` | 10 | Worker thread 數量 |
 | `--work-queue=` | 64 | Work Queue 最大工作數 |
 | `--compressed-budget-mib=` | 1024 | 壓縮 PNG Slot Storage 記憶體上限 |
 | `--compressed-slot-count=` | 64 | 壓縮 PNG slot 數量上限 |

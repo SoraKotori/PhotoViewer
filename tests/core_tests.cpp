@@ -44,6 +44,25 @@ void NavigationTests() {
     Check(PresentNext(navigation) == 6, "release must retain the initial committed press");
     Check(navigation.Empty(), "release must discard unpresented repeats");
 
+    navigation.Reset(5, 20);
+    PresentNext(navigation);
+    navigation.Step(1, false);
+    navigation.Step(1, true, 4);
+    for (const std::size_t index : std::array<std::size_t, 5>{6, 7, 8, 9, 10}) {
+        Check(PresentNext(navigation) == index,
+              "merged key repeat count must preserve every adjacent image");
+    }
+    Check(navigation.Empty(), "merged key repeat count must drain exactly");
+
+    navigation.Reset(5, 20);
+    PresentNext(navigation);
+    navigation.Step(1, false);
+    navigation.Step(1, true, 4);
+    navigation.Release(1);
+    Check(PresentNext(navigation) == 6,
+          "release must discard every unpresented merged repeat");
+    Check(navigation.Empty(), "merged repeats must not survive release");
+
     navigation.Reset(0, 2);
     PresentNext(navigation);
     navigation.Step(-1, false);

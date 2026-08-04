@@ -8,7 +8,7 @@ param(
     [ValidateRange(1, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
-    [int]$Workers = 12,
+    [int]$Workers = 10,
     [ValidateRange(1, 4096)]
     [int]$CpuSurfaceSlots = 32,
     [ValidateRange(1, 4096)]
@@ -93,6 +93,8 @@ foreach ($file in $usedFiles) {
 $navigation = $Direction * $Steps
 $inputMode = if ($ShortPresses) { 'short' } else { 'hold' }
 $measurements = @()
+$injectionMeasurements = @()
+$tailMeasurements = @()
 for ($run = 1; $run -le $Runs; ++$run) {
     $report = Join-Path $resultDirectory "performance-report-$Direction-$inputMode-$run.txt"
     $arguments = @(
@@ -128,10 +130,27 @@ for ($run = 1; $run -le $Runs; ++$run) {
     }
     $fps = $Steps * 1000.0 / $process.ExitCode
     $measurements += $fps
+    $finalReport = @{}
+    $inFinalPhase = $false
+    foreach ($line in Get-Content -LiteralPath $report) {
+        if ($line -like 'phase=*') {
+            $inFinalPhase = $line -eq 'phase=navigation-complete'
+            continue
+        }
+        if ($inFinalPhase -and $line -match '^([^=]+)=(.*)$') {
+            $finalReport[$matches[1]] = $matches[2]
+        }
+    }
+    $injectionMs = [double]$finalReport.navigation_injection_nanoseconds / 1.0e6
+    $tailMs = [double]$finalReport.navigation_pipeline_tail_nanoseconds / 1.0e6
+    $injectionMeasurements += $injectionMs
+    $tailMeasurements += $tailMs
     [pscustomobject]@{
         Run = $run
         ElapsedMs = $process.ExitCode
         ImagesPerSecond = [math]::Round($fps, 2)
+        InputInjectionMs = [math]::Round($injectionMs, 2)
+        PipelineTailMs = [math]::Round($tailMs, 2)
     }
 }
 
@@ -159,6 +178,10 @@ $average = ($measurements | Measure-Object -Average).Average
     TargetImagesPerSecond = $TargetFps
     MinimumImagesPerSecond = [math]::Round($minimum, 2)
     AverageImagesPerSecond = [math]::Round($average, 2)
+    MaximumInputInjectionMs = [math]::Round(
+        ($injectionMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MaximumPipelineTailMs = [math]::Round(
+        ($tailMeasurements | Measure-Object -Maximum).Maximum, 2)
     SourceFilesUnchanged = $true
 }
 if ($minimum -lt $TargetFps) {
