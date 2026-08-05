@@ -108,21 +108,20 @@ void AddPaeth(std::uint8_t* const destination, const std::uint8_t* const source,
     const auto decode_pixel = [](__m128i filtered, const __m128i left,
                                  const __m128i up,
                                  const __m128i upper_left) noexcept {
-        const __m128i distance_left = _mm_abs_epi16(
-            _mm_sub_epi16(up, upper_left));
-        const __m128i distance_up = _mm_abs_epi16(
-            _mm_sub_epi16(left, upper_left));
+        const __m128i up_delta = _mm_sub_epi16(up, upper_left);
+        const __m128i left_delta = _mm_sub_epi16(left, upper_left);
+        const __m128i distance_left = _mm_abs_epi16(up_delta);
+        const __m128i distance_up = _mm_abs_epi16(left_delta);
         const __m128i distance_upper_left = _mm_abs_epi16(
-            _mm_add_epi16(_mm_sub_epi16(up, upper_left),
-                          _mm_sub_epi16(left, upper_left)));
-        const __m128i smallest = _mm_min_epi16(
-            distance_upper_left, _mm_min_epi16(distance_left, distance_up));
-        const __m128i choose_left = _mm_cmpeq_epi16(smallest, distance_left);
-        const __m128i choose_up = _mm_cmpeq_epi16(smallest, distance_up);
-        const __m128i up_or_upper_left = _mm_blendv_epi8(
-            upper_left, up, choose_up);
+            _mm_add_epi16(up_delta, left_delta));
+        const __m128i choose_up = _mm_cmpgt_epi16(distance_left, distance_up);
+        const __m128i left_or_up = _mm_blendv_epi8(left, up, choose_up);
+        const __m128i nearest_left_or_up = _mm_min_epi16(
+            distance_left, distance_up);
+        const __m128i choose_upper_left = _mm_cmpgt_epi16(
+            nearest_left_or_up, distance_upper_left);
         const __m128i prediction = _mm_blendv_epi8(
-            up_or_upper_left, left, choose_left);
+            left_or_up, upper_left, choose_upper_left);
         return _mm_add_epi8(filtered, prediction);
     };
     std::size_t offset = 0;
