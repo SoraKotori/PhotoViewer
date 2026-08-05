@@ -8,13 +8,19 @@ param(
     [ValidateRange(1, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
-    [int]$Workers = 8,
+    [int]$Workers = 7,
     [ValidateRange(1, 4096)]
-    [int]$StagingSlots = 32,
+    [int]$StagingSlots = 12,
     [ValidateRange(1, 4096)]
-    [int]$GpuTextureSlots = 16,
+    [int]$GpuTextureSlots = 6,
     [ValidateRange(1, 4096)]
-    [int]$CompressedSlots = 64,
+    [int]$CompressedSlots = 24,
+    [ValidateRange(1, 16384)]
+    [int]$StagingCacheMiB = 1280,
+    [ValidateRange(1, 16384)]
+    [int]$GpuCacheMiB = 512,
+    [ValidateRange(1, 16384)]
+    [int]$CompressedBudgetMiB = 640,
     [ValidateSet('L', 'R')]
     [string]$Direction = 'R',
     [switch]$ShortPresses,
@@ -95,6 +101,9 @@ $inputMode = if ($ShortPresses) { 'short' } else { 'hold' }
 $measurements = @()
 $injectionMeasurements = @()
 $tailMeasurements = @()
+$privateMemoryMeasurements = @()
+$workingSetMeasurements = @()
+$managedMemoryMeasurements = @()
 for ($run = 1; $run -le $Runs; ++$run) {
     $report = Join-Path $resultDirectory "performance-report-$Direction-$inputMode-$run.txt"
     $arguments = @(
@@ -103,6 +112,9 @@ for ($run = 1; $run -le $Runs; ++$run) {
         "--staging-slot-count=$StagingSlots",
         "--gpu-texture-slot-count=$GpuTextureSlots",
         "--compressed-slot-count=$CompressedSlots",
+        "--staging-cache-mib=$StagingCacheMiB",
+        "--gpu-cache-mib=$GpuCacheMiB",
+        "--compressed-budget-mib=$CompressedBudgetMiB",
         "--validation-file-list=$fileList",
         "--validation-navigation=$navigation",
         "--validation-warmup-ms=$WarmupMs",
@@ -120,8 +132,24 @@ for ($run = 1; $run -le $Runs; ++$run) {
         -FilePath $viewer `
         -ArgumentList $arguments `
         -WindowStyle Hidden `
-        -Wait `
         -PassThru
+    [int64]$peakPrivateBytes = 0
+    [int64]$peakWorkingSetBytes = 0
+    while (-not $process.HasExited) {
+        try {
+            $process.Refresh()
+            $peakPrivateBytes = [math]::Max(
+                $peakPrivateBytes, $process.PrivateMemorySize64)
+            $peakWorkingSetBytes = [math]::Max(
+                $peakWorkingSetBytes, $process.WorkingSet64)
+        } catch {
+            # The process can exit between HasExited and Refresh.
+        }
+        Start-Sleep -Milliseconds 10
+    }
+    $process.WaitForExit()
+    $privateMemoryMeasurements += $peakPrivateBytes
+    $workingSetMeasurements += $peakWorkingSetBytes
     if ($process.ExitCode -ge 100 -and $process.ExitCode -le 109) {
         throw "Run $run timed out at pipeline stage $($process.ExitCode - 100)"
     }
@@ -131,6 +159,12 @@ for ($run = 1; $run -le $Runs; ++$run) {
     $fps = $Steps * 1000.0 / $process.ExitCode
     $measurements += $fps
     $finalReport = @{}
+    $managedPeakBytes = 0L
+    $managedBytes = @{
+        compressed_committed_bytes = 0L
+        staging_committed_bytes = 0L
+        gpu_bytes = 0L
+    }
     $inFinalPhase = $false
     foreach ($line in Get-Content -LiteralPath $report) {
         if ($line -like 'phase=*') {
@@ -140,7 +174,15 @@ for ($run = 1; $run -le $Runs; ++$run) {
         if ($inFinalPhase -and $line -match '^([^=]+)=(.*)$') {
             $finalReport[$matches[1]] = $matches[2]
         }
+        if ($line -match '^(compressed_committed_bytes|staging_committed_bytes|gpu_bytes)=([0-9]+)$') {
+            $managedBytes[$matches[1]] = [int64]$matches[2]
+            $managedTotal = $managedBytes.compressed_committed_bytes +
+                            $managedBytes.staging_committed_bytes +
+                            $managedBytes.gpu_bytes
+            $managedPeakBytes = [math]::Max($managedPeakBytes, $managedTotal)
+        }
     }
+    $managedMemoryMeasurements += $managedPeakBytes
     $injectionMs = [double]$finalReport.navigation_injection_nanoseconds / 1.0e6
     $tailMs = [double]$finalReport.navigation_pipeline_tail_nanoseconds / 1.0e6
     $injectionMeasurements += $injectionMs
@@ -151,6 +193,9 @@ for ($run = 1; $run -le $Runs; ++$run) {
         ImagesPerSecond = [math]::Round($fps, 2)
         InputInjectionMs = [math]::Round($injectionMs, 2)
         PipelineTailMs = [math]::Round($tailMs, 2)
+        PeakPrivateMiB = [math]::Round($peakPrivateBytes / 1MB, 1)
+        PeakWorkingSetMiB = [math]::Round($peakWorkingSetBytes / 1MB, 1)
+        PeakManagedStorageMiB = [math]::Round($managedPeakBytes / 1MB, 1)
     }
 }
 
@@ -170,6 +215,9 @@ $average = ($measurements | Measure-Object -Average).Average
     StagingSlots = $StagingSlots
     GpuTextureSlots = $GpuTextureSlots
     CompressedSlots = $CompressedSlots
+    StagingCacheMiB = $StagingCacheMiB
+    GpuCacheMiB = $GpuCacheMiB
+    CompressedBudgetMiB = $CompressedBudgetMiB
     Direction = $Direction
     InputMode = $inputMode
     StepsPerRun = $Steps
@@ -182,6 +230,12 @@ $average = ($measurements | Measure-Object -Average).Average
         ($injectionMeasurements | Measure-Object -Maximum).Maximum, 2)
     MaximumPipelineTailMs = [math]::Round(
         ($tailMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MaximumPrivateMiB = [math]::Round(
+        (($privateMemoryMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
+    MaximumWorkingSetMiB = [math]::Round(
+        (($workingSetMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
+    MaximumManagedStorageMiB = [math]::Round(
+        (($managedMemoryMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
     SourceFilesUnchanged = $true
 }
 if ($minimum -lt $TargetFps) {

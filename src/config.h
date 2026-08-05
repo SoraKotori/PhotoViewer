@@ -9,13 +9,13 @@ namespace pv {
 
 struct Config {
     std::filesystem::path initial_image;
-    std::size_t staging_cache_bytes = 2048ULL * 1024ULL * 1024ULL;
-    std::size_t gpu_cache_bytes = 768ULL * 1024ULL * 1024ULL;
-    std::size_t compressed_budget_bytes = 1024ULL * 1024ULL * 1024ULL;
-    std::size_t staging_slot_count = 32;
-    std::size_t gpu_texture_slot_count = 16;
-    std::size_t compressed_slot_count = 64;
-    std::size_t worker_count = 8;
+    std::size_t staging_cache_bytes = 1280ULL * 1024ULL * 1024ULL;
+    std::size_t gpu_cache_bytes = 512ULL * 1024ULL * 1024ULL;
+    std::size_t compressed_budget_bytes = 640ULL * 1024ULL * 1024ULL;
+    std::size_t staging_slot_count = 12;
+    std::size_t gpu_texture_slot_count = 6;
+    std::size_t compressed_slot_count = 24;
+    std::size_t worker_count = 7;
     std::size_t work_queue_capacity = 64;
     bool validation_exit_after_present = false;
     bool validation_elapsed_exit_code = false;

@@ -36,14 +36,14 @@
 
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
-| `--workers=` | 8 | Worker thread 數量 |
+| `--workers=` | 7 | Worker thread 數量 |
 | `--work-queue=` | 64 | Work Queue 最大工作數 |
-| `--compressed-budget-mib=` | 1024 | 壓縮 PNG Slot Storage 記憶體上限 |
-| `--compressed-slot-count=` | 64 | 壓縮 PNG slot 數量上限 |
-| `--staging-cache-mib=` | 2048 | 解碼 staging texture Slot Storage 記憶體上限 |
-| `--staging-slot-count=` | 32 | 解碼 staging texture slot 數量上限 |
-| `--gpu-cache-mib=` | 768 | GPU texture 記憶體上限 |
-| `--gpu-texture-slot-count=` | 16 | GPU texture slot 數量上限 |
+| `--compressed-budget-mib=` | 640 | 壓縮 PNG Slot Storage 記憶體上限 |
+| `--compressed-slot-count=` | 24 | 壓縮 PNG slot 數量上限 |
+| `--staging-cache-mib=` | 1280 | 解碼 staging texture Slot Storage 記憶體上限 |
+| `--staging-slot-count=` | 12 | 解碼 staging texture slot 數量上限 |
+| `--gpu-cache-mib=` | 512 | GPU texture 記憶體上限 |
+| `--gpu-texture-slot-count=` | 6 | GPU texture slot 數量上限 |
 
 ## 圖片呈現品質
 
