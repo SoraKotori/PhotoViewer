@@ -36,7 +36,7 @@
 
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
-| `--workers=` | 7 | Worker thread 數量 |
+| `--workers=` | 6 | Worker thread 數量 |
 | `--work-queue=` | 64 | Work Queue 最大工作數 |
 | `--compressed-budget-mib=` | 640 | 壓縮 PNG Slot Storage 記憶體上限 |
 | `--compressed-slot-count=` | 24 | 壓縮 PNG slot 數量上限 |
@@ -55,7 +55,7 @@
 | 項目 | 最低需求 |
 |---|---|
 | 作業系統 | Windows 10 version 1703（build 15063）或更新版本，64-bit |
-| 處理器架構 | x64（AMD64） |
+| 處理器 | x86-64-v3 相容處理器 |
 | 顯示卡與驅動程式 | 硬體 Direct3D 裝置，Feature Level 11_1 以上並支援 D3D11 fence |
 | 執行階段 | Microsoft Visual C++ v14 Redistributable x64，version 14.51.36247 以上 |
 

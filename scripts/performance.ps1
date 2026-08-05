@@ -8,7 +8,7 @@ param(
     [ValidateRange(1, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
-    [int]$Workers = 7,
+    [int]$Workers = 6,
     [ValidateRange(1, 4096)]
     [int]$StagingSlots = 12,
     [ValidateRange(1, 4096)]
