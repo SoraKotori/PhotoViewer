@@ -1,5 +1,6 @@
 #include "navigation.h"
 #include "png.h"
+#include "processor_topology.h"
 #include "resource_slots.h"
 #include "reservation.h"
 #include "work_queue.h"
@@ -15,6 +16,26 @@ void Check(const bool condition, const char* message) {
         std::cerr << "FAIL: " << message << '\n';
         std::exit(1);
     }
+}
+
+std::size_t ProcessorTopologyTests() {
+    Check(pv::DefaultWorkerCountForPhysicalCores(0) == 1,
+          "missing topology must retain one worker");
+    Check(pv::DefaultWorkerCountForPhysicalCores(1) == 1,
+          "one physical core must select one worker");
+    Check(pv::DefaultWorkerCountForPhysicalCores(8) == 8,
+          "worker default must follow physical cores below the cap");
+    Check(pv::DefaultWorkerCountForPhysicalCores(16) == 16,
+          "worker default must include the cap");
+    Check(pv::DefaultWorkerCountForPhysicalCores(32) == 16,
+          "worker default must not exceed the cap");
+
+    const std::size_t detected = pv::DetectPhysicalCoreCount();
+    Check(detected > 0, "physical core detection must return a usable count");
+    Check(pv::DefaultWorkerCount() ==
+              pv::DefaultWorkerCountForPhysicalCores(detected),
+          "runtime worker default must use the detected physical core count");
+    return detected;
 }
 
 std::size_t PresentNext(pv::NavigationState& navigation) {
@@ -218,7 +239,7 @@ void ReservationTests() {
               table.FindFrame(10) == pv::kInvalidReservation,
           "safe retired reservation must be reassigned without a second pool");
 
-    pv::WorkQueue queue(2);
+    pv::WorkQueue queue;
     auto token = std::make_shared<pv::WorkToken>();
     pv::DecodeWork work{3, 7, token, 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
@@ -239,15 +260,29 @@ void ReservationTests() {
     pv::DecodeWork popped;
     Check(queue.Pop(popped, std::stop_token{}) && popped.index == 4,
           "queued decode work must follow the latest navigation priority");
+
+    pv::WorkQueue naturally_bounded_queue;
+    std::vector<std::shared_ptr<pv::WorkToken>> natural_tokens;
+    natural_tokens.reserve(32);
+    for (std::size_t index = 0; index < 32; ++index) {
+        natural_tokens.push_back(std::make_shared<pv::WorkToken>());
+        pv::DecodeWork queued{index, 1, natural_tokens.back(), 0, 0};
+        Check(naturally_bounded_queue.TryPush(queued),
+              "work queue must not impose an independent item-count limit");
+    }
+    Check(naturally_bounded_queue.Size() == 32,
+          "work queue size must be bounded only by dispatched slot-backed work");
 }
 
 }  // namespace
 
 int main() {
+    const std::size_t physical_core_count = ProcessorTopologyTests();
     NavigationTests();
     PngTests();
     ResourceSlotTests();
     ReservationTests();
-    std::cout << "PASS: core tests\n";
+    std::cout << "PASS: core tests physical_core_count=" << physical_core_count
+              << " default_worker_count=" << pv::DefaultWorkerCount() << '\n';
     return 0;
 }

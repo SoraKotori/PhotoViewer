@@ -2,6 +2,9 @@
 #include "decoder.h"
 #include "graphics.h"
 #include "spng_decoder.h"
+#define SPNG_STATIC
+#include "../third_party/libspng/spng.h"
+#include "../third_party/zlib-ng/zlib.h"
 
 #include <array>
 #include <cmath>
@@ -14,6 +17,159 @@ namespace {
 
 void Check(const bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+std::uint8_t ReferencePaeth(const std::uint8_t left, const std::uint8_t up,
+                            const std::uint8_t upper_left) {
+    const int p = static_cast<int>(left) + up - upper_left;
+    const int pa = std::abs(p - left);
+    const int pb = std::abs(p - up);
+    const int pc = std::abs(p - upper_left);
+    if (pa <= pb && pa <= pc) return left;
+    return pb <= pc ? up : upper_left;
+}
+
+void AppendBigEndian(std::vector<std::byte>& output, const std::uint32_t value) {
+    output.push_back(std::byte{static_cast<std::uint8_t>(value >> 24)});
+    output.push_back(std::byte{static_cast<std::uint8_t>(value >> 16)});
+    output.push_back(std::byte{static_cast<std::uint8_t>(value >> 8)});
+    output.push_back(std::byte{static_cast<std::uint8_t>(value)});
+}
+
+void AppendChunk(std::vector<std::byte>& png, const std::string_view type,
+                 const std::span<const std::byte> payload) {
+    Check(type.size() == 4 && payload.size() <= UINT32_MAX,
+          "valid synthetic PNG chunk");
+    AppendBigEndian(png, static_cast<std::uint32_t>(payload.size()));
+    const std::size_t crc_begin = png.size();
+    for (const char byte : type) {
+        png.push_back(std::byte{static_cast<std::uint8_t>(byte)});
+    }
+    png.insert(png.end(), payload.begin(), payload.end());
+    uLong crc = crc32(0, Z_NULL, 0);
+    crc = crc32(crc,
+                reinterpret_cast<const Bytef*>(png.data() + crc_begin),
+                static_cast<uInt>(png.size() - crc_begin));
+    AppendBigEndian(png, static_cast<std::uint32_t>(crc));
+}
+
+struct SyntheticPng {
+    std::vector<std::byte> encoded;
+    std::vector<std::byte> pixels;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+
+SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
+    constexpr std::array<std::uint8_t, 16> filters{
+        0, 4, 4, 4, 4, 1, 2, 3, 4, 4, 4, 4, 2, 4, 4, 4};
+    const std::uint32_t height = static_cast<std::uint32_t>(filters.size());
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
+    std::vector<std::byte> pixels(row_bytes * height);
+    for (std::uint32_t row = 0; row < height; ++row) {
+        for (std::uint32_t column = 0; column < width; ++column) {
+            for (std::uint32_t channel = 0; channel < 4; ++channel) {
+                const std::size_t offset = static_cast<std::size_t>(row) * row_bytes +
+                                           column * 4 + channel;
+                pixels[offset] = std::byte{static_cast<std::uint8_t>(
+                    row * 37U + column * 19U + channel * 73U +
+                    ((row ^ column) * 11U))};
+            }
+        }
+    }
+
+    std::vector<std::byte> filtered((row_bytes + 1) * height);
+    for (std::uint32_t row = 0; row < height; ++row) {
+        const std::uint8_t filter = filters[row];
+        const std::size_t filtered_row = static_cast<std::size_t>(row) *
+                                         (row_bytes + 1);
+        filtered[filtered_row] = std::byte{filter};
+        for (std::size_t column = 0; column < row_bytes; ++column) {
+            const std::size_t raw_offset = static_cast<std::size_t>(row) *
+                                           row_bytes + column;
+            const std::uint8_t current = static_cast<std::uint8_t>(pixels[raw_offset]);
+            const std::uint8_t left = column >= 4
+                ? static_cast<std::uint8_t>(pixels[raw_offset - 4])
+                : 0;
+            const std::uint8_t up = row != 0
+                ? static_cast<std::uint8_t>(pixels[raw_offset - row_bytes])
+                : 0;
+            const std::uint8_t upper_left = row != 0 && column >= 4
+                ? static_cast<std::uint8_t>(
+                      pixels[raw_offset - row_bytes - 4])
+                : 0;
+            std::uint8_t prediction = 0;
+            switch (filter) {
+                case 0: break;
+                case 1: prediction = left; break;
+                case 2: prediction = up; break;
+                case 3: prediction = static_cast<std::uint8_t>(
+                            (static_cast<unsigned int>(left) + up) / 2U);
+                        break;
+                case 4: prediction = ReferencePaeth(left, up, upper_left); break;
+                default: Check(false, "known synthetic PNG filter");
+            }
+            filtered[filtered_row + 1 + column] = std::byte{
+                static_cast<std::uint8_t>(current - prediction)};
+        }
+    }
+
+    uLongf compressed_size = compressBound(static_cast<uLong>(filtered.size()));
+    std::vector<std::byte> compressed(compressed_size);
+    const int compressed_result = compress2(
+        reinterpret_cast<Bytef*>(compressed.data()), &compressed_size,
+        reinterpret_cast<const Bytef*>(filtered.data()),
+        static_cast<uLong>(filtered.size()), Z_BEST_SPEED);
+    Check(compressed_result == Z_OK, "compress synthetic PNG scanlines");
+    compressed.resize(compressed_size);
+
+    std::vector<std::byte> png{
+        std::byte{0x89}, std::byte{0x50}, std::byte{0x4E}, std::byte{0x47},
+        std::byte{0x0D}, std::byte{0x0A}, std::byte{0x1A}, std::byte{0x0A}};
+    std::array<std::byte, 13> ihdr{};
+    ihdr[0] = std::byte{static_cast<std::uint8_t>(width >> 24)};
+    ihdr[1] = std::byte{static_cast<std::uint8_t>(width >> 16)};
+    ihdr[2] = std::byte{static_cast<std::uint8_t>(width >> 8)};
+    ihdr[3] = std::byte{static_cast<std::uint8_t>(width)};
+    ihdr[7] = std::byte{static_cast<std::uint8_t>(height)};
+    ihdr[8] = std::byte{8};
+    ihdr[9] = std::byte{6};
+    AppendChunk(png, "IHDR", ihdr);
+    const std::size_t split0 = compressed.size() / 3;
+    const std::size_t split1 = compressed.size() * 2 / 3;
+    AppendChunk(png, "IDAT", std::span(compressed).subspan(0, split0));
+    AppendChunk(png, "IDAT",
+                std::span(compressed).subspan(split0, split1 - split0));
+    AppendChunk(png, "IDAT", std::span(compressed).subspan(split1));
+    AppendChunk(png, "IEND", {});
+    return {std::move(png), std::move(pixels), width, height};
+}
+
+void CheckSyntheticDecode(const std::uint32_t width) {
+    SyntheticPng sample = BuildMixedFilterPng(width);
+    constexpr std::size_t guard_bytes = 64;
+    const std::size_t decoded_bytes = sample.pixels.size();
+    const std::size_t allocation_bytes = decoded_bytes + sample.height;
+    std::vector<std::byte> storage(guard_bytes + allocation_bytes + guard_bytes,
+                                   std::byte{0xA5});
+    pv::DecodeSurface surface{storage.data() + guard_bytes, allocation_bytes,
+                              decoded_bytes, sample.width, sample.height,
+                              sample.width * 4};
+    pv::CheckHr(pv::DecodePngSpng(sample.encoded, surface),
+                "decode mixed-filter synthetic PNG");
+    Check(std::equal(sample.pixels.begin(), sample.pixels.end(), surface.pixels),
+          "mixed-filter synthetic PNG full pixel equality");
+    Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
+                      [](const std::byte value) { return value == std::byte{0xA5}; }),
+          "synthetic PNG leading canary");
+    Check(std::all_of(storage.end() - guard_bytes, storage.end(),
+                      [](const std::byte value) { return value == std::byte{0xA5}; }),
+          "synthetic PNG trailing canary");
+}
+
+void TestMixedFiltersAndBounds() {
+    CheckSyntheticDecode(17);
+    CheckSyntheticDecode(2);
 }
 
 void TestSpng() {
@@ -63,7 +219,7 @@ void TestCancelledWorkReleasesInput() {
 
     auto token = std::make_shared<pv::WorkToken>();
     token->claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
-    pv::WorkQueue work_queue(1);
+    pv::WorkQueue work_queue;
     pv::CompletionQueue completion_queue;
     {
         pv::DecoderPool pool(1, work_queue, completion_queue, slots, nullptr);
@@ -227,6 +383,102 @@ std::uint32_t ReadBigEndian(const std::byte* const data) {
            (static_cast<std::uint32_t>(data[1]) << 16U) |
            (static_cast<std::uint32_t>(data[2]) << 8U) |
            static_cast<std::uint32_t>(data[3]);
+}
+
+std::vector<std::byte> ReadFileBytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    Check(input.good(), "open PNG for full pixel verification");
+    const std::streamsize length = input.tellg();
+    Check(length >= 29, "PNG verification input is too small");
+    std::vector<std::byte> bytes(static_cast<std::size_t>(length));
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(bytes.data()), length);
+    Check(input.good(), "read PNG for full pixel verification");
+    return bytes;
+}
+
+std::vector<std::byte> DecodeReferenceSpng(
+    const std::span<const std::byte> compressed,
+    const std::uint32_t width, const std::uint32_t height) {
+    std::unique_ptr<spng_ctx, decltype(&spng_ctx_free)> context(
+        spng_ctx_new(0), &spng_ctx_free);
+    Check(context != nullptr, "create reference libspng context");
+    Check(spng_set_crc_action(context.get(), SPNG_CRC_USE, SPNG_CRC_USE) ==
+              SPNG_OK,
+          "configure reference libspng CRC validation");
+    Check(spng_set_png_buffer(context.get(), compressed.data(), compressed.size()) ==
+              SPNG_OK,
+          "set reference libspng input");
+    spng_ihdr header{};
+    Check(spng_get_ihdr(context.get(), &header) == SPNG_OK &&
+              header.width == width && header.height == height &&
+              header.bit_depth == 8 &&
+              header.color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA &&
+              header.interlace_method == SPNG_INTERLACE_NONE,
+          "reference PNG must be non-interlaced RGBA8");
+    std::size_t decoded_size = 0;
+    Check(spng_decoded_image_size(context.get(), SPNG_FMT_PNG, &decoded_size) ==
+              SPNG_OK &&
+              decoded_size == static_cast<std::size_t>(width) * height * 4,
+          "reference libspng decoded size");
+    std::vector<std::byte> decoded(decoded_size);
+    Check(spng_decode_image(context.get(), decoded.data(), decoded.size(),
+                            SPNG_FMT_PNG, 0) == SPNG_OK,
+          "reference libspng full decode");
+    return decoded;
+}
+
+int VerifyFullPixels(const std::filesystem::path& start_path,
+                     const std::size_t requested) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(start_path.parent_path())) {
+        if (entry.is_regular_file() && entry.path().extension() == L".png") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    const auto first = std::find(files.begin(), files.end(), start_path);
+    Check(first != files.end(), "find starting PNG for full pixel verification");
+    std::size_t verified = 0;
+    for (auto file = first; file != files.end() && verified < requested; ++file) {
+        const std::vector<std::byte> original = ReadFileBytes(*file);
+        const std::uint32_t width = ReadBigEndian(original.data() + 16);
+        const std::uint32_t height = ReadBigEndian(original.data() + 20);
+        if (original[24] != std::byte{8} || original[25] != std::byte{6} ||
+            original[28] != std::byte{0}) {
+            continue;
+        }
+        const std::vector<std::byte> reference = DecodeReferenceSpng(
+            original, width, height);
+        std::vector<std::byte> mutable_png = original;
+        constexpr std::size_t guard_bytes = 64;
+        const std::size_t decoded_bytes = reference.size();
+        const std::size_t allocation_bytes = decoded_bytes + height;
+        std::vector<std::byte> storage(
+            guard_bytes + allocation_bytes + guard_bytes, std::byte{0x5A});
+        pv::DecodeSurface surface{storage.data() + guard_bytes, allocation_bytes,
+                                  decoded_bytes, width, height, width * 4};
+        pv::CheckHr(pv::DecodePngSpng(mutable_png, surface),
+                    "fast-path PNG decode for full pixel verification");
+        Check(std::equal(reference.begin(), reference.end(), surface.pixels),
+              "fast-path pixels must exactly match reference libspng");
+        Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
+                          [](const std::byte value) {
+                              return value == std::byte{0x5A};
+                          }),
+              "real PNG leading canary");
+        Check(std::all_of(storage.end() - guard_bytes, storage.end(),
+                          [](const std::byte value) {
+                              return value == std::byte{0x5A};
+                          }),
+              "real PNG trailing canary");
+        ++verified;
+    }
+    Check(verified == requested, "not enough compatible PNGs for verification");
+    std::cout << "FullPixelVerify images=" << verified
+              << " reference=libspng result=exact canaries=intact\n";
+    return 0;
 }
 
 int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers) {
@@ -425,11 +677,17 @@ int wmain(const int argc, wchar_t** const argv) {
             Check(workers > 0 && workers <= 64, "invalid benchmark worker count");
             return BenchmarkDecode(argv[2], workers);
         }
+        if (argc == 4 && std::wstring_view(argv[1]) == L"--verify-full-pixels") {
+            const std::size_t images = std::stoull(argv[3]);
+            Check(images > 0 && images <= 32, "invalid full pixel verification count");
+            return VerifyFullPixels(argv[2], images);
+        }
         TestSpng();
+        TestMixedFiltersAndBounds();
         TestCancelledWorkReleasesInput();
         TestManagedStagingUpload();
         TestGraphics(GetModuleHandleW(nullptr));
-        std::cout << "PASS: pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: mixed PNG filters with guarded bounds, pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

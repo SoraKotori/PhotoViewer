@@ -14,6 +14,7 @@
     <ClCompile Include="src\main.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\navigation.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\png.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\processor_topology.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\spng_decoder.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -26,6 +27,7 @@
     <ClInclude Include="src\model.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\navigation.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\png.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\processor_topology.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\spng_decoder.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\work_queue.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
