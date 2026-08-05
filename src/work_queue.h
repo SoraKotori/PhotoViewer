@@ -26,6 +26,38 @@ public:
         return true;
     }
 
+    bool TryCancel(const std::shared_ptr<WorkToken>& token,
+                   DecodeWork& cancelled) {
+        if (!token) return false;
+        std::lock_guard lock(mutex_);
+        const auto found = std::find_if(
+            queue_.begin(), queue_.end(),
+            [&](const DecodeWork& work) { return work.token == token; });
+        if (found == queue_.end()) return false;
+        WorkClaim expected = WorkClaim::Queued;
+        if (!token->claim.compare_exchange_strong(
+                expected, WorkClaim::Cancelled, std::memory_order_acq_rel)) {
+            return false;
+        }
+        cancelled = std::move(*found);
+        queue_.erase(found);
+        return true;
+    }
+
+    void Reorder(const std::span<const std::size_t> priority) {
+        std::lock_guard lock(mutex_);
+        const auto rank = [&](const std::size_t frame) {
+            const auto found = std::find(priority.begin(), priority.end(), frame);
+            return found == priority.end()
+                       ? priority.size()
+                       : static_cast<std::size_t>(found - priority.begin());
+        };
+        std::stable_sort(queue_.begin(), queue_.end(),
+                         [&](const DecodeWork& left, const DecodeWork& right) {
+                             return rank(left.index) < rank(right.index);
+                         });
+    }
+
     void Stop() {
         std::lock_guard lock(mutex_);
         stopped_ = true;

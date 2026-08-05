@@ -6,6 +6,7 @@ namespace pv {
 
 using SlotId = std::uint32_t;
 constexpr SlotId kInvalidSlot = std::numeric_limits<SlotId>::max();
+constexpr std::size_t kInvalidFrame = std::numeric_limits<std::size_t>::max();
 
 enum class PipelineStage {
     Outside,
@@ -141,7 +142,7 @@ struct UploadTicket {
     std::uint64_t generation = 0;
     UINT64 fence_value = 0;
     SlotId staging_slot = kInvalidSlot;
-    SlotId gpu_texture_slot = kInvalidSlot;
+    SlotId source_texture_slot = kInvalidSlot;
     std::size_t bytes = 0;
 };
 

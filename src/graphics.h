@@ -22,7 +22,7 @@ public:
                               SlotId staging_slot, const DecodeStaging& source,
                               GpuImage& destination);
     void FinishUpload(GpuImage& image);
-    void Draw(const GpuImage& image);
+    [[nodiscard]] UINT64 Draw(const GpuImage& image);
     void ResetMetrics() noexcept;
     [[nodiscard]] std::uint64_t UploadCount() const noexcept;
     [[nodiscard]] std::uint64_t UploadNanoseconds() const noexcept;

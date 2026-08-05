@@ -211,9 +211,14 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     ticket.generation = generation;
     ticket.staging_slot = staging_slot;
     ticket.bytes = source.surface.ByteSize();
-    destination = {};
-    CheckHr(device_->CreateTexture2D(&description, nullptr, &destination.texture),
-            "Create GPU image texture");
+    const bool reusable = destination.texture &&
+                          destination.width == source.surface.width &&
+                          destination.height == source.surface.height;
+    if (!reusable) {
+        destination = {};
+        CheckHr(device_->CreateTexture2D(&description, nullptr, &destination.texture),
+                "Create GPU image texture");
+    }
 
     const D3D11_BOX source_box{0, 0, 0, source.surface.width,
                               source.surface.height, 1};
@@ -233,6 +238,7 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
 }
 
 void Graphics::FinishUpload(GpuImage& image) {
+    if (image.bitmap) return;
     ComPtr<IDXGISurface> surface;
     CheckHr(image.texture.As(&surface), "Query uploaded IDXGISurface");
     const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
@@ -245,8 +251,8 @@ void Graphics::FinishUpload(GpuImage& image) {
             "Create Direct2D source bitmap");
 }
 
-void Graphics::Draw(const GpuImage& image) {
-    if (!image.bitmap || surface_width_ == 0 || surface_height_ == 0) return;
+UINT64 Graphics::Draw(const GpuImage& image) {
+    if (!image.bitmap || surface_width_ == 0 || surface_height_ == 0) return 0;
     const auto begin = std::chrono::steady_clock::now();
     const float sx = static_cast<float>(surface_width_) / static_cast<float>(image.width);
     const float sy = static_cast<float>(surface_height_) / static_cast<float>(image.height);
@@ -266,10 +272,14 @@ void Graphics::Draw(const GpuImage& image) {
                              D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, source);
     CheckHr(d2d_context_->EndDraw(), "Direct2D EndDraw");
     CheckHr(swap_chain_->Present(1, 0), "DXGI Present");
+    const UINT64 completion = next_fence_value_++;
+    CheckHr(context_->Signal(fence_.Get(), completion),
+            "Signal presented SourceTexture completion");
     draw_nanoseconds_ += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin).count());
     ++draw_count_;
+    return completion;
 }
 
 void Graphics::ResetMetrics() noexcept {

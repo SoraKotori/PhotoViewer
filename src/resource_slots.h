@@ -21,10 +21,11 @@ enum class StagingSlotState : std::uint8_t {
 };
 
 enum class GpuTextureSlotState : std::uint8_t {
-    Free,
-    UploadDestination,
-    Presentable,
-    Retiring,
+    Inactive,
+    Writable,
+    Writing,
+    Readable,
+    Reading,
 };
 
 struct CompressedSlot {
@@ -43,8 +44,9 @@ struct StagingSlot {
 
 struct GpuTextureSlot {
     GpuImage resource;
-    GpuTextureSlotState state = GpuTextureSlotState::Free;
-    std::size_t image = 0;
+    GpuTextureSlotState state = GpuTextureSlotState::Inactive;
+    std::size_t reserved_frame = kInvalidFrame;
+    std::size_t content_frame = kInvalidFrame;
     std::uint64_t generation = 0;
 };
 
@@ -115,16 +117,16 @@ public:
         return id;
     }
 
-    [[nodiscard]] SlotId AcquireGpuTexture(std::size_t image,
-                                           std::uint64_t generation) {
-        if (free_gpu_textures_.empty()) return kInvalidSlot;
-        const SlotId id = free_gpu_textures_.back();
-        free_gpu_textures_.pop_back();
+    [[nodiscard]] bool ActivateGpuTexture(const SlotId id) {
+        if (id == kInvalidSlot || id >= gpu_textures_.size()) return false;
         GpuTextureSlot& slot = GpuTextureAt(id);
-        slot.state = GpuTextureSlotState::UploadDestination;
-        slot.image = image;
-        slot.generation = generation;
-        return id;
+        if (slot.state != GpuTextureSlotState::Inactive) return true;
+        RemoveFree(free_gpu_textures_, id);
+        slot.state = GpuTextureSlotState::Writable;
+        slot.reserved_frame = kInvalidFrame;
+        slot.content_frame = kInvalidFrame;
+        slot.generation = 0;
+        return true;
     }
 
     void ReleaseCompressed(SlotId id) {
@@ -154,20 +156,6 @@ public:
         slot.image = 0;
         slot.generation = 0;
         free_staging_.push_back(id);
-    }
-
-    void ReleaseGpuTexture(SlotId id) {
-        if (id == kInvalidSlot) return;
-        GpuTextureSlot& slot = GpuTextureAt(id);
-        if (slot.state == GpuTextureSlotState::Free) {
-            throw std::logic_error("GPU texture slot released twice");
-        }
-        slot.state = GpuTextureSlotState::Retiring;
-        slot.resource = {};
-        slot.state = GpuTextureSlotState::Free;
-        slot.image = 0;
-        slot.generation = 0;
-        free_gpu_textures_.push_back(id);
     }
 
     [[nodiscard]] CompressedSlot& Compressed(SlotId id) {
