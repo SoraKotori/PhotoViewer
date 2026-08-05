@@ -228,9 +228,7 @@ void App::OpenInitialImage() {
     for (std::size_t index = 0; index < resources_.images.size(); ++index) {
         auto& image = resources_.images[index];
         image.generation = resources_.generation;
-        image.demand = resources_.catalog.items[index].file_bytes != 0
-                           ? ImageDemandState::Outside
-                           : ImageDemandState::Failed;
+        image.failed = resources_.catalog.items[index].file_bytes == 0;
     }
     resources_.navigation.Reset(resources_.catalog.initial_index,
                                 resources_.catalog.items.size());
@@ -324,17 +322,14 @@ void App::CompleteIoRequest(IoRequest* const request) {
             }
             resources_.slots->ReleaseCompressed(compressed_slot);
             image.compressed_slot = kInvalidSlot;
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
         }
     } else {
         if (resources_.compressed_bytes >= allocation) resources_.compressed_bytes -= allocation;
         resources_.slots->ReleaseCompressed(compressed_slot);
         image.compressed_slot = kInvalidSlot;
         if (reserved && io_result != ERROR_OPERATION_ABORTED) {
-            image.demand = ImageDemandState::Failed;
-        } else {
-            image.demand = reserved ? ImageDemandState::Requested
-                                    : ImageDemandState::Outside;
+            image.failed = true;
         }
     }
 }
@@ -378,10 +373,7 @@ void App::OnWorkerComplete() {
             resources_.slots->ReleaseStaging(result.staging_slot);
             image.staging_slot = kInvalidSlot;
             if (!result.cancelled && FAILED(result.error) && reserved) {
-                image.demand = ImageDemandState::Failed;
-            } else {
-                image.demand = reserved ? ImageDemandState::Requested
-                                        : ImageDemandState::Outside;
+                image.failed = true;
             }
         }
     }
@@ -430,7 +422,6 @@ void App::OnGpuComplete() {
         } else {
             source.content_frame = ticket.index;
             source.state = GpuTextureSlotState::Writable;
-            image.demand = ImageDemandState::Outside;
         }
         resources_.slots->ReleaseStaging(ticket.staging_slot);
         if (image.staging_slot == ticket.staging_slot) {
@@ -767,7 +758,7 @@ void App::PumpPipeline() {
 PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
     const std::size_t frame = static_cast<std::size_t>(
         &image - resources_.images.data());
-    if (image.demand == ImageDemandState::Failed) return PipelineStage::Failed;
+    if (image.failed) return PipelineStage::Failed;
     if (image.source_reservation != kInvalidReservation &&
         image.source_reservation < resources_.slots->GpuTextureCount()) {
         const GpuTextureSlot& source = resources_.slots->GpuTextureAt(
@@ -813,9 +804,8 @@ PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
                 break;
         }
     }
-    return image.demand == ImageDemandState::Requested &&
-                   ReservationActive(resources_.compressed_reservations,
-                                     image.compressed_reservation, frame)
+    return ReservationActive(resources_.compressed_reservations,
+                             image.compressed_reservation, frame)
                ? PipelineStage::WaitingIo
                : PipelineStage::Outside;
 }
@@ -927,7 +917,7 @@ void App::ReconcileReservations() {
                                              : source_capacity;
     for (const std::size_t frame : resources_.priority_order) {
         if (source_desired.size() >= forward_capacity) break;
-        if (resources_.images[frame].demand != ImageDemandState::Failed) {
+        if (!resources_.images[frame].failed) {
             append_unique(source_desired, frame, source_capacity);
         }
     }
@@ -942,7 +932,7 @@ void App::ReconcileReservations() {
                       source_capacity);
     }
     for (const std::size_t frame : resources_.priority_order) {
-        if (resources_.images[frame].demand != ImageDemandState::Failed) {
+        if (!resources_.images[frame].failed) {
             append_unique(source_desired, frame, source_capacity);
         }
     }
@@ -989,7 +979,7 @@ void App::ReconcileReservations() {
     for (const std::size_t frame : resources_.priority_order) {
         if (staging_desired.size() == resources_.staging_reservations.Capacity()) break;
         const ImageRecord& image = resources_.images[frame];
-        if (image.demand == ImageDemandState::Failed) continue;
+        if (image.failed) continue;
         bool source_complete = false;
         if (image.source_reservation != kInvalidReservation) {
             const GpuTextureSlot& source = resources_.slots->GpuTextureAt(
@@ -1071,14 +1061,11 @@ void App::ReconcileReservations() {
             if (image.compressed_reservation == id) {
                 image.compressed_reservation = kInvalidReservation;
             }
-            image.demand = ImageDemandState::Outside;
         },
         [&](const ReservationId id, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
             image.compressed_reservation = id;
-            image.demand = resources_.catalog.items[frame].file_bytes != 0
-                               ? ImageDemandState::Requested
-                               : ImageDemandState::Failed;
+            image.failed = resources_.catalog.items[frame].file_bytes == 0;
         },
         ReservationTable::FirstFree);
     work_queue_.Reorder(resources_.priority_order);
@@ -1102,12 +1089,12 @@ void App::SubmitReads() {
         const CatalogItem& item = resources_.catalog.items[index];
         if (item.file_bytes == 0 ||
             item.file_bytes > std::numeric_limits<DWORD>::max()) {
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         const std::size_t compressed = static_cast<std::size_t>(item.file_bytes);
         if (compressed > config_.compressed_budget_bytes) {
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         if (resources_.compressed_bytes >
@@ -1133,7 +1120,7 @@ void App::SubmitReads() {
         if (request->file == INVALID_HANDLE_VALUE) {
             resources_.slots->ReleaseCompressed(request->compressed_slot);
             image.compressed_slot = kInvalidSlot;
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         request->threadpool_io = CreateThreadpoolIo(request->file, &App::IoCompletion,
@@ -1142,7 +1129,7 @@ void App::SubmitReads() {
             CloseHandle(request->file);
             resources_.slots->ReleaseCompressed(request->compressed_slot);
             image.compressed_slot = kInvalidSlot;
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
 
@@ -1162,7 +1149,7 @@ void App::SubmitReads() {
             image.io.reset();
             image.compressed_slot = kInvalidSlot;
             resources_.compressed_bytes -= compressed;
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
         }
     }
 }
@@ -1178,7 +1165,7 @@ void App::DispatchDecodes() {
         }
         if (!resources_.catalog.items[index].header_valid) {
             ReleaseCompressed(image);
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         const CatalogItem& item = resources_.catalog.items[index];
@@ -1186,7 +1173,7 @@ void App::DispatchDecodes() {
             item.png.height + static_cast<std::size_t>(item.png.width) * 4;
         if (staging_bytes == 0 || staging_bytes > config_.staging_cache_bytes) {
             ReleaseCompressed(image);
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         SlotId staging_slot = resources_.slots->AcquireStaging(
@@ -1232,7 +1219,7 @@ void App::SubmitUploads() {
         if (bytes == 0 || bytes > config_.gpu_cache_bytes) {
             resources_.slots->ReleaseStaging(image.staging_slot);
             image.staging_slot = kInvalidSlot;
-            image.demand = ImageDemandState::Failed;
+            image.failed = true;
             continue;
         }
         const std::size_t old_bytes = source.resource.bytes;

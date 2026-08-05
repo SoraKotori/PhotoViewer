@@ -21,10 +21,8 @@ struct IoRequest {
     std::atomic<ULONG_PTR> transferred{0};
 };
 
-enum class ImageDemandState : std::uint8_t { Outside, Requested, Failed };
-
 struct ImageRecord {
-    ImageDemandState demand = ImageDemandState::Outside;
+    bool failed = false;
     std::uint64_t generation = 0;
     std::unique_ptr<IoRequest> io;
     std::shared_ptr<WorkToken> work_token;
