@@ -202,13 +202,22 @@ void TestGraphics(const HINSTANCE instance) {
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "D3D11 fence completion");
         graphics.FinishUpload(image);
+        ID3D11Texture2D* const first_texture = image.texture.Get();
+        ID2D1Bitmap1* const first_bitmap = image.bitmap.Get();
+        ticket = graphics.SubmitUpload(1, 1, 0, staging, image);
+        graphics.ArmFence(ticket.fence_value);
+        Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
+              "reused D3D11 fence completion");
+        graphics.FinishUpload(image);
+        Check(image.texture.Get() == first_texture && image.bitmap.Get() == first_bitmap,
+              "same-sized SourceTexture and Direct2D bitmap must be reused");
         Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
               "initial frame credit");
-        graphics.Draw(image);
+        (void)graphics.Draw(image);
         graphics.Resize(400, 300);
         Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
               "resized frame credit");
-        graphics.Draw(image);
+        (void)graphics.Draw(image);
     }
     DestroyWindow(window);
 }
@@ -389,7 +398,7 @@ int BenchmarkGraphics(const HINSTANCE instance) {
         Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
               "graphics benchmark upload fence");
         graphics.FinishUpload(image);
-        graphics.Draw(image);
+        (void)graphics.Draw(image);
         if (index + 1 < frames) {
             Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
                   "graphics benchmark frame credit");

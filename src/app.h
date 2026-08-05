@@ -5,6 +5,7 @@
 #include "decoder.h"
 #include "graphics.h"
 #include "navigation.h"
+#include "reservation.h"
 
 namespace pv {
 
@@ -25,32 +26,27 @@ enum class ImageDemandState : std::uint8_t { Outside, Requested, Failed };
 struct ImageRecord {
     ImageDemandState demand = ImageDemandState::Outside;
     std::uint64_t generation = 0;
-    std::size_t reserved_output_bytes = 0;
     std::unique_ptr<IoRequest> io;
     std::shared_ptr<WorkToken> work_token;
+    ReservationId compressed_reservation = kInvalidReservation;
+    ReservationId staging_reservation = kInvalidReservation;
+    ReservationId source_reservation = kInvalidReservation;
     SlotId compressed_slot = kInvalidSlot;
     SlotId staging_slot = kInvalidSlot;
-    SlotId gpu_texture_slot = kInvalidSlot;
-};
-
-struct BufferRanges {
-    std::size_t required_low = 0;
-    std::size_t required_high = 0;
-    std::size_t decode_low = 0;
-    std::size_t decode_high = 0;
-    std::size_t gpu_low = 0;
-    std::size_t gpu_high = 0;
 };
 
 struct ResourceContext {
     Catalog catalog;
     NavigationState navigation;
     std::vector<ImageRecord> images;
-    BufferRanges ranges;
     std::uint64_t generation = 1;
 
+    ReservationTable compressed_reservations;
+    ReservationTable staging_reservations;
+    ReservationTable source_reservations;
+    std::vector<std::size_t> priority_order;
+
     std::size_t compressed_bytes = 0;
-    std::size_t reserved_output_bytes = 0;
     std::size_t gpu_bytes = 0;
     std::unique_ptr<ResourceSlots> slots;
     std::deque<UploadTicket> uploads;
@@ -58,6 +54,8 @@ struct ResourceContext {
     bool frame_credit = false;
     bool redraw_pending = true;
     UINT64 armed_fence = 0;
+    SlotId reading_source_slot = kInvalidSlot;
+    UINT64 reading_source_fence = 0;
 };
 
 class App {
@@ -99,25 +97,24 @@ private:
     void OnFullscreenValidationTimer();
 
     void PumpPipeline();
-    void RecalculateRanges();
-    void ReclaimOutsideRanges();
+    void InitializeReservations();
+    void ReconcileReservations();
     void SubmitReads();
     void DispatchDecodes();
     void SubmitUploads();
     bool TryPresent();
 
-    [[nodiscard]] bool InRequiredRange(std::size_t index) const noexcept;
-    [[nodiscard]] bool InDecodeRange(std::size_t index) const noexcept;
-    [[nodiscard]] bool InGpuRange(std::size_t index) const noexcept;
-    [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(PipelineStage stage,
-                                                                 bool gpu_range) const;
+    [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(
+        PipelineStage stage) const;
     [[nodiscard]] PipelineStage StageOf(const ImageRecord& image) const noexcept;
+    [[nodiscard]] bool ReservationActive(const ReservationTable& table,
+                                         ReservationId id,
+                                         std::size_t frame) const noexcept;
+    [[nodiscard]] bool HasReadableSource(std::size_t frame) const noexcept;
+    [[nodiscard]] bool CancelQueuedDecode(std::size_t frame);
     void ReleaseCompressed(ImageRecord& image);
-    void ReleaseReservation(ImageRecord& image);
-    void EvictGpu(std::size_t index);
     void CancelAllIo();
     void ArmOldestFence();
-    [[nodiscard]] std::size_t CountStage(PipelineStage stage) const noexcept;
 
     Config config_;
     HWND window_ = nullptr;

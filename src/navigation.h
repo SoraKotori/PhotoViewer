@@ -4,6 +4,7 @@
 #include <deque>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace pv {
 
@@ -17,6 +18,7 @@ public:
     void CompletePresentation(std::size_t index);
 
     [[nodiscard]] std::pair<std::size_t, std::size_t> RequiredBounds() const;
+    [[nodiscard]] std::vector<std::size_t> PlannedOrder(std::size_t limit) const;
     [[nodiscard]] int PreferredDirection() const noexcept;
     [[nodiscard]] int HeldDirection() const noexcept { return held_direction_; }
     [[nodiscard]] std::size_t CurrentIndex() const noexcept { return current_index_; }

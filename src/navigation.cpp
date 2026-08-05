@@ -92,6 +92,51 @@ std::pair<std::size_t, std::size_t> NavigationState::RequiredBounds() const {
     return {low, high};
 }
 
+std::vector<std::size_t> NavigationState::PlannedOrder(
+    const std::size_t limit) const {
+    std::vector<std::size_t> order;
+    order.reserve(std::min(limit, image_count_));
+    if (image_count_ == 0 || limit == 0) return order;
+    const auto append = [&](const std::size_t frame) {
+        if (order.size() < limit &&
+            std::find(order.begin(), order.end(), frame) == order.end()) {
+            order.push_back(frame);
+        }
+    };
+
+    std::size_t projected = current_index_;
+    if (initial_pending_) append(projected);
+    const auto apply_pending = [&](const std::deque<int>& pending) {
+        for (const int direction : pending) {
+            projected = Apply(projected, direction);
+            append(projected);
+            if (order.size() == limit) return false;
+        }
+        return true;
+    };
+    if (!apply_pending(committed_) || !apply_pending(repeated_)) return order;
+
+    int direction = PreferredDirection();
+    if (direction == 0) direction = 1;
+    std::size_t value = projected;
+    while (order.size() < limit &&
+           !((direction < 0 && value == 0) ||
+             (direction > 0 && value + 1 >= image_count_))) {
+        value = Apply(value, direction);
+        append(value);
+    }
+    value = current_index_;
+    direction = -direction;
+    while (order.size() < limit &&
+           !((direction < 0 && value == 0) ||
+             (direction > 0 && value + 1 >= image_count_))) {
+        value = Apply(value, direction);
+        append(value);
+    }
+    append(current_index_);
+    return order;
+}
+
 int NavigationState::PreferredDirection() const noexcept {
     if (held_direction_ != 0) return held_direction_;
     if (!committed_.empty()) return committed_.front();

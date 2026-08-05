@@ -1,6 +1,8 @@
 #include "navigation.h"
 #include "png.h"
 #include "resource_slots.h"
+#include "reservation.h"
+#include "work_queue.h"
 
 #include <array>
 #include <cstdlib>
@@ -89,6 +91,9 @@ void NavigationTests() {
     Check(navigation.Empty(), "left short press must drain exactly");
     Check(navigation.PreferredDirection() == -1,
           "idle prefetch must retain the last successful left direction");
+    const auto left_plan = navigation.PlannedOrder(4);
+    Check(left_plan == std::vector<std::size_t>({8, 7, 6, 5}),
+          "planned order must extend from the requested left direction");
     navigation.Step(1, false);
     navigation.Release(1);
     Check(PresentNext(navigation) == 10, "right short press after left must be presented");
@@ -164,20 +169,17 @@ void ResourceSlotTests() {
               slots.StagingAt(staging0).state == pv::StagingSlotState::Free,
           "staging release must restore state and free index together");
 
-    const pv::SlotId gpu0 = slots.AcquireGpuTexture(3, 7);
-    const pv::SlotId gpu1 = slots.AcquireGpuTexture(4, 7);
-    Check(gpu0 != pv::kInvalidSlot && gpu1 != pv::kInvalidSlot,
-          "configured GPU texture slots must be allocatable");
-    Check(slots.AcquireGpuTexture(5, 7) == pv::kInvalidSlot,
-          "GPU texture slot count must be a hard limit");
+    constexpr pv::SlotId gpu0 = 0;
+    constexpr pv::SlotId gpu1 = 1;
+    Check(slots.ActivateGpuTexture(gpu0) && slots.ActivateGpuTexture(gpu1),
+          "configured SourceTexture slots must be activatable once");
+    Check(!slots.ActivateGpuTexture(2),
+          "SourceTexture slot count must be a hard limit");
     Check(slots.GpuTextureAt(gpu0).state ==
-              pv::GpuTextureSlotState::UploadDestination,
+              pv::GpuTextureSlotState::Writable,
           "GPU acquisition state must describe its pipeline phase");
-    slots.GpuTextureAt(gpu0).state = pv::GpuTextureSlotState::Presentable;
-    slots.ReleaseGpuTexture(gpu0);
-    Check(slots.FreeGpuTextureCount() == 1 &&
-              slots.GpuTextureAt(gpu0).state == pv::GpuTextureSlotState::Free,
-          "GPU release must restore state and free index together");
+    Check(slots.FreeGpuTextureCount() == 0,
+          "fixed SourceTexture slots leave the inactive index when activated");
 
     pv::ResourceSlots budget_limited(2, 2, 1, 4096, 4096);
     Check(budget_limited.AcquireCompressed(4096, 0, 1) != pv::kInvalidSlot,
@@ -190,12 +192,62 @@ void ResourceSlotTests() {
           "staging byte budget and slot count must both be enforced");
 }
 
+void ReservationTests() {
+    pv::ReservationTable table;
+    table.Reset(2);
+    std::vector<std::size_t> released;
+    std::vector<std::size_t> assigned;
+    const auto reconcile = [&](const std::vector<std::size_t>& desired,
+                               const bool allow_release) {
+        table.Reconcile(
+            desired,
+            [&](pv::ReservationId, std::size_t) { return allow_release; },
+            [&](pv::ReservationId, std::size_t frame) { released.push_back(frame); },
+            [&](pv::ReservationId, std::size_t frame) { assigned.push_back(frame); },
+            pv::ReservationTable::FirstFree);
+    };
+    reconcile({10, 11}, true);
+    Check(table.AssignedCount() == 2 && table.FindFrame(10) != pv::kInvalidReservation,
+          "reservation table must assign fixed capacity in desired order");
+    reconcile({12, 11}, false);
+    const auto old = table.FindFrame(10);
+    Check(old != pv::kInvalidReservation && table.At(old).retiring,
+          "busy obsolete reservation must retire without unsafe reuse");
+    reconcile({12, 11}, true);
+    Check(table.FindFrame(12) != pv::kInvalidReservation &&
+              table.FindFrame(10) == pv::kInvalidReservation,
+          "safe retired reservation must be reassigned without a second pool");
+
+    pv::WorkQueue queue(2);
+    auto token = std::make_shared<pv::WorkToken>();
+    pv::DecodeWork work{3, 7, token, 1, 2};
+    Check(queue.TryPush(work), "decode work must enter queue");
+    pv::DecodeWork cancelled;
+    Check(queue.TryCancel(token, cancelled) && cancelled.index == 3,
+          "unclaimed decode work must be synchronously cancellable");
+    Check(queue.Size() == 0 &&
+              token->claim.load(std::memory_order_acquire) == pv::WorkClaim::Cancelled,
+          "cancelled work must leave the queue exactly once");
+
+    auto low_token = std::make_shared<pv::WorkToken>();
+    auto high_token = std::make_shared<pv::WorkToken>();
+    pv::DecodeWork low{9, 1, low_token, 0, 0};
+    pv::DecodeWork high{4, 1, high_token, 0, 0};
+    Check(queue.TryPush(low) && queue.TryPush(high),
+          "priority reorder test work must enter queue");
+    queue.Reorder(std::array<std::size_t, 2>{4, 9});
+    pv::DecodeWork popped;
+    Check(queue.Pop(popped, std::stop_token{}) && popped.index == 4,
+          "queued decode work must follow the latest navigation priority");
+}
+
 }  // namespace
 
 int main() {
     NavigationTests();
     PngTests();
     ResourceSlotTests();
+    ReservationTests();
     std::cout << "PASS: core tests\n";
     return 0;
 }
