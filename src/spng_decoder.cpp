@@ -4,6 +4,8 @@
 #include "../third_party/libspng/spng.h"
 #include "../third_party/libdeflate/libdeflate.h"
 
+#include <array>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 
@@ -35,6 +37,31 @@ bool IsType(const std::byte* const type, const char* const expected) noexcept {
            type[1] == std::byte{static_cast<unsigned char>(expected[1])} &&
            type[2] == std::byte{static_cast<unsigned char>(expected[2])} &&
            type[3] == std::byte{static_cast<unsigned char>(expected[3])};
+}
+
+void CopyForward(std::byte* const destination, const std::byte* const source,
+                 const std::size_t bytes) noexcept {
+    std::size_t offset = 0;
+    for (; offset + 128 <= bytes; offset += 128) {
+        const __m256i block0 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(source + offset));
+        const __m256i block1 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(source + offset + 32));
+        const __m256i block2 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(source + offset + 64));
+        const __m256i block3 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(source + offset + 96));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset), block0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset + 32), block1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset + 64), block2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset + 96), block3);
+    }
+    for (; offset + 32 <= bytes; offset += 32) {
+        const __m256i block = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(source + offset));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset), block);
+    }
+    for (; offset < bytes; ++offset) destination[offset] = source[offset];
 }
 
 __m128i LoadPixel(const std::uint8_t* const source) noexcept {
@@ -97,12 +124,6 @@ void AddPaeth(std::uint8_t* const destination, const std::uint8_t* const source,
         return;
     }
     const __m128i zero = _mm_setzero_si128();
-    const __m128i pack_two_pixels = _mm_setr_epi8(
-        0, 1, 2, 3, 8, 9, 10, 11,
-        static_cast<char>(0x80), static_cast<char>(0x80),
-        static_cast<char>(0x80), static_cast<char>(0x80),
-        static_cast<char>(0x80), static_cast<char>(0x80),
-        static_cast<char>(0x80), static_cast<char>(0x80));
     __m128i up_left = zero;
     __m128i decoded = zero;
     const auto decode_pixel = [](__m128i filtered, const __m128i left,
@@ -151,12 +172,10 @@ void AddPaeth(std::uint8_t* const destination, const std::uint8_t* const source,
             filtered_2, decoded_1, above_2, above_1);
         const __m128i decoded_3 = decode_pixel(
             filtered_3, decoded_2, above_3, above_2);
-        const __m128i packed_01 = _mm_shuffle_epi8(
-            _mm_packus_epi16(decoded_0, decoded_1), pack_two_pixels);
-        const __m128i packed_23 = _mm_shuffle_epi8(
-            _mm_packus_epi16(decoded_2, decoded_3), pack_two_pixels);
+        const __m128i decoded_01 = _mm_unpacklo_epi64(decoded_0, decoded_1);
+        const __m128i decoded_23 = _mm_unpacklo_epi64(decoded_2, decoded_3);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + offset),
-                         _mm_unpacklo_epi64(packed_01, packed_23));
+                         _mm_packus_epi16(decoded_01, decoded_23));
         decoded = decoded_3;
         up_left = above_3;
     }
@@ -167,6 +186,196 @@ void AddPaeth(std::uint8_t* const destination, const std::uint8_t* const source,
             up_left);
         StorePixel(destination + offset, _mm_packus_epi16(decoded, decoded));
         up_left = up;
+    }
+}
+
+std::uint8_t PaethByte(const std::uint8_t left, const std::uint8_t up,
+                       const std::uint8_t upper_left) noexcept {
+    const int distance_left = std::abs(static_cast<int>(up) - upper_left);
+    const int distance_up = std::abs(static_cast<int>(left) - upper_left);
+    const int distance_upper_left = std::abs(
+        static_cast<int>(left) + up - 2 * static_cast<int>(upper_left));
+    if (distance_left <= distance_up &&
+        distance_left <= distance_upper_left) {
+        return left;
+    }
+    return distance_up <= distance_upper_left ? up : upper_left;
+}
+
+std::uint32_t LoadPixelValue(const std::uint8_t* const source) noexcept {
+    std::uint32_t value = 0;
+    std::memcpy(&value, source, sizeof(value));
+    return value;
+}
+
+void StorePixelValue(std::uint8_t* const destination,
+                     const std::uint32_t value) noexcept {
+    std::memcpy(destination, &value, sizeof(value));
+}
+
+void DecodePaethPixelValue(std::uint8_t* const destination,
+                           const std::uint8_t* const previous,
+                           const std::size_t pixel,
+                           const std::uint32_t filtered) noexcept {
+    const std::size_t offset = pixel * 4;
+    const std::uint32_t left = pixel == 0
+        ? 0
+        : LoadPixelValue(destination + offset - 4);
+    const std::uint32_t up = previous
+        ? LoadPixelValue(previous + offset)
+        : 0;
+    const std::uint32_t upper_left = previous && pixel != 0
+        ? LoadPixelValue(previous + offset - 4)
+        : 0;
+    std::uint32_t decoded = 0;
+    for (unsigned int channel = 0; channel < 4; ++channel) {
+        const unsigned int shift = channel * 8;
+        const auto byte = [](const std::uint32_t value,
+                             const unsigned int bit) noexcept {
+            return static_cast<std::uint8_t>(value >> bit);
+        };
+        const std::uint8_t prediction = PaethByte(
+            byte(left, shift), byte(up, shift), byte(upper_left, shift));
+        const std::uint8_t decoded_byte = static_cast<std::uint8_t>(
+            byte(filtered, shift) + prediction);
+        decoded |= static_cast<std::uint32_t>(decoded_byte) << shift;
+    }
+    StorePixelValue(destination + offset, decoded);
+}
+
+void DecodePaethPixel(std::uint8_t* const destination,
+                      const std::uint8_t* const source,
+                      const std::uint8_t* const previous,
+                      const std::size_t pixel) noexcept {
+    DecodePaethPixelValue(destination, previous, pixel,
+                          LoadPixelValue(source + pixel * 4));
+}
+
+std::uint32_t LoadFilteredPixel(const std::uint8_t* const source,
+                                const std::size_t row_bytes,
+                                const std::uint8_t* const preserved_tail,
+                                const std::size_t preserved_bytes,
+                                const std::size_t pixel) noexcept {
+    const std::size_t offset = pixel * 4;
+    const std::size_t preserved_begin = row_bytes - preserved_bytes;
+    if (offset + 4 <= preserved_begin) {
+        return LoadPixelValue(source + offset);
+    }
+    std::uint32_t value = 0;
+    for (std::size_t byte_index = 0; byte_index < 4; ++byte_index) {
+        const std::size_t position = offset + byte_index;
+        const std::uint8_t byte = position < preserved_begin
+            ? source[position]
+            : preserved_tail[position - preserved_begin];
+        value |= static_cast<std::uint32_t>(byte) << (byte_index * 8);
+    }
+    return value;
+}
+
+void AddPaethRows4(std::uint8_t* const destination,
+                   const std::uint8_t* const source,
+                   const std::size_t row_bytes,
+                   std::uint8_t* const scratch) noexcept {
+    const std::size_t pixels = row_bytes / 4;
+    std::uint8_t* const destination0 = destination;
+    std::uint8_t* const destination1 = destination0 + row_bytes;
+    std::uint8_t* const destination2 = destination1 + row_bytes;
+    std::uint8_t* const destination3 = destination2 + row_bytes;
+    const std::uint8_t* const source0 = source;
+    const std::uint8_t* const source1 = source0 + row_bytes + 1;
+    const std::uint8_t* const source2 = source1 + row_bytes + 1;
+    const std::uint8_t* const source3 = source2 + row_bytes + 1;
+    const std::uint8_t* const previous0 = destination0 - row_bytes;
+
+    const std::size_t preserved0 = static_cast<std::size_t>(source0 - destination0);
+    const std::size_t preserved1 = static_cast<std::size_t>(source1 - destination1);
+    const std::size_t preserved2 = static_cast<std::size_t>(source2 - destination2);
+    if (pixels < 4 || preserved2 >= row_bytes) {
+        AddPaeth(destination0, source0, previous0, row_bytes);
+        AddPaeth(destination1, source1, destination0, row_bytes);
+        AddPaeth(destination2, source2, destination1, row_bytes);
+        AddPaeth(destination3, source3, destination2, row_bytes);
+        return;
+    }
+    std::uint8_t* const tail0 = scratch;
+    std::uint8_t* const tail1 = tail0 + preserved0;
+    std::uint8_t* const tail2 = tail1 + preserved1;
+    std::memcpy(tail0, source0 + row_bytes - preserved0, preserved0);
+    std::memcpy(tail1, source1 + row_bytes - preserved1, preserved1);
+    std::memcpy(tail2, source2 + row_bytes - preserved2, preserved2);
+
+    for (std::size_t pixel = 0; pixel < 3; ++pixel) {
+        DecodePaethPixel(destination0, source0, previous0, pixel);
+    }
+    for (std::size_t pixel = 0; pixel < 2; ++pixel) {
+        DecodePaethPixel(destination1, source1, destination0, pixel);
+    }
+    DecodePaethPixel(destination2, source2, destination1, 0);
+
+    __m256i left = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+        static_cast<int>(LoadPixelValue(destination0 + 8)),
+        static_cast<int>(LoadPixelValue(destination1 + 4)),
+        static_cast<int>(LoadPixelValue(destination2)), 0));
+    for (std::size_t pixel = 0; pixel + 3 < pixels; ++pixel) {
+        const __m256i filtered = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+            static_cast<int>(LoadFilteredPixel(
+                source0, row_bytes, tail0, preserved0, pixel + 3)),
+            static_cast<int>(LoadFilteredPixel(
+                source1, row_bytes, tail1, preserved1, pixel + 2)),
+            static_cast<int>(LoadFilteredPixel(
+                source2, row_bytes, tail2, preserved2, pixel + 1)),
+            static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
+        const __m256i up = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+            static_cast<int>(LoadPixelValue(previous0 + (pixel + 3) * 4)),
+            static_cast<int>(LoadPixelValue(destination0 + (pixel + 2) * 4)),
+            static_cast<int>(LoadPixelValue(destination1 + (pixel + 1) * 4)),
+            static_cast<int>(LoadPixelValue(destination2 + pixel * 4))));
+        const __m256i upper_left = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+            static_cast<int>(LoadPixelValue(previous0 + (pixel + 2) * 4)),
+            static_cast<int>(LoadPixelValue(destination0 + (pixel + 1) * 4)),
+            static_cast<int>(LoadPixelValue(destination1 + pixel * 4)),
+            pixel == 0 ? 0 : static_cast<int>(
+                LoadPixelValue(destination2 + (pixel - 1) * 4))));
+        const __m256i up_delta = _mm256_sub_epi16(up, upper_left);
+        const __m256i left_delta = _mm256_sub_epi16(left, upper_left);
+        const __m256i distance_left = _mm256_abs_epi16(up_delta);
+        const __m256i distance_up = _mm256_abs_epi16(left_delta);
+        const __m256i distance_upper_left = _mm256_abs_epi16(
+            _mm256_add_epi16(up_delta, left_delta));
+        const __m256i choose_up = _mm256_cmpgt_epi16(
+            distance_left, distance_up);
+        const __m256i left_or_up = _mm256_blendv_epi8(left, up, choose_up);
+        const __m256i choose_upper_left = _mm256_cmpgt_epi16(
+            _mm256_min_epi16(distance_left, distance_up),
+            distance_upper_left);
+        const __m256i prediction = _mm256_blendv_epi8(
+            left_or_up, upper_left, choose_upper_left);
+        const __m256i decoded = _mm256_add_epi8(filtered, prediction);
+        const __m256i packed = _mm256_packus_epi16(decoded, decoded);
+        const __m128i pixels01 = _mm256_castsi256_si128(packed);
+        const __m128i pixels23 = _mm256_extracti128_si256(packed, 1);
+        const __m128i values = _mm_unpacklo_epi64(pixels01, pixels23);
+        StorePixelValue(destination0 + (pixel + 3) * 4,
+                        static_cast<std::uint32_t>(_mm_extract_epi32(values, 0)));
+        StorePixelValue(destination1 + (pixel + 2) * 4,
+                        static_cast<std::uint32_t>(_mm_extract_epi32(values, 1)));
+        StorePixelValue(destination2 + (pixel + 1) * 4,
+                        static_cast<std::uint32_t>(_mm_extract_epi32(values, 2)));
+        StorePixelValue(destination3 + pixel * 4,
+                        static_cast<std::uint32_t>(_mm_extract_epi32(values, 3)));
+        left = decoded;
+    }
+
+    DecodePaethPixelValue(destination1, destination0, pixels - 1,
+                          LoadFilteredPixel(source1, row_bytes, tail1,
+                                            preserved1, pixels - 1));
+    for (std::size_t pixel = pixels - 2; pixel < pixels; ++pixel) {
+        DecodePaethPixelValue(destination2, destination1, pixel,
+                              LoadFilteredPixel(source2, row_bytes, tail2,
+                                                preserved2, pixel));
+    }
+    for (std::size_t pixel = pixels - 3; pixel < pixels; ++pixel) {
+        DecodePaethPixel(destination3, source3, destination2, pixel);
     }
 }
 
@@ -188,10 +397,23 @@ void AddUp(std::uint8_t* const destination, const std::uint8_t* const source,
 
 bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
               const std::uint32_t height, PngDecodeTimings* const timings) noexcept {
+    constexpr std::uint32_t max_wavefront_height = 16384;
+    std::array<std::uint8_t, max_wavefront_height * 3> scratch;
     auto* const base = reinterpret_cast<std::uint8_t*>(bytes);
-    for (std::uint32_t row = 0; row < height; ++row) {
+    for (std::uint32_t row = 0; row < height;) {
         const std::size_t source_offset = static_cast<std::size_t>(row) * (row_bytes + 1);
         const std::uint8_t filter = base[source_offset];
+        if (height <= max_wavefront_height && row != 0 && row + 3 < height &&
+            filter == 4 &&
+            base[source_offset + row_bytes + 1] == 4 &&
+            base[source_offset + 2 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 3 * (row_bytes + 1)] == 4) {
+            AddPaethRows4(base + static_cast<std::size_t>(row) * row_bytes,
+                          base + source_offset + 1, row_bytes, scratch.data());
+            if (timings) timings->filter_rows[4] += 4;
+            row += 4;
+            continue;
+        }
         if (timings && filter < timings->filter_rows.size()) {
             ++timings->filter_rows[filter];
         }
@@ -218,6 +440,7 @@ bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
             default:
                 return false;
         }
+        ++row;
     }
     return true;
 }
@@ -265,8 +488,8 @@ HRESULT CompactIdat(const std::span<std::byte> compressed, IdatData& idat,
                 write_offset = payload_offset;
             }
             if (write_offset != payload_offset) {
-                std::memmove(compressed.data() + write_offset,
-                             compressed.data() + payload_offset, length);
+                CopyForward(compressed.data() + write_offset,
+                            compressed.data() + payload_offset, length);
             }
             write_offset += length;
             idat.bytes += length;

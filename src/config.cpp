@@ -120,10 +120,6 @@ Config ParseConfig() {
             const auto value = ParsePositive(argument.substr(std::wstring_view(L"--workers=").size()));
             if (!value || *value > 256) throw std::invalid_argument("invalid worker count");
             config.worker_count = *value;
-        } else if (argument.starts_with(L"--work-queue=")) {
-            const auto value = ParsePositive(argument.substr(std::wstring_view(L"--work-queue=").size()));
-            if (!value || *value > 4096) throw std::invalid_argument("invalid work queue capacity");
-            config.work_queue_capacity = *value;
         } else if (argument.starts_with(L"--")) {
             throw std::invalid_argument("unknown option");
         } else if (config.initial_image.empty()) {

@@ -19,7 +19,7 @@
     <ClCompile><WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><UseStandardPreprocessor>true</UseStandardPreprocessor><LanguageStandard>stdcpp20</LanguageStandard><ExceptionHandling>Sync</ExceptionHandling><MultiProcessorCompilation>true</MultiProcessorCompilation><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;NDEBUG;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions></ClCompile>
     <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation></Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="tests\core_tests.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\resource_slots.h" /></ItemGroup>
+  <ItemGroup><ClCompile Include="tests\core_tests.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\processor_topology.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\processor_topology.h" /><ClInclude Include="src\resource_slots.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

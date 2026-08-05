@@ -35,7 +35,7 @@ bool NavigationInputPending(const HWND window) noexcept {
 }  // namespace
 
 App::App(Config config)
-    : config_(std::move(config)), work_queue_(config_.work_queue_capacity) {
+    : config_(std::move(config)) {
     resources_.slots = std::make_unique<ResourceSlots>(
         config_.compressed_slot_count, config_.staging_slot_count,
         config_.gpu_texture_slot_count, config_.compressed_budget_bytes,
@@ -1157,7 +1157,6 @@ void App::SubmitReads() {
 void App::DispatchDecodes() {
     for (const std::size_t index : PrioritizedCandidates(
              PipelineStage::CompressedReady)) {
-        if (work_queue_.Size() >= config_.work_queue_capacity) break;
         ImageRecord& image = resources_.images[index];
         if (!ReservationActive(resources_.staging_reservations,
                                image.staging_reservation, index)) {

@@ -6,11 +6,9 @@ namespace pv {
 
 class WorkQueue {
 public:
-    explicit WorkQueue(const std::size_t capacity) : capacity_(capacity) {}
-
     bool TryPush(DecodeWork& work) {
         std::lock_guard lock(mutex_);
-        if (stopped_ || queue_.size() >= capacity_) return false;
+        if (stopped_) return false;
         queue_.push_back(std::move(work));
         available_.notify_one();
         return true;
@@ -70,7 +68,6 @@ public:
     }
 
 private:
-    const std::size_t capacity_;
     mutable std::mutex mutex_;
     std::condition_variable available_;
     std::deque<DecodeWork> queue_;
