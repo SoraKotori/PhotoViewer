@@ -90,6 +90,8 @@ private:
     void InjectValidationNavigation();
     void InjectValidationNavigationStep();
     void StopValidationNavigationTimer();
+    void RecordValidationReady(std::size_t index);
+    void RecordValidationPresentation(std::size_t index);
     void WriteValidationReport(std::string_view phase, bool truncate);
     void BeginFullscreenValidation();
     void OnFullscreenValidationTimer();
@@ -129,8 +131,13 @@ private:
     bool validation_script_scheduled_ = false;
     std::size_t validation_navigation_cursor_ = 0;
     std::size_t validation_expected_index_ = 0;
+    std::chrono::steady_clock::time_point validation_cold_started_{};
     std::chrono::steady_clock::time_point validation_navigation_started_{};
     std::chrono::steady_clock::time_point validation_navigation_injection_finished_{};
+    std::vector<std::size_t> validation_ready_indices_;
+    std::vector<std::uint64_t> validation_ready_nanoseconds_;
+    std::vector<std::size_t> validation_presented_indices_;
+    std::vector<std::uint64_t> validation_presented_nanoseconds_;
     PTP_TIMER validation_navigation_timer_ = nullptr;
     int exit_code_ = 0;
 

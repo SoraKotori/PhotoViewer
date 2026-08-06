@@ -55,6 +55,9 @@ App::~App() {
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
+    if (!config_.validation_navigation.empty()) {
+        validation_cold_started_ = std::chrono::steady_clock::now();
+    }
     if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
         ThrowLastError("Set main thread priority");
     }
@@ -419,6 +422,7 @@ void App::OnGpuComplete() {
             graphics_.FinishUpload(source.resource);
             source.content_frame = ticket.index;
             source.state = GpuTextureSlotState::Readable;
+            RecordValidationReady(ticket.index);
         } else {
             source.content_frame = ticket.index;
             source.state = GpuTextureSlotState::Writable;
@@ -627,6 +631,32 @@ void App::StopValidationNavigationTimer() {
     validation_navigation_timer_ = nullptr;
 }
 
+void App::RecordValidationPresentation(const std::size_t index) {
+    if (validation_cold_started_ == std::chrono::steady_clock::time_point{} ||
+        (!validation_presented_indices_.empty() &&
+         validation_presented_indices_.back() == index)) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - validation_cold_started_);
+    validation_presented_indices_.push_back(index);
+    validation_presented_nanoseconds_.push_back(
+        static_cast<std::uint64_t>(elapsed.count()));
+}
+
+void App::RecordValidationReady(const std::size_t index) {
+    if (validation_cold_started_ == std::chrono::steady_clock::time_point{} ||
+        std::ranges::find(validation_ready_indices_, index) !=
+            validation_ready_indices_.end()) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - validation_cold_started_);
+    validation_ready_indices_.push_back(index);
+    validation_ready_nanoseconds_.push_back(
+        static_cast<std::uint64_t>(elapsed.count()));
+}
+
 void App::WriteValidationReport(const std::string_view phase, const bool truncate) {
     if (config_.validation_report.empty()) return;
     std::ofstream output(config_.validation_report,
@@ -703,6 +733,32 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     }
     output << '\n'
            << "validation_cursor=" << validation_navigation_cursor_ << '\n'
+           << "validation_ready_count="
+           << validation_ready_indices_.size() << '\n'
+           << "validation_ready_indices=";
+    for (std::size_t index = 0; index < validation_ready_indices_.size(); ++index) {
+        if (index != 0) output << ',';
+        output << validation_ready_indices_[index];
+    }
+    output << '\n' << "validation_ready_nanoseconds=";
+    for (std::size_t index = 0; index < validation_ready_nanoseconds_.size(); ++index) {
+        if (index != 0) output << ',';
+        output << validation_ready_nanoseconds_[index];
+    }
+    output << '\n'
+           << "validation_presented_count="
+           << validation_presented_indices_.size() << '\n'
+           << "validation_presented_indices=";
+    for (std::size_t index = 0; index < validation_presented_indices_.size(); ++index) {
+        if (index != 0) output << ',';
+        output << validation_presented_indices_[index];
+    }
+    output << '\n' << "validation_presented_nanoseconds=";
+    for (std::size_t index = 0; index < validation_presented_nanoseconds_.size(); ++index) {
+        if (index != 0) output << ',';
+        output << validation_presented_nanoseconds_[index];
+    }
+    output << '\n'
            << "navigation_injection_nanoseconds=";
     if (validation_navigation_started_ != std::chrono::steady_clock::time_point{} &&
         validation_navigation_injection_finished_ !=
@@ -1258,6 +1314,7 @@ bool App::TryPresent() {
         resources_.frame_credit = false;
         resources_.redraw_pending = false;
         resources_.navigation.CompletePresentation(*next);
+        RecordValidationPresentation(*next);
         SetWindowTextW(window_, resources_.catalog.items[*next].path.filename().c_str());
         if (config_.validation_exit_after_present) {
             if (config_.validation_fullscreen && validation_fullscreen_phase_ == 0) {
