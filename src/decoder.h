@@ -23,13 +23,25 @@ public:
     DecoderPool& operator=(const DecoderPool&) = delete;
 
 private:
+    struct alignas(64) WorkerMetrics {
+        std::atomic<std::uint64_t> decode_count{0};
+        std::atomic<std::uint64_t> decode_nanoseconds{0};
+        std::atomic<bool> selected_cpu_set{false};
+        std::atomic<bool> unthrottled{false};
+        std::atomic<bool> elevated{false};
+        std::array<std::byte,
+                   64 - 2 * sizeof(std::atomic<std::uint64_t>) -
+                       3 * sizeof(std::atomic<bool>)> cache_line_padding{};
+    };
+    static_assert(sizeof(WorkerMetrics) == 64);
+
     struct InputReleaseGuard {
         DecoderPool& owner;
         DecodeWork& work;
         ~InputReleaseGuard() { owner.ReleaseInput(work); }
     };
 
-    void WorkerMain(std::stop_token stop);
+    void WorkerMain(std::stop_token stop, WorkerMetrics& metrics);
     DecodeResult Decode(DecodeWork work);
     void ReleaseInput(DecodeWork& work) noexcept;
 
@@ -38,11 +50,7 @@ private:
     ResourceSlots& slots_;
     HWND event_window_ = nullptr;
     std::vector<std::jthread> workers_;
-    std::atomic<std::uint64_t> decode_count_{0};
-    std::atomic<std::uint64_t> decode_nanoseconds_{0};
-    std::atomic<std::size_t> selected_cpu_set_count_{0};
-    std::atomic<std::size_t> unthrottled_worker_count_{0};
-    std::atomic<std::size_t> elevated_worker_count_{0};
+    std::vector<std::unique_ptr<WorkerMetrics>> worker_metrics_;
 };
 
 }  // namespace pv

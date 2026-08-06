@@ -366,7 +366,7 @@ void App::OnWorkerComplete() {
             resources_.slots->ReleaseStaging(result.staging_slot);
             continue;
         }
-        image.work_token.reset();
+        image.work_active = false;
         const bool reserved = ReservationActive(
             resources_.staging_reservations, image.staging_reservation,
             result.index);
@@ -928,7 +928,10 @@ bool App::CancelQueuedDecode(const std::size_t frame) {
     if (frame >= resources_.images.size()) return false;
     ImageRecord& image = resources_.images[frame];
     DecodeWork cancelled;
-    if (!work_queue_.TryCancel(image.work_token, cancelled)) return false;
+    if (!image.work_active ||
+        !work_queue_.TryCancel(image.work_token.get(), cancelled)) {
+        return false;
+    }
 
     if (cancelled.staging_slot != kInvalidSlot) {
         StagingSlot& staging = resources_.slots->StagingAt(cancelled.staging_slot);
@@ -948,7 +951,7 @@ bool App::CancelQueuedDecode(const std::size_t frame) {
             ReleaseCompressed(image);
         }
     }
-    image.work_token.reset();
+    image.work_active = false;
     return true;
 }
 
@@ -1056,7 +1059,7 @@ void App::ReconcileReservations() {
             if (slot.state == StagingSlotState::DecodeOutputMapped ||
                 slot.state == StagingSlotState::CancellationPending) {
                 if (CancelQueuedDecode(frame)) return true;
-                if (image.work_token) {
+                if (image.work_active) {
                     image.work_token->claim.store(WorkClaim::Cancelled,
                                                   std::memory_order_release);
                 }
@@ -1237,8 +1240,10 @@ void App::DispatchDecodes() {
         DecodeStaging& staging = resources_.slots->StagingAt(staging_slot).resource;
         graphics_.MapDecodeStaging(staging, item.png.width, item.png.height,
                                    item.png.decoded_bytes);
-        auto token = std::make_shared<WorkToken>();
-        DecodeWork work{index, image.generation, token, image.compressed_slot,
+        image.work_token->claim.store(WorkClaim::Queued,
+                                      std::memory_order_relaxed);
+        DecodeWork work{index, image.generation, image.work_token.get(),
+                        image.compressed_slot,
                         staging_slot};
         resources_.slots->Compressed(image.compressed_slot).state =
             CompressedSlotState::DecodeInput;
@@ -1250,7 +1255,7 @@ void App::DispatchDecodes() {
             break;
         }
         image.staging_slot = staging_slot;
-        image.work_token = std::move(token);
+        image.work_active = true;
     }
 }
 

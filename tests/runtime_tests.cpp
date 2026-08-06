@@ -218,13 +218,13 @@ void TestCancelledWorkReleasesInput() {
               staging_slot != pv::kInvalidSlot,
           "allocate cancellation test slots");
 
-    auto token = std::make_shared<pv::WorkToken>();
+    auto token = std::make_unique<pv::WorkToken>();
     token->claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
     pv::WorkQueue work_queue;
     pv::CompletionQueue completion_queue;
     {
         pv::DecoderPool pool(1, work_queue, completion_queue, slots, nullptr);
-        pv::DecodeWork work{0, 1, token, compressed_slot, staging_slot};
+        pv::DecodeWork work{0, 1, token.get(), compressed_slot, staging_slot};
         Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
 
         std::vector<pv::DecodeResult> results;

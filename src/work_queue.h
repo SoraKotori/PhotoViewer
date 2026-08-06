@@ -24,8 +24,7 @@ public:
         return true;
     }
 
-    bool TryCancel(const std::shared_ptr<WorkToken>& token,
-                   DecodeWork& cancelled) {
+    bool TryCancel(WorkToken* const token, DecodeWork& cancelled) {
         if (!token) return false;
         std::lock_guard lock(mutex_);
         const auto found = std::find_if(
