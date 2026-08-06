@@ -8,13 +8,13 @@ param(
     [ValidateRange(1, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
-    [int]$Workers = 6,
+    [int]$Workers = 5,
     [ValidateRange(1, 4096)]
-    [int]$StagingSlots = 12,
+    [int]$StagingSlots = 10,
     [ValidateRange(1, 4096)]
-    [int]$GpuTextureSlots = 6,
+    [int]$GpuTextureSlots = 3,
     [ValidateRange(1, 4096)]
-    [int]$CompressedSlots = 24,
+    [int]$CompressedSlots = 8,
     [ValidateRange(1, 16384)]
     [int]$StagingCacheMiB = 1280,
     [ValidateRange(1, 16384)]

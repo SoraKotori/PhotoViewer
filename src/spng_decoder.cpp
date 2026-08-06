@@ -208,6 +208,15 @@ std::uint32_t LoadPixelValue(const std::uint8_t* const source) noexcept {
     return value;
 }
 
+__m256i ShiftPaethRows(const __m256i rows,
+                       const std::uint32_t first) noexcept {
+    const __m256i shifted = _mm256_permute4x64_epi64(
+        rows, _MM_SHUFFLE(2, 1, 0, 0));
+    const __m256i expanded_first = _mm256_cvtepu8_epi16(
+        _mm_cvtsi32_si128(static_cast<int>(first)));
+    return _mm256_blend_epi32(shifted, expanded_first, 0x03);
+}
+
 void StorePixelValue(std::uint8_t* const destination,
                      const std::uint32_t value) noexcept {
     std::memcpy(destination, &value, sizeof(value));
@@ -316,6 +325,9 @@ void AddPaethRows4(std::uint8_t* const destination,
         static_cast<int>(LoadPixelValue(destination0 + 8)),
         static_cast<int>(LoadPixelValue(destination1 + 4)),
         static_cast<int>(LoadPixelValue(destination2)), 0));
+    __m256i upper_left_rows = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+        static_cast<int>(LoadPixelValue(destination0 + 4)),
+        static_cast<int>(LoadPixelValue(destination1)), 0, 0));
     for (std::size_t pixel = 0; pixel + 3 < pixels; ++pixel) {
         const __m256i filtered = _mm256_cvtepu8_epi16(_mm_setr_epi32(
             static_cast<int>(LoadFilteredPixel(
@@ -325,17 +337,11 @@ void AddPaethRows4(std::uint8_t* const destination,
             static_cast<int>(LoadFilteredPixel(
                 source2, row_bytes, tail2, preserved2, pixel + 1)),
             static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
-        const __m256i up = _mm256_cvtepu8_epi16(_mm_setr_epi32(
-            static_cast<int>(LoadPixelValue(previous0 + (pixel + 3) * 4)),
-            static_cast<int>(LoadPixelValue(destination0 + (pixel + 2) * 4)),
-            static_cast<int>(LoadPixelValue(destination1 + (pixel + 1) * 4)),
-            static_cast<int>(LoadPixelValue(destination2 + pixel * 4))));
-        const __m256i upper_left = _mm256_cvtepu8_epi16(_mm_setr_epi32(
-            static_cast<int>(LoadPixelValue(previous0 + (pixel + 2) * 4)),
-            static_cast<int>(LoadPixelValue(destination0 + (pixel + 1) * 4)),
-            static_cast<int>(LoadPixelValue(destination1 + pixel * 4)),
-            pixel == 0 ? 0 : static_cast<int>(
-                LoadPixelValue(destination2 + (pixel - 1) * 4))));
+        const __m256i up = ShiftPaethRows(
+            left, LoadPixelValue(previous0 + (pixel + 3) * 4));
+        const __m256i upper_left = ShiftPaethRows(
+            upper_left_rows,
+            LoadPixelValue(previous0 + (pixel + 2) * 4));
         const __m256i up_delta = _mm256_sub_epi16(up, upper_left);
         const __m256i left_delta = _mm256_sub_epi16(left, upper_left);
         const __m256i distance_left = _mm256_abs_epi16(up_delta);
@@ -363,6 +369,7 @@ void AddPaethRows4(std::uint8_t* const destination,
                         static_cast<std::uint32_t>(_mm_extract_epi32(values, 2)));
         StorePixelValue(destination3 + pixel * 4,
                         static_cast<std::uint32_t>(_mm_extract_epi32(values, 3)));
+        upper_left_rows = left;
         left = decoded;
     }
 
