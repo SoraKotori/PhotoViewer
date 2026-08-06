@@ -10,7 +10,7 @@ param(
     [ValidateRange(1, 256)]
     [int]$Workers = 5,
     [ValidateRange(1, 4096)]
-    [int]$StagingSlots = 10,
+    [int]$StagingSlots = 8,
     [ValidateRange(1, 4096)]
     [int]$GpuTextureSlots = 3,
     [ValidateRange(1, 4096)]
