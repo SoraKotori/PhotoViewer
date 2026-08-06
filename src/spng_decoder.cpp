@@ -3,6 +3,7 @@
 #define SPNG_STATIC
 #include "../third_party/libspng/spng.h"
 #include "../third_party/libdeflate/libdeflate.h"
+#include "../third_party/zlib-ng/zlib.h"
 
 #include <array>
 #include <cstdlib>
@@ -37,6 +38,33 @@ bool IsType(const std::byte* const type, const char* const expected) noexcept {
            type[1] == std::byte{static_cast<unsigned char>(expected[1])} &&
            type[2] == std::byte{static_cast<unsigned char>(expected[2])} &&
            type[3] == std::byte{static_cast<unsigned char>(expected[3])};
+}
+
+bool HasFastRgba8Header(const std::span<const std::byte> compressed,
+                        std::uint32_t& width,
+                        std::uint32_t& height) noexcept {
+    constexpr std::array<std::byte, 8> signature{
+        std::byte{0x89}, std::byte{0x50}, std::byte{0x4E}, std::byte{0x47},
+        std::byte{0x0D}, std::byte{0x0A}, std::byte{0x1A}, std::byte{0x0A}};
+    if (compressed.size() < 33 ||
+        !std::equal(signature.begin(), signature.end(), compressed.begin()) ||
+        ReadBigEndian(compressed.data() + 8) != 13 ||
+        !IsType(compressed.data() + 12, "IHDR")) {
+        return false;
+    }
+    const auto* const ihdr = reinterpret_cast<const Bytef*>(
+        compressed.data() + 12);
+    const uLong expected_crc = ReadBigEndian(compressed.data() + 29);
+    if (crc32(0, ihdr, 17) != expected_crc) return false;
+
+    width = ReadBigEndian(compressed.data() + 16);
+    height = ReadBigEndian(compressed.data() + 20);
+    return width != 0 && height != 0 &&
+           compressed[24] == std::byte{8} &&
+           compressed[25] == std::byte{SPNG_COLOR_TYPE_TRUECOLOR_ALPHA} &&
+           compressed[26] == std::byte{0} &&
+           compressed[27] == std::byte{0} &&
+           compressed[28] == std::byte{SPNG_INTERLACE_NONE};
 }
 
 void CopyForward(std::byte* const destination, const std::byte* const source,
@@ -325,23 +353,14 @@ void AddPaethRows4(std::uint8_t* const destination,
         static_cast<int>(LoadPixelValue(destination0 + 8)),
         static_cast<int>(LoadPixelValue(destination1 + 4)),
         static_cast<int>(LoadPixelValue(destination2)), 0));
-    __m256i upper_left_rows = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+    __m256i upper_left = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+        static_cast<int>(LoadPixelValue(previous0 + 8)),
         static_cast<int>(LoadPixelValue(destination0 + 4)),
-        static_cast<int>(LoadPixelValue(destination1)), 0, 0));
-    for (std::size_t pixel = 0; pixel + 3 < pixels; ++pixel) {
-        const __m256i filtered = _mm256_cvtepu8_epi16(_mm_setr_epi32(
-            static_cast<int>(LoadFilteredPixel(
-                source0, row_bytes, tail0, preserved0, pixel + 3)),
-            static_cast<int>(LoadFilteredPixel(
-                source1, row_bytes, tail1, preserved1, pixel + 2)),
-            static_cast<int>(LoadFilteredPixel(
-                source2, row_bytes, tail2, preserved2, pixel + 1)),
-            static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
+        static_cast<int>(LoadPixelValue(destination1)), 0));
+    const auto decode_wavefront = [&](const std::size_t pixel,
+                                      const __m256i filtered) noexcept {
         const __m256i up = ShiftPaethRows(
             left, LoadPixelValue(previous0 + (pixel + 3) * 4));
-        const __m256i upper_left = ShiftPaethRows(
-            upper_left_rows,
-            LoadPixelValue(previous0 + (pixel + 2) * 4));
         const __m256i up_delta = _mm256_sub_epi16(up, upper_left);
         const __m256i left_delta = _mm256_sub_epi16(left, upper_left);
         const __m256i distance_left = _mm256_abs_epi16(up_delta);
@@ -361,6 +380,13 @@ void AddPaethRows4(std::uint8_t* const destination,
         const __m128i pixels01 = _mm256_castsi256_si128(packed);
         const __m128i pixels23 = _mm256_extracti128_si256(packed, 1);
         const __m128i values = _mm_unpacklo_epi64(pixels01, pixels23);
+        // This diagonal's up pixels are the next diagonal's upper-left pixels.
+        upper_left = up;
+        left = decoded;
+        return values;
+    };
+    const auto store_wavefront = [&](const std::size_t pixel,
+                                     const __m128i values) noexcept {
         StorePixelValue(destination0 + (pixel + 3) * 4,
                         static_cast<std::uint32_t>(_mm_extract_epi32(values, 0)));
         StorePixelValue(destination1 + (pixel + 2) * 4,
@@ -369,8 +395,59 @@ void AddPaethRows4(std::uint8_t* const destination,
                         static_cast<std::uint32_t>(_mm_extract_epi32(values, 2)));
         StorePixelValue(destination3 + pixel * 4,
                         static_cast<std::uint32_t>(_mm_extract_epi32(values, 3)));
-        upper_left_rows = left;
-        left = decoded;
+    };
+    const auto load_wavefront = [&](const std::size_t pixel) noexcept {
+        return _mm256_cvtepu8_epi16(_mm_setr_epi32(
+            static_cast<int>(LoadPixelValue(source0 + (pixel + 3) * 4)),
+            static_cast<int>(LoadPixelValue(source1 + (pixel + 2) * 4)),
+            static_cast<int>(LoadPixelValue(source2 + (pixel + 1) * 4)),
+            static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
+    };
+
+    std::size_t pixel = 0;
+    // All but the final diagonal are still ahead of the in-place compaction
+    // writes. Keep this hot loop free of per-row overlap checks; only the last
+    // diagonal needs the preserved source tails.
+    for (; pixel + 7 < pixels; pixel += 4) {
+        const __m128i diagonal0 = decode_wavefront(
+            pixel, load_wavefront(pixel));
+        const __m128i diagonal1 = decode_wavefront(
+            pixel + 1, load_wavefront(pixel + 1));
+        const __m128i diagonal2 = decode_wavefront(
+            pixel + 2, load_wavefront(pixel + 2));
+        const __m128i diagonal3 = decode_wavefront(
+            pixel + 3, load_wavefront(pixel + 3));
+
+        const __m128i rows01_low = _mm_unpacklo_epi32(diagonal0, diagonal1);
+        const __m128i rows23_low = _mm_unpacklo_epi32(diagonal2, diagonal3);
+        const __m128i rows01_high = _mm_unpackhi_epi32(diagonal0, diagonal1);
+        const __m128i rows23_high = _mm_unpackhi_epi32(diagonal2, diagonal3);
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destination0 + (pixel + 3) * 4),
+            _mm_unpacklo_epi64(rows01_low, rows23_low));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destination1 + (pixel + 2) * 4),
+            _mm_unpackhi_epi64(rows01_low, rows23_low));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destination2 + (pixel + 1) * 4),
+            _mm_unpacklo_epi64(rows01_high, rows23_high));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destination3 + pixel * 4),
+            _mm_unpackhi_epi64(rows01_high, rows23_high));
+    }
+    for (; pixel + 4 < pixels; ++pixel) {
+        store_wavefront(pixel, decode_wavefront(pixel, load_wavefront(pixel)));
+    }
+    for (; pixel + 3 < pixels; ++pixel) {
+        const __m256i filtered = _mm256_cvtepu8_epi16(_mm_setr_epi32(
+            static_cast<int>(LoadFilteredPixel(
+                source0, row_bytes, tail0, preserved0, pixel + 3)),
+            static_cast<int>(LoadFilteredPixel(
+                source1, row_bytes, tail1, preserved1, pixel + 2)),
+            static_cast<int>(LoadFilteredPixel(
+                source2, row_bytes, tail2, preserved2, pixel + 1)),
+            static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
+        store_wavefront(pixel, decode_wavefront(pixel, filtered));
     }
 
     DecodePaethPixelValue(destination1, destination0, pixels - 1,
@@ -402,6 +479,7 @@ void AddUp(std::uint8_t* const destination, const std::uint8_t* const source,
     }
 }
 
+template <bool TrackTimings>
 bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
               const std::uint32_t height, PngDecodeTimings* const timings) noexcept {
     constexpr std::uint32_t max_wavefront_height = 16384;
@@ -417,26 +495,30 @@ bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
             base[source_offset + 3 * (row_bytes + 1)] == 4) {
             AddPaethRows4(base + static_cast<std::size_t>(row) * row_bytes,
                           base + source_offset + 1, row_bytes, scratch.data());
-            if (timings) timings->filter_rows[4] += 4;
+            if constexpr (TrackTimings) timings->filter_rows[4] += 4;
             row += 4;
             continue;
         }
-        if (timings && filter < timings->filter_rows.size()) {
-            ++timings->filter_rows[filter];
+        if constexpr (TrackTimings) {
+            if (filter < timings->filter_rows.size()) {
+                ++timings->filter_rows[filter];
+            }
         }
         const std::uint8_t* const source = base + source_offset + 1;
         std::uint8_t* const destination = base + static_cast<std::size_t>(row) * row_bytes;
         const std::uint8_t* const previous = row == 0 ? nullptr : destination - row_bytes;
         switch (filter) {
             case 0:
-                std::memmove(destination, source, row_bytes);
+                CopyForward(reinterpret_cast<std::byte*>(destination),
+                            reinterpret_cast<const std::byte*>(source), row_bytes);
                 break;
             case 1:
                 AddSub(destination, source, row_bytes);
                 break;
             case 2:
                 if (previous) AddUp(destination, source, previous, row_bytes);
-                else std::memmove(destination, source, row_bytes);
+                else CopyForward(reinterpret_cast<std::byte*>(destination),
+                                 reinterpret_cast<const std::byte*>(source), row_bytes);
                 break;
             case 3:
                 AddAverage(destination, source, previous, row_bytes);
@@ -564,8 +646,9 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     if (input_consumed) input_consumed(callback_context);
     const auto unfilter_begin = timings ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-    const bool unfiltered = Unfilter(surface.pixels, row_bytes, surface.height,
-                                     timings);
+    const bool unfiltered = timings
+        ? Unfilter<true>(surface.pixels, row_bytes, surface.height, timings)
+        : Unfilter<false>(surface.pixels, row_bytes, surface.height, nullptr);
     if (timings) {
         timings->unfilter_nanoseconds = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -590,6 +673,21 @@ HRESULT DecodePngSpng(const std::span<std::byte> compressed,
 
     const auto header_begin = timings ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    std::uint32_t fast_width = 0;
+    std::uint32_t fast_height = 0;
+    if (HasFastRgba8Header(compressed, fast_width, fast_height)) {
+        if (fast_width != surface.width || fast_height != surface.height) {
+            return E_INVALIDARG;
+        }
+        if (timings) {
+            timings->header_nanoseconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - header_begin).count());
+        }
+        return DecodeRgba8Fast(compressed, surface, input_consumed,
+                               callback_context, timings);
+    }
+
     std::unique_ptr<spng_ctx, SpngContextDeleter> context(
         spng_ctx_new(SPNG_CTX_IGNORE_ADLER32));
     if (!context) return E_OUTOFMEMORY;
