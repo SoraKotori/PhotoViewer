@@ -481,6 +481,242 @@ void AddPaethRows4(std::uint8_t* const destination,
     }
 }
 
+void AddPaethRows8(std::uint8_t* const destination,
+                   const std::uint8_t* const source,
+                   const std::size_t row_bytes,
+                   std::uint8_t* const scratch) noexcept {
+    constexpr std::size_t row_count = 8;
+    constexpr std::size_t preserved_row_count = row_count - 1;
+    const std::size_t pixels = row_bytes / 4;
+    std::array<std::uint8_t*, row_count> destinations{};
+    std::array<const std::uint8_t*, row_count> sources{};
+    destinations[0] = destination;
+    sources[0] = source;
+    for (std::size_t row = 1; row < row_count; ++row) {
+        destinations[row] = destinations[row - 1] + row_bytes;
+        sources[row] = sources[row - 1] + row_bytes + 1;
+    }
+    const std::uint8_t* const previous0 = destinations[0] - row_bytes;
+
+    std::array<std::size_t, preserved_row_count> preserved{};
+    for (std::size_t row = 0; row < preserved.size(); ++row) {
+        preserved[row] = static_cast<std::size_t>(
+            sources[row] - destinations[row]);
+    }
+    if (pixels < row_count || preserved.back() >= row_bytes) {
+        for (std::size_t row = 0; row < row_count; ++row) {
+            AddPaeth(destinations[row], sources[row],
+                     row == 0 ? previous0 : destinations[row - 1], row_bytes);
+        }
+        return;
+    }
+
+    std::array<std::uint8_t*, preserved_row_count> tails{};
+    std::uint8_t* tail = scratch;
+    for (std::size_t row = 0; row < tails.size(); ++row) {
+        tails[row] = tail;
+        std::memcpy(tail, sources[row] + row_bytes - preserved[row],
+                    preserved[row]);
+        tail += preserved[row];
+    }
+
+    for (std::size_t row = 0; row < preserved_row_count; ++row) {
+        const std::uint8_t* const previous =
+            row == 0 ? previous0 : destinations[row - 1];
+        for (std::size_t pixel = 0;
+             pixel < preserved_row_count - row;
+             ++pixel) {
+            DecodePaethPixel(destinations[row], sources[row], previous, pixel);
+        }
+    }
+
+    __m256i left = _mm256_setr_epi32(
+        static_cast<int>(LoadPixelValue(destinations[0] + 6 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[1] + 5 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[2] + 4 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[3] + 3 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[4] + 2 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[5] + 1 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[6])), 0);
+    __m256i upper_left = _mm256_setr_epi32(
+        static_cast<int>(LoadPixelValue(previous0 + 6 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[0] + 5 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[1] + 4 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[2] + 3 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[3] + 2 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[4] + 1 * 4)),
+        static_cast<int>(LoadPixelValue(destinations[5])), 0);
+
+    const auto absolute_difference = [](
+        const __m256i a, const __m256i b) noexcept {
+        return _mm256_sub_epi8(_mm256_max_epu8(a, b),
+                               _mm256_min_epu8(a, b));
+    };
+    const auto decode_diagonal = [&](const std::size_t pixel,
+                                     const __m256i filtered) noexcept {
+        const __m256i shift = _mm256_permutevar8x32_epi32(
+            left, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+        const __m256i first_up = _mm256_castsi128_si256(
+            _mm_cvtsi32_si128(static_cast<int>(
+                LoadPixelValue(previous0 + (pixel + 7) * 4))));
+        const __m256i up = _mm256_blend_epi32(shift, first_up, 0x01);
+        const __m256i distance_left = absolute_difference(up, upper_left);
+        const __m256i distance_up = absolute_difference(left, upper_left);
+        const __m256i left_above = _mm256_cmpeq_epi8(
+            _mm256_max_epu8(left, upper_left), left);
+        const __m256i up_above = _mm256_cmpeq_epi8(
+            _mm256_max_epu8(up, upper_left), up);
+        const __m256i same_side = _mm256_cmpeq_epi8(left_above, up_above);
+        const __m256i same_side_distance = _mm256_adds_epu8(
+            distance_left, distance_up);
+        const __m256i opposite_side_distance = absolute_difference(
+            distance_left, distance_up);
+        const __m256i distance_upper_left = _mm256_blendv_epi8(
+            opposite_side_distance, same_side_distance, same_side);
+        const __m256i zero = _mm256_setzero_si256();
+        const __m256i all = _mm256_cmpeq_epi8(zero, zero);
+        const __m256i choose_up = _mm256_xor_si256(
+            _mm256_cmpeq_epi8(
+                _mm256_subs_epu8(distance_left, distance_up), zero), all);
+        const __m256i left_or_up = _mm256_blendv_epi8(left, up, choose_up);
+        const __m256i choose_upper_left = _mm256_xor_si256(
+            _mm256_cmpeq_epi8(
+                _mm256_subs_epu8(
+                    _mm256_min_epu8(distance_left, distance_up),
+                    distance_upper_left),
+                zero),
+            all);
+        const __m256i prediction = _mm256_blendv_epi8(
+            left_or_up, upper_left, choose_upper_left);
+        const __m256i decoded = _mm256_add_epi8(filtered, prediction);
+        upper_left = up;
+        left = decoded;
+        return decoded;
+    };
+    const auto load_diagonal = [&](const std::size_t pixel) noexcept {
+        return _mm256_setr_epi32(
+            static_cast<int>(LoadPixelValue(
+                sources[0] + (pixel + 7) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[1] + (pixel + 6) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[2] + (pixel + 5) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[3] + (pixel + 4) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[4] + (pixel + 3) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[5] + (pixel + 2) * 4)),
+            static_cast<int>(LoadPixelValue(
+                sources[6] + (pixel + 1) * 4)),
+            static_cast<int>(LoadPixelValue(sources[7] + pixel * 4)));
+    };
+    const auto store_diagonal = [&](const std::size_t first_row,
+                                    const std::size_t pixel,
+                                    const __m128i values) noexcept {
+        alignas(16) std::array<std::uint32_t, 4> lanes{};
+        _mm_store_si128(reinterpret_cast<__m128i*>(lanes.data()), values);
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+            StorePixelValue(
+                destinations[first_row + lane] +
+                    (pixel + 7 - first_row - lane) * 4,
+                lanes[lane]);
+        }
+    };
+    const auto store_four_diagonals = [&](const std::size_t first_row,
+                                          const std::size_t pixel,
+                                          const std::array<__m128i, 4>& values) noexcept {
+        const __m128i rows01_low = _mm_unpacklo_epi32(values[0], values[1]);
+        const __m128i rows23_low = _mm_unpacklo_epi32(values[2], values[3]);
+        const __m128i rows01_high = _mm_unpackhi_epi32(values[0], values[1]);
+        const __m128i rows23_high = _mm_unpackhi_epi32(values[2], values[3]);
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destinations[first_row] +
+                                       (pixel + 7 - first_row) * 4),
+            _mm_unpacklo_epi64(rows01_low, rows23_low));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destinations[first_row + 1] +
+                                       (pixel + 6 - first_row) * 4),
+            _mm_unpackhi_epi64(rows01_low, rows23_low));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destinations[first_row + 2] +
+                                       (pixel + 5 - first_row) * 4),
+            _mm_unpacklo_epi64(rows01_high, rows23_high));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(destinations[first_row + 3] +
+                                       (pixel + 4 - first_row) * 4),
+            _mm_unpackhi_epi64(rows01_high, rows23_high));
+    };
+    const auto direct_diagonal_end = [](const std::size_t full_pixels,
+                                         const std::size_t row_offset) noexcept {
+        return full_pixels > row_offset ? full_pixels - row_offset : 0;
+    };
+    std::size_t direct_end = pixels - preserved_row_count;
+    for (std::size_t row = 0; row < preserved.size(); ++row) {
+        direct_end = std::min(
+            direct_end,
+            direct_diagonal_end((row_bytes - preserved[row]) / 4,
+                                preserved_row_count - row));
+    }
+
+    std::size_t pixel = 0;
+    for (; pixel + 4 <= direct_end; pixel += 4) {
+        std::array<__m128i, 4> values0{};
+        std::array<__m128i, 4> values1{};
+        for (std::size_t diagonal = 0; diagonal < 4; ++diagonal) {
+            const __m256i values = decode_diagonal(
+                pixel + diagonal, load_diagonal(pixel + diagonal));
+            values0[diagonal] = _mm256_castsi256_si128(values);
+            values1[diagonal] = _mm256_extracti128_si256(values, 1);
+        }
+        store_four_diagonals(0, pixel, values0);
+        store_four_diagonals(4, pixel, values1);
+    }
+    for (; pixel < direct_end; ++pixel) {
+        const __m256i values = decode_diagonal(pixel, load_diagonal(pixel));
+        store_diagonal(0, pixel, _mm256_castsi256_si128(values));
+        store_diagonal(4, pixel, _mm256_extracti128_si256(values, 1));
+    }
+    for (; pixel + preserved_row_count < pixels; ++pixel) {
+        const __m256i filtered = _mm256_setr_epi32(
+            static_cast<int>(LoadFilteredPixel(
+                sources[0], row_bytes, tails[0], preserved[0], pixel + 7)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[1], row_bytes, tails[1], preserved[1], pixel + 6)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[2], row_bytes, tails[2], preserved[2], pixel + 5)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[3], row_bytes, tails[3], preserved[3], pixel + 4)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[4], row_bytes, tails[4], preserved[4], pixel + 3)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[5], row_bytes, tails[5], preserved[5], pixel + 2)),
+            static_cast<int>(LoadFilteredPixel(
+                sources[6], row_bytes, tails[6], preserved[6], pixel + 1)),
+            static_cast<int>(LoadPixelValue(sources[7] + pixel * 4)));
+        const __m256i values = decode_diagonal(pixel, filtered);
+        store_diagonal(0, pixel, _mm256_castsi256_si128(values));
+        store_diagonal(4, pixel, _mm256_extracti128_si256(values, 1));
+    }
+
+    for (std::size_t row = 1; row < preserved_row_count; ++row) {
+        for (std::size_t tail_pixel = pixels - row;
+             tail_pixel < pixels;
+             ++tail_pixel) {
+            DecodePaethPixelValue(
+                destinations[row], destinations[row - 1], tail_pixel,
+                LoadFilteredPixel(sources[row], row_bytes, tails[row],
+                                  preserved[row], tail_pixel));
+        }
+    }
+    for (std::size_t tail_pixel = pixels - preserved_row_count;
+         tail_pixel < pixels;
+         ++tail_pixel) {
+        DecodePaethPixel(destinations.back(), sources.back(),
+                         destinations[preserved_row_count - 1], tail_pixel);
+    }
+}
+
 void AddUp(std::uint8_t* const destination, const std::uint8_t* const source,
            const std::uint8_t* const previous, const std::size_t bytes) noexcept {
     std::size_t offset = 0;
@@ -501,11 +737,26 @@ template <bool TrackTimings>
 bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
               const std::uint32_t height, PngDecodeTimings* const timings) noexcept {
     constexpr std::uint32_t max_wavefront_height = 16384;
-    std::array<std::uint8_t, max_wavefront_height * 3> scratch;
+    std::array<std::uint8_t, max_wavefront_height * 7> scratch;
     auto* const base = reinterpret_cast<std::uint8_t*>(bytes);
     for (std::uint32_t row = 0; row < height;) {
         const std::size_t source_offset = static_cast<std::size_t>(row) * (row_bytes + 1);
         const std::uint8_t filter = base[source_offset];
+        if (height <= max_wavefront_height && row != 0 && row + 7 < height &&
+            filter == 4 &&
+            base[source_offset + row_bytes + 1] == 4 &&
+            base[source_offset + 2 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 3 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 4 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 5 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 6 * (row_bytes + 1)] == 4 &&
+            base[source_offset + 7 * (row_bytes + 1)] == 4) {
+            AddPaethRows8(base + static_cast<std::size_t>(row) * row_bytes,
+                          base + source_offset + 1, row_bytes, scratch.data());
+            if constexpr (TrackTimings) timings->filter_rows[4] += 8;
+            row += 8;
+            continue;
+        }
         if (height <= max_wavefront_height && row != 0 && row + 3 < height &&
             filter == 4 &&
             base[source_offset + row_bytes + 1] == 4 &&
