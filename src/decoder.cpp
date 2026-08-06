@@ -56,8 +56,26 @@ std::vector<DWORD> SelectCpuSets(const std::size_t worker_count) {
     });
 
     std::vector<DWORD> selected;
-    selected.reserve(std::min(worker_count, candidates.size()));
+    selected.reserve(candidates.size());
     std::vector<std::pair<WORD, BYTE>> selected_cores;
+    if (!candidates.empty()) {
+        const BYTE best_efficiency = candidates.front().efficiency;
+        const BYTE best_scheduling = candidates.front().scheduling;
+        for (const CpuSetCandidate& candidate : candidates) {
+            if (candidate.parked || candidate.efficiency != best_efficiency ||
+                candidate.scheduling != best_scheduling) {
+                continue;
+            }
+            const auto core = std::pair{candidate.group, candidate.core};
+            if (std::find(selected_cores.begin(), selected_cores.end(), core) !=
+                selected_cores.end()) {
+                continue;
+            }
+            selected.push_back(candidate.id);
+            selected_cores.push_back(core);
+        }
+    }
+    if (selected.size() >= worker_count) return selected;
     for (const CpuSetCandidate& candidate : candidates) {
         const auto core = std::pair{candidate.group, candidate.core};
         if (std::find(selected_cores.begin(), selected_cores.end(), core) !=
@@ -66,14 +84,14 @@ std::vector<DWORD> SelectCpuSets(const std::size_t worker_count) {
         }
         selected.push_back(candidate.id);
         selected_cores.push_back(core);
-        if (selected.size() == worker_count) return selected;
+        if (selected.size() >= worker_count) return selected;
     }
     for (const CpuSetCandidate& candidate : candidates) {
         if (std::find(selected.begin(), selected.end(), candidate.id) != selected.end()) {
             continue;
         }
         selected.push_back(candidate.id);
-        if (selected.size() == worker_count) break;
+        if (selected.size() >= worker_count) break;
     }
     return selected;
 }

@@ -4,9 +4,9 @@ param(
     [ValidateRange(1, 100)]
     [int]$Runs = 3,
     [ValidateRange(1, 1000)]
-    [int]$Steps = 120,
+    [int]$Steps = 180,
     [ValidateRange(0, 60000)]
-    [int]$WarmupMs = 1250,
+    [int]$WarmupMs = 0,
     [ValidateRange(1, 256)]
     [int]$Workers = 5,
     [ValidateRange(1, 4096)]

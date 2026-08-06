@@ -61,8 +61,9 @@ struct SyntheticPng {
 };
 
 SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
-    constexpr std::array<std::uint8_t, 16> filters{
-        0, 4, 4, 4, 4, 1, 2, 3, 4, 4, 4, 4, 2, 4, 4, 4};
+    constexpr std::array<std::uint8_t, 24> filters{
+        0, 4, 4, 4, 4, 4, 4, 4, 4, 1, 2, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 2, 4, 4, 4};
     const std::uint32_t height = static_cast<std::uint32_t>(filters.size());
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     std::vector<std::byte> pixels(row_bytes * height);
@@ -461,7 +462,24 @@ int VerifyFullPixels(const std::filesystem::path& start_path,
                                   decoded_bytes, width, height, width * 4};
         pv::CheckHr(pv::DecodePngSpng(mutable_png, surface),
                     "fast-path PNG decode for full pixel verification");
-        Check(std::equal(reference.begin(), reference.end(), surface.pixels),
+        const auto mismatch = std::mismatch(reference.begin(), reference.end(),
+                                            surface.pixels);
+        if (mismatch.first != reference.end()) {
+            const std::size_t offset = static_cast<std::size_t>(
+                mismatch.first - reference.begin());
+            std::cerr << "PixelMismatch file=" << file->filename()
+                      << " offset=" << offset
+                      << " row=" << (offset / (width * 4ULL))
+                      << " byte_in_row=" << (offset % (width * 4ULL))
+                      << " expected="
+                      << static_cast<unsigned int>(
+                             static_cast<std::uint8_t>(*mismatch.first))
+                      << " actual="
+                      << static_cast<unsigned int>(
+                             static_cast<std::uint8_t>(*mismatch.second))
+                      << '\n';
+        }
+        Check(mismatch.first == reference.end(),
               "fast-path pixels must exactly match reference libspng");
         Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
                           [](const std::byte value) {
@@ -679,7 +697,7 @@ int wmain(const int argc, wchar_t** const argv) {
         }
         if (argc == 4 && std::wstring_view(argv[1]) == L"--verify-full-pixels") {
             const std::size_t images = std::stoull(argv[3]);
-            Check(images > 0 && images <= 32, "invalid full pixel verification count");
+            Check(images > 0 && images <= 256, "invalid full pixel verification count");
             return VerifyFullPixels(argv[2], images);
         }
         TestSpng();

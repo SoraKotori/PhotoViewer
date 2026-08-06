@@ -97,6 +97,6 @@
 | `--staging-slot-count=` | 8 |
 | `--gpu-texture-slot-count=` | 3 |
 
-驗收使用 61 張連續且不重複的 7680 × 4320、8-bit RGBA、non-interlaced PNG，採冷啟動且不做 warmup。第一張的冷啟動時間獨立記錄；後續圖片不得晚於 30 images/s 的理論 ready deadline。
+驗收使用 181 張連續且不重複的 7680 × 4320、8-bit RGBA、non-interlaced PNG，採冷啟動且不做 warmup。第一張作為冷啟動圖片並獨立記錄；後續 180 張圖片不得晚於 30 images/s 的理論 ready deadline。
 
 效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。大型資料搬移保持顯式，CPU 密集工作由 Workers 執行，Main Thread 僅負責控制、提交與完成處理。
