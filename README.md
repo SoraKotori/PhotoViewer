@@ -6,10 +6,9 @@
 - [使用方式](#使用方式)
 - [圖片呈現品質](#圖片呈現品質)
 - [預設參數](#預設參數)
-- [驗收參數](#驗收參數)
 - [系統需求](#系統需求)
 - [資源需求](#資源需求)
-- [執行緒、解碼流程與控制架構](docs/runtime-design.md)
+- [驗收條件](#驗收條件)
 
 ## 產品目標
 
@@ -30,7 +29,7 @@
 ## 圖片呈現品質
 
 - 使用 Direct2D 高品質縮放。
-- 使用 Per-Monitor DPI，並使 back buffer 對應視窗的實體像素，避免 DPI 虛擬化造成 DWM 二次縮放。
+- 使用 Per-Monitor DPI Awareness V2 避免 DPI 虛擬化；swap-chain back buffer 隨視窗 client area 的實體像素調整，避免 DXGI 額外縮放。
 
 ## 預設參數
 
@@ -45,19 +44,6 @@
 | `--staging-slot-count=` | 20 | 解碼 staging texture slot 數量上限 |
 | `--gpu-cache-mib=` | 無限制 | GPU texture 記憶體上限 |
 | `--gpu-texture-slot-count=` | 6 | GPU texture slot 數量上限 |
-
-## 驗收參數
-
-效能驗收只覆寫以下參數，其餘沿用預設值：
-
-| 參數 | 驗收值 |
-|---|---:|
-| `--workers=` | 5 |
-| `--compressed-slot-count=` | 8 |
-| `--staging-slot-count=` | 8 |
-| `--gpu-texture-slot-count=` | 3 |
-
-效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。大型資料搬移保持顯式，CPU 密集工作由 Workers 執行，Main Thread 僅負責控制、提交與完成處理。
 
 ## 系統需求
 
@@ -87,3 +73,18 @@
 | 儲存裝置 | 40 × 30 | 1.17 GiB／秒 |
 | 系統記憶體 | 2 × (40 + 126.56) × 30 | 9.76 GiB／秒 |
 | 獨立顯示卡傳輸介面 | 126.56 × 30 | 3.71 GiB／秒 |
+
+## 驗收條件
+
+效能驗收只覆寫以下參數，其餘沿用預設值：
+
+| 參數 | 驗收值 |
+|---|---:|
+| `--workers=` | 5 |
+| `--compressed-slot-count=` | 8 |
+| `--staging-slot-count=` | 8 |
+| `--gpu-texture-slot-count=` | 3 |
+
+驗收使用 7680 × 4320、8-bit RGBA、non-interlaced PNG。導覽開始延遲由私有測試設定指定；第一張作為初始圖片並獨立記錄，後續圖片的可呈現時間必須符合設定的時限。
+
+效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。大型資料搬移保持顯式，CPU 密集工作由 Workers 執行，Main Thread 僅負責控制、提交與完成處理。

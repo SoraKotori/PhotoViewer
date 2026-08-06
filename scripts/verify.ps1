@@ -46,9 +46,6 @@ if ($SamplePng) {
         -FilePath (Join-Path $output 'PhotoViewer.exe') `
         -ArgumentList @(
             $validationMode,
-            '--staging-cache-mib=512',
-            '--gpu-cache-mib=256',
-            '--compressed-budget-mib=256',
             '--workers=5',
             ('"' + $sample + '"')
         ) `

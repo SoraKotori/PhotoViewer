@@ -5,7 +5,7 @@ param(
     [int]$Runs = 3,
     [ValidateRange(1, 1000)]
     [int]$Steps = 120,
-    [ValidateRange(1, 60000)]
+    [ValidateRange(0, 60000)]
     [int]$WarmupMs = 1250,
     [ValidateRange(1, 256)]
     [int]$Workers = 5,
@@ -15,12 +15,6 @@ param(
     [int]$GpuTextureSlots = 3,
     [ValidateRange(1, 4096)]
     [int]$CompressedSlots = 8,
-    [ValidateRange(1, 16384)]
-    [int]$StagingCacheMiB = 1280,
-    [ValidateRange(1, 16384)]
-    [int]$GpuCacheMiB = 512,
-    [ValidateRange(1, 16384)]
-    [int]$CompressedBudgetMiB = 640,
     [ValidateSet('L', 'R')]
     [string]$Direction = 'R',
     [switch]$ShortPresses,
@@ -104,6 +98,12 @@ $tailMeasurements = @()
 $privateMemoryMeasurements = @()
 $workingSetMeasurements = @()
 $managedMemoryMeasurements = @()
+$coldStartMeasurements = @()
+$coldTimelineMeasurements = @()
+$maximumGapMeasurements = @()
+$maximumLatenessMeasurements = @()
+$maximumReadyLatenessMeasurements = @()
+$lateReadyCountMeasurements = @()
 for ($run = 1; $run -le $Runs; ++$run) {
     $report = Join-Path $resultDirectory "performance-report-$Direction-$inputMode-$run.txt"
     $arguments = @(
@@ -112,16 +112,15 @@ for ($run = 1; $run -le $Runs; ++$run) {
         "--staging-slot-count=$StagingSlots",
         "--gpu-texture-slot-count=$GpuTextureSlots",
         "--compressed-slot-count=$CompressedSlots",
-        "--staging-cache-mib=$StagingCacheMiB",
-        "--gpu-cache-mib=$GpuCacheMiB",
-        "--compressed-budget-mib=$CompressedBudgetMiB",
         "--validation-file-list=$fileList",
         "--validation-navigation=$navigation",
-        "--validation-warmup-ms=$WarmupMs",
         "--validation-report=$report",
         '--validation-elapsed-exit-code',
         '--validation-timeout-ms=60000'
     )
+    if ($WarmupMs -gt 0) {
+        $arguments += "--validation-warmup-ms=$WarmupMs"
+    }
     if ($NavigationIntervalMs -gt 0) {
         $arguments += "--validation-navigation-interval-ms=$NavigationIntervalMs"
     }
@@ -183,6 +182,69 @@ for ($run = 1; $run -le $Runs; ++$run) {
         }
     }
     $managedMemoryMeasurements += $managedPeakBytes
+    $presentedIndices = @($finalReport.validation_presented_indices -split ',' |
+        ForEach-Object { [int64]$_ })
+    $presentedNanoseconds = @($finalReport.validation_presented_nanoseconds -split ',' |
+        ForEach-Object { [int64]$_ })
+    $readyIndices = @($finalReport.validation_ready_indices -split ',' |
+        Where-Object { $_ -ne '' } |
+        ForEach-Object { [int64]$_ })
+    $readyNanoseconds = @($finalReport.validation_ready_nanoseconds -split ',' |
+        Where-Object { $_ -ne '' } |
+        ForEach-Object { [int64]$_ })
+    if ($presentedIndices.Count -ne $Steps + 1 -or
+        $presentedNanoseconds.Count -ne $Steps + 1) {
+        throw "Run $run reported $($presentedIndices.Count) presentations; $($Steps + 1) required"
+    }
+    if ($readyIndices.Count -ne $readyNanoseconds.Count) {
+        throw "Run $run reported mismatched ready indices and timestamps"
+    }
+    $readyByIndex = @{}
+    for ($index = 0; $index -lt $readyIndices.Count; ++$index) {
+        $readyByIndex[$readyIndices[$index]] = $readyNanoseconds[$index]
+    }
+    $expectedDelta = if ($Direction -eq 'R') { 1 } else { -1 }
+    [double]$maximumGapMs = 0
+    [double]$maximumLatenessMs = 0
+    [double]$maximumReadyLatenessMs = [double]::NegativeInfinity
+    [int]$lateReadyCount = 0
+    $targetPeriodNanoseconds = 1.0e9 / $TargetFps
+    for ($ordinal = 0; $ordinal -lt $presentedIndices.Count; ++$ordinal) {
+        if ($ordinal -gt 0 -and
+            $presentedIndices[$ordinal] - $presentedIndices[$ordinal - 1] -ne
+                $expectedDelta) {
+            throw "Run $run presentation order is not contiguous at position $ordinal"
+        }
+        if ($ordinal -gt 0) {
+            $gapMs = ($presentedNanoseconds[$ordinal] -
+                      $presentedNanoseconds[$ordinal - 1]) / 1.0e6
+            $maximumGapMs = [math]::Max($maximumGapMs, $gapMs)
+        }
+        $deadline = $presentedNanoseconds[0] +
+                    $ordinal * $targetPeriodNanoseconds
+        $latenessMs = ($presentedNanoseconds[$ordinal] - $deadline) / 1.0e6
+        $maximumLatenessMs = [math]::Max($maximumLatenessMs, $latenessMs)
+        $frameIndex = $presentedIndices[$ordinal]
+        if (-not $readyByIndex.ContainsKey($frameIndex)) {
+            throw "Run $run has no ready timestamp for image index $frameIndex"
+        }
+        $readyLatenessMs = ([int64]$readyByIndex[$frameIndex] - $deadline) / 1.0e6
+        $maximumReadyLatenessMs = [math]::Max(
+            $maximumReadyLatenessMs, $readyLatenessMs)
+        if ($readyLatenessMs -gt 0) {
+            ++$lateReadyCount
+        }
+    }
+    $coldStartMs = $presentedNanoseconds[0] / 1.0e6
+    $coldTimelineElapsedMs = ($presentedNanoseconds[-1] -
+                              $presentedNanoseconds[0]) / 1.0e6
+    $coldTimelineFps = $Steps * 1000.0 / $coldTimelineElapsedMs
+    $coldStartMeasurements += $coldStartMs
+    $coldTimelineMeasurements += $coldTimelineFps
+    $maximumGapMeasurements += $maximumGapMs
+    $maximumLatenessMeasurements += $maximumLatenessMs
+    $maximumReadyLatenessMeasurements += $maximumReadyLatenessMs
+    $lateReadyCountMeasurements += $lateReadyCount
     $injectionMs = [double]$finalReport.navigation_injection_nanoseconds / 1.0e6
     $tailMs = [double]$finalReport.navigation_pipeline_tail_nanoseconds / 1.0e6
     $injectionMeasurements += $injectionMs
@@ -191,6 +253,12 @@ for ($run = 1; $run -le $Runs; ++$run) {
         Run = $run
         ElapsedMs = $process.ExitCode
         ImagesPerSecond = [math]::Round($fps, 2)
+        ColdFirstPresentMs = [math]::Round($coldStartMs, 2)
+        ColdTimelineImagesPerSecond = [math]::Round($coldTimelineFps, 2)
+        MaximumPresentationGapMs = [math]::Round($maximumGapMs, 2)
+        MaximumDeadlineLatenessMs = [math]::Round($maximumLatenessMs, 2)
+        MaximumReadyDeadlineLatenessMs = [math]::Round($maximumReadyLatenessMs, 2)
+        LateReadyImages = $lateReadyCount
         InputInjectionMs = [math]::Round($injectionMs, 2)
         PipelineTailMs = [math]::Round($tailMs, 2)
         PeakPrivateMiB = [math]::Round($peakPrivateBytes / 1MB, 1)
@@ -215,9 +283,6 @@ $average = ($measurements | Measure-Object -Average).Average
     StagingSlots = $StagingSlots
     GpuTextureSlots = $GpuTextureSlots
     CompressedSlots = $CompressedSlots
-    StagingCacheMiB = $StagingCacheMiB
-    GpuCacheMiB = $GpuCacheMiB
-    CompressedBudgetMiB = $CompressedBudgetMiB
     Direction = $Direction
     InputMode = $inputMode
     StepsPerRun = $Steps
@@ -226,6 +291,20 @@ $average = ($measurements | Measure-Object -Average).Average
     TargetImagesPerSecond = $TargetFps
     MinimumImagesPerSecond = [math]::Round($minimum, 2)
     AverageImagesPerSecond = [math]::Round($average, 2)
+    MaximumColdFirstPresentMs = [math]::Round(
+        ($coldStartMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MinimumColdTimelineImagesPerSecond = [math]::Round(
+        ($coldTimelineMeasurements | Measure-Object -Minimum).Minimum, 2)
+    AverageColdTimelineImagesPerSecond = [math]::Round(
+        ($coldTimelineMeasurements | Measure-Object -Average).Average, 2)
+    MaximumPresentationGapMs = [math]::Round(
+        ($maximumGapMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MaximumDeadlineLatenessMs = [math]::Round(
+        ($maximumLatenessMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MaximumReadyDeadlineLatenessMs = [math]::Round(
+        ($maximumReadyLatenessMeasurements | Measure-Object -Maximum).Maximum, 2)
+    MaximumLateReadyImages =
+        ($lateReadyCountMeasurements | Measure-Object -Maximum).Maximum
     MaximumInputInjectionMs = [math]::Round(
         ($injectionMeasurements | Measure-Object -Maximum).Maximum, 2)
     MaximumPipelineTailMs = [math]::Round(
@@ -241,5 +320,8 @@ $average = ($measurements | Measure-Object -Average).Average
 if ($minimum -lt $TargetFps) {
     throw "Performance target missed: minimum $([math]::Round($minimum, 2)) < $TargetFps images/s"
 }
+if (($lateReadyCountMeasurements | Measure-Object -Maximum).Maximum -ne 0) {
+    throw "Ready deadline missed: at least one image became presentable after its 30 images/s deadline"
+}
 
-Write-Host 'PASS: performance target met in every run.'
+Write-Host 'PASS: performance and ready-deadline targets met in every run.'

@@ -5,15 +5,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 
 namespace pv {
 
 struct Config {
     std::filesystem::path initial_image;
-    std::size_t staging_cache_bytes = 1280ULL * 1024ULL * 1024ULL;
-    std::size_t gpu_cache_bytes = 512ULL * 1024ULL * 1024ULL;
-    std::size_t compressed_budget_bytes = 640ULL * 1024ULL * 1024ULL;
+    std::size_t staging_cache_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t gpu_cache_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t compressed_budget_bytes = std::numeric_limits<std::size_t>::max();
     std::size_t staging_slot_count = 12;
     std::size_t gpu_texture_slot_count = 6;
     std::size_t compressed_slot_count = 24;
