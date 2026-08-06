@@ -298,6 +298,9 @@ std::uint32_t LoadFilteredPixel(const std::uint8_t* const source,
     if (offset + 4 <= preserved_begin) {
         return LoadPixelValue(source + offset);
     }
+    if (offset >= preserved_begin) {
+        return LoadPixelValue(preserved_tail + offset - preserved_begin);
+    }
     std::uint32_t value = 0;
     for (std::size_t byte_index = 0; byte_index < 4; ++byte_index) {
         const std::size_t position = offset + byte_index;
@@ -404,11 +407,26 @@ void AddPaethRows4(std::uint8_t* const destination,
             static_cast<int>(LoadPixelValue(source3 + pixel * 4))));
     };
 
+    const auto direct_diagonal_end = [](const std::size_t full_pixels,
+                                        const std::size_t row_offset) noexcept {
+        return full_pixels > row_offset ? full_pixels - row_offset : 0;
+    };
+    std::size_t direct_end = pixels - 3;
+    direct_end = std::min(
+        direct_end,
+        direct_diagonal_end((row_bytes - preserved0) / 4, 3));
+    direct_end = std::min(
+        direct_end,
+        direct_diagonal_end((row_bytes - preserved1) / 4, 2));
+    direct_end = std::min(
+        direct_end,
+        direct_diagonal_end((row_bytes - preserved2) / 4, 1));
+
     std::size_t pixel = 0;
-    // All but the final diagonal are still ahead of the in-place compaction
-    // writes. Keep this hot loop free of per-row overlap checks; only the last
-    // diagonal needs the preserved source tails.
-    for (; pixel + 7 < pixels; pixel += 4) {
+    // Batch four diagonals while every source pixel is still before its
+    // preserved tail. This keeps overlap checks out of the hot region without
+    // reading bytes overwritten by the following compacted rows.
+    for (; pixel + 4 <= direct_end; pixel += 4) {
         const __m128i diagonal0 = decode_wavefront(
             pixel, load_wavefront(pixel));
         const __m128i diagonal1 = decode_wavefront(
@@ -435,7 +453,7 @@ void AddPaethRows4(std::uint8_t* const destination,
             reinterpret_cast<__m128i*>(destination3 + pixel * 4),
             _mm_unpackhi_epi64(rows01_high, rows23_high));
     }
-    for (; pixel + 4 < pixels; ++pixel) {
+    for (; pixel < direct_end; ++pixel) {
         store_wavefront(pixel, decode_wavefront(pixel, load_wavefront(pixel)));
     }
     for (; pixel + 3 < pixels; ++pixel) {
@@ -453,13 +471,13 @@ void AddPaethRows4(std::uint8_t* const destination,
     DecodePaethPixelValue(destination1, destination0, pixels - 1,
                           LoadFilteredPixel(source1, row_bytes, tail1,
                                             preserved1, pixels - 1));
-    for (std::size_t pixel = pixels - 2; pixel < pixels; ++pixel) {
-        DecodePaethPixelValue(destination2, destination1, pixel,
+    for (std::size_t tail_pixel = pixels - 2; tail_pixel < pixels; ++tail_pixel) {
+        DecodePaethPixelValue(destination2, destination1, tail_pixel,
                               LoadFilteredPixel(source2, row_bytes, tail2,
-                                                preserved2, pixel));
+                                                preserved2, tail_pixel));
     }
-    for (std::size_t pixel = pixels - 3; pixel < pixels; ++pixel) {
-        DecodePaethPixel(destination3, source3, destination2, pixel);
+    for (std::size_t tail_pixel = pixels - 3; tail_pixel < pixels; ++tail_pixel) {
+        DecodePaethPixel(destination3, source3, destination2, tail_pixel);
     }
 }
 

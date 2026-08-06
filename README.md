@@ -52,7 +52,7 @@
 
 | 參數 | 驗收值 |
 |---|---:|
-| `--workers=` | 4 |
+| `--workers=` | 5 |
 | `--compressed-slot-count=` | 8 |
 | `--staging-slot-count=` | 10 |
 | `--gpu-texture-slot-count=` | 3 |
