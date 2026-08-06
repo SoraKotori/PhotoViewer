@@ -54,7 +54,7 @@
 |---|---:|
 | `--workers=` | 5 |
 | `--compressed-slot-count=` | 8 |
-| `--staging-slot-count=` | 10 |
+| `--staging-slot-count=` | 8 |
 | `--gpu-texture-slot-count=` | 3 |
 
 效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。大型資料搬移保持顯式，CPU 密集工作由 Workers 執行，Main Thread 僅負責控制、提交與完成處理。
