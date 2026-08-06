@@ -104,26 +104,32 @@ DecoderPool::DecoderPool(const std::size_t worker_count, WorkQueue& work_queue,
     : work_queue_(work_queue), completion_queue_(completion_queue), slots_(slots),
       event_window_(event_window) {
     const std::vector<DWORD> cpu_sets = SelectCpuSets(worker_count);
+    worker_metrics_.reserve(worker_count);
+    for (std::size_t index = 0; index < worker_count; ++index) {
+        worker_metrics_.push_back(std::make_unique<WorkerMetrics>());
+    }
     workers_.reserve(worker_count);
     for (std::size_t index = 0; index < worker_count; ++index) {
         const bool has_cpu_set = index < cpu_sets.size();
         const DWORD cpu_set = has_cpu_set ? cpu_sets[index] : 0;
-        workers_.emplace_back([this, has_cpu_set, cpu_set](const std::stop_token stop) {
+        WorkerMetrics* const metrics = worker_metrics_[index].get();
+        workers_.emplace_back([this, has_cpu_set, cpu_set, metrics](
+                                  const std::stop_token stop) {
             if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
-                elevated_worker_count_.fetch_add(1, std::memory_order_relaxed);
+                metrics->elevated.store(true, std::memory_order_relaxed);
             }
             THREAD_POWER_THROTTLING_STATE power{};
             power.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
             power.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
             if (SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
                                      &power, sizeof(power))) {
-                unthrottled_worker_count_.fetch_add(1, std::memory_order_relaxed);
+                metrics->unthrottled.store(true, std::memory_order_relaxed);
             }
             if (has_cpu_set &&
                 SetThreadSelectedCpuSets(GetCurrentThread(), &cpu_set, 1)) {
-                selected_cpu_set_count_.fetch_add(1, std::memory_order_relaxed);
+                metrics->selected_cpu_set.store(true, std::memory_order_relaxed);
             }
-            WorkerMain(stop);
+            WorkerMain(stop, *metrics);
         });
     }
 }
@@ -135,40 +141,60 @@ DecoderPool::~DecoderPool() {
 }
 
 void DecoderPool::ResetMetrics() noexcept {
-    decode_count_.store(0, std::memory_order_relaxed);
-    decode_nanoseconds_.store(0, std::memory_order_relaxed);
+    for (const auto& metrics : worker_metrics_) {
+        metrics->decode_count.store(0, std::memory_order_relaxed);
+        metrics->decode_nanoseconds.store(0, std::memory_order_relaxed);
+    }
 }
 
 std::uint64_t DecoderPool::DecodeCount() const noexcept {
-    return decode_count_.load(std::memory_order_relaxed);
+    std::uint64_t total = 0;
+    for (const auto& metrics : worker_metrics_) {
+        total += metrics->decode_count.load(std::memory_order_relaxed);
+    }
+    return total;
 }
 
 std::uint64_t DecoderPool::DecodeNanoseconds() const noexcept {
-    return decode_nanoseconds_.load(std::memory_order_relaxed);
+    std::uint64_t total = 0;
+    for (const auto& metrics : worker_metrics_) {
+        total += metrics->decode_nanoseconds.load(std::memory_order_relaxed);
+    }
+    return total;
 }
 
 std::size_t DecoderPool::SelectedCpuSetCount() const noexcept {
-    return selected_cpu_set_count_.load(std::memory_order_relaxed);
+    return static_cast<std::size_t>(std::count_if(
+        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
+            return metrics->selected_cpu_set.load(std::memory_order_relaxed);
+        }));
 }
 
 std::size_t DecoderPool::UnthrottledWorkerCount() const noexcept {
-    return unthrottled_worker_count_.load(std::memory_order_relaxed);
+    return static_cast<std::size_t>(std::count_if(
+        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
+            return metrics->unthrottled.load(std::memory_order_relaxed);
+        }));
 }
 
 std::size_t DecoderPool::ElevatedWorkerCount() const noexcept {
-    return elevated_worker_count_.load(std::memory_order_relaxed);
+    return static_cast<std::size_t>(std::count_if(
+        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
+            return metrics->elevated.load(std::memory_order_relaxed);
+        }));
 }
 
-void DecoderPool::WorkerMain(const std::stop_token stop) {
+void DecoderPool::WorkerMain(const std::stop_token stop, WorkerMetrics& metrics) {
     DecodeWork work;
     while (work_queue_.Pop(work, stop)) {
         const auto begin = std::chrono::steady_clock::now();
         DecodeResult result = Decode(std::move(work));
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin);
-        decode_nanoseconds_.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
-                                      std::memory_order_relaxed);
-        decode_count_.fetch_add(1, std::memory_order_relaxed);
+        metrics.decode_nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(elapsed.count()),
+            std::memory_order_relaxed);
+        metrics.decode_count.fetch_add(1, std::memory_order_relaxed);
         if (completion_queue_.Push(std::move(result))) {
             PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
         }

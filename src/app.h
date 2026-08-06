@@ -25,7 +25,8 @@ struct ImageRecord {
     bool failed = false;
     std::uint64_t generation = 0;
     std::unique_ptr<IoRequest> io;
-    std::shared_ptr<WorkToken> work_token;
+    std::unique_ptr<WorkToken> work_token = std::make_unique<WorkToken>();
+    bool work_active = false;
     ReservationId compressed_reservation = kInvalidReservation;
     ReservationId staging_reservation = kInvalidReservation;
     ReservationId source_reservation = kInvalidReservation;

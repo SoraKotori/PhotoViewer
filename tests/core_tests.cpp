@@ -240,20 +240,20 @@ void ReservationTests() {
           "safe retired reservation must be reassigned without a second pool");
 
     pv::WorkQueue queue;
-    auto token = std::make_shared<pv::WorkToken>();
-    pv::DecodeWork work{3, 7, token, 1, 2};
+    auto token = std::make_unique<pv::WorkToken>();
+    pv::DecodeWork work{3, 7, token.get(), 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
     pv::DecodeWork cancelled;
-    Check(queue.TryCancel(token, cancelled) && cancelled.index == 3,
+    Check(queue.TryCancel(token.get(), cancelled) && cancelled.index == 3,
           "unclaimed decode work must be synchronously cancellable");
     Check(queue.Size() == 0 &&
               token->claim.load(std::memory_order_acquire) == pv::WorkClaim::Cancelled,
           "cancelled work must leave the queue exactly once");
 
-    auto low_token = std::make_shared<pv::WorkToken>();
-    auto high_token = std::make_shared<pv::WorkToken>();
-    pv::DecodeWork low{9, 1, low_token, 0, 0};
-    pv::DecodeWork high{4, 1, high_token, 0, 0};
+    auto low_token = std::make_unique<pv::WorkToken>();
+    auto high_token = std::make_unique<pv::WorkToken>();
+    pv::DecodeWork low{9, 1, low_token.get(), 0, 0};
+    pv::DecodeWork high{4, 1, high_token.get(), 0, 0};
     Check(queue.TryPush(low) && queue.TryPush(high),
           "priority reorder test work must enter queue");
     queue.Reorder(std::array<std::size_t, 2>{4, 9});
@@ -262,11 +262,11 @@ void ReservationTests() {
           "queued decode work must follow the latest navigation priority");
 
     pv::WorkQueue naturally_bounded_queue;
-    std::vector<std::shared_ptr<pv::WorkToken>> natural_tokens;
+    std::vector<std::unique_ptr<pv::WorkToken>> natural_tokens;
     natural_tokens.reserve(32);
     for (std::size_t index = 0; index < 32; ++index) {
-        natural_tokens.push_back(std::make_shared<pv::WorkToken>());
-        pv::DecodeWork queued{index, 1, natural_tokens.back(), 0, 0};
+        natural_tokens.push_back(std::make_unique<pv::WorkToken>());
+        pv::DecodeWork queued{index, 1, natural_tokens.back().get(), 0, 0};
         Check(naturally_bounded_queue.TryPush(queued),
               "work queue must not impose an independent item-count limit");
     }

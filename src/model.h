@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include <array>
+
 namespace pv {
 
 using SlotId = std::uint32_t;
@@ -102,14 +104,16 @@ struct DecodeStaging {
     DecodeSurface surface;
 };
 
-struct WorkToken {
+struct alignas(64) WorkToken {
     std::atomic<WorkClaim> claim{WorkClaim::Queued};
+    std::array<std::byte, 64 - sizeof(claim)> cache_line_padding{};
 };
+static_assert(sizeof(WorkToken) == 64);
 
 struct DecodeWork {
     std::size_t index = 0;
     std::uint64_t generation = 0;
-    std::shared_ptr<WorkToken> token;
+    WorkToken* token = nullptr;
     SlotId compressed_slot = kInvalidSlot;
     SlotId staging_slot = kInvalidSlot;
 };
