@@ -567,27 +567,22 @@ void AddPaethRows8(std::uint8_t* const destination,
         const __m256i up_above = _mm256_cmpeq_epi8(
             _mm256_max_epu8(up, upper_left), up);
         const __m256i same_side = _mm256_cmpeq_epi8(left_above, up_above);
-        const __m256i same_side_distance = _mm256_adds_epu8(
-            distance_left, distance_up);
+        const __m256i zero = _mm256_setzero_si256();
         const __m256i opposite_side_distance = absolute_difference(
             distance_left, distance_up);
-        const __m256i distance_upper_left = _mm256_blendv_epi8(
-            opposite_side_distance, same_side_distance, same_side);
-        const __m256i zero = _mm256_setzero_si256();
-        const __m256i all = _mm256_cmpeq_epi8(zero, zero);
-        const __m256i choose_up = _mm256_xor_si256(
-            _mm256_cmpeq_epi8(
-                _mm256_subs_epu8(distance_left, distance_up), zero), all);
+        const __m256i nearest_left_or_up = _mm256_min_epu8(
+            distance_left, distance_up);
+        const __m256i choose_up = _mm256_cmpeq_epi8(
+            nearest_left_or_up, distance_up);
         const __m256i left_or_up = _mm256_blendv_epi8(left, up, choose_up);
-        const __m256i choose_upper_left = _mm256_xor_si256(
+        const __m256i reject_upper_left = _mm256_or_si256(
+            same_side,
             _mm256_cmpeq_epi8(
                 _mm256_subs_epu8(
-                    _mm256_min_epu8(distance_left, distance_up),
-                    distance_upper_left),
-                zero),
-            all);
+                    nearest_left_or_up, opposite_side_distance),
+                zero));
         const __m256i prediction = _mm256_blendv_epi8(
-            left_or_up, upper_left, choose_upper_left);
+            upper_left, left_or_up, reject_upper_left);
         const __m256i decoded = _mm256_add_epi8(filtered, prediction);
         upper_left = up;
         left = decoded;
@@ -897,18 +892,17 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     thread_local std::unique_ptr<libdeflate_decompressor, DecompressorDeleter>
         decompressor(libdeflate_alloc_decompressor());
     if (!decompressor) return E_OUTOFMEMORY;
-    std::size_t actual = 0;
     const auto deflate_begin = timings ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     const libdeflate_result result = libdeflate_deflate_decompress(
         decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
-        filtered_bytes, &actual);
+        filtered_bytes, nullptr);
     if (timings) {
         timings->deflate_nanoseconds = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - deflate_begin).count());
     }
-    if (result != LIBDEFLATE_SUCCESS || actual != filtered_bytes) {
+    if (result != LIBDEFLATE_SUCCESS) {
         return WINCODEC_ERR_BADIMAGE;
     }
 
