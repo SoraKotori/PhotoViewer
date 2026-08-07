@@ -13,17 +13,51 @@ Graphics::~Graphics() {
 }
 
 void Graphics::Initialize(const HWND window) {
+    InitializeDevice(window);
+    InitializeSurface();
+}
+
+void Graphics::InitializeDevice(const HWND window) {
+    InitializeDirect3D(window);
+    InitializeDirect2D();
+}
+
+void Graphics::InitializeDirect3D(const HWND window) {
     window_ = window;
     RECT client{};
     if (!GetClientRect(window_, &client)) ThrowLastError("GetClientRect");
     surface_width_ = std::max<LONG>(1, client.right - client.left);
     surface_height_ = std::max<LONG>(1, client.bottom - client.top);
-    CreateDeviceResources();
+    CreateDirect3DResources();
+}
+
+void Graphics::InitializeDirect2D() {
+    if (!device_ || !dxgi_factory_ || d2d_context_) {
+        throw std::logic_error("invalid Direct2D initialization");
+    }
+    CreateDirect2DResources();
+}
+
+void Graphics::InitializeSurface() {
+    InitializeSwapChain();
+    InitializeBackBufferTarget();
+}
+
+void Graphics::InitializeSwapChain() {
+    if (!window_ || !device_ || !d2d_context_ || swap_chain_) {
+        throw std::logic_error("invalid swap-chain initialization");
+    }
     CreateSwapChain();
+}
+
+void Graphics::InitializeBackBufferTarget() {
+    if (!swap_chain_ || back_buffer_target_) {
+        throw std::logic_error("invalid back-buffer initialization");
+    }
     CreateBackBufferTarget();
 }
 
-void Graphics::CreateDeviceResources() {
+void Graphics::CreateDirect3DResources() {
     constexpr D3D_FEATURE_LEVEL requested[] = {
         D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1};
     ComPtr<ID3D11Device> base_device;
@@ -48,7 +82,11 @@ void Graphics::CreateDeviceResources() {
     ComPtr<IDXGIAdapter> adapter;
     CheckHr(dxgi_device->GetAdapter(&adapter), "IDXGIDevice::GetAdapter");
     CheckHr(adapter->GetParent(IID_PPV_ARGS(&dxgi_factory_)), "Get DXGI factory");
+}
 
+void Graphics::CreateDirect2DResources() {
+    ComPtr<IDXGIDevice> dxgi_device;
+    CheckHr(device_.As(&dxgi_device), "Query IDXGIDevice for Direct2D");
     D2D1_FACTORY_OPTIONS options{};
 #ifdef _DEBUG
     options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
@@ -122,11 +160,14 @@ void Graphics::Resize(const UINT width, const UINT height) {
     CreateBackBufferTarget();
 }
 
-void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
-                                const UINT height,
-                                const std::size_t decoded_bytes) {
-    if (staging.mapped || width == 0 || height == 0 || decoded_bytes == 0) {
-        throw std::invalid_argument("invalid decode staging map");
+void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
+                                    const UINT height) {
+    if (staging.mapped || width == 0 || height == 0) {
+        throw std::invalid_argument("invalid decode staging preparation");
+    }
+    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+        throw std::invalid_argument("PNG dimensions exceed D3D11 limits");
     }
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     const std::size_t extra_rows =
@@ -158,7 +199,16 @@ void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
         staging.texture_width = texture_width;
         staging.texture_height = texture_height;
     }
+}
 
+void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
+                                const UINT height,
+                                const std::size_t decoded_bytes) {
+    if (staging.mapped || decoded_bytes == 0) {
+        throw std::invalid_argument("invalid decode staging map");
+    }
+    PrepareDecodeStaging(staging, width, height);
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     D3D11_MAPPED_SUBRESOURCE mapped{};
     CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped),
             "Map decode staging texture");

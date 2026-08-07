@@ -218,22 +218,31 @@ void TestCancelledWorkReleasesInput() {
               staging_slot != pv::kInvalidSlot,
           "allocate cancellation test slots");
 
-    auto token = std::make_unique<pv::WorkToken>();
-    token->claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
+    pv::WorkToken token;
+    token.claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
     pv::WorkQueue work_queue;
     pv::CompletionQueue completion_queue;
+    HWND notification_window = CreateWindowExW(
+        0, L"STATIC", L"decoder-test-notification", 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+    Check(notification_window != nullptr,
+          "create decoder completion notification window");
     {
-        pv::DecoderPool pool(1, work_queue, completion_queue, slots, nullptr);
-        pv::DecodeWork work{0, 1, token.get(), compressed_slot, staging_slot};
+        pv::DecoderPool pool(1, work_queue, completion_queue, slots,
+                             notification_window);
+        pv::DecodeWork work{0, 1, &token, compressed_slot, staging_slot};
         Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
 
         pv::CompletionQueue::Batch batch;
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(5);
-        while (batch.results.empty() &&
-               std::chrono::steady_clock::now() < deadline) {
+        const DWORD wait = MsgWaitForMultipleObjectsEx(
+            0, nullptr, 5000, QS_POSTMESSAGE, MWMO_INPUTAVAILABLE);
+        Check(wait == WAIT_OBJECT_0,
+              "worker completion notification timed out");
+        MSG message{};
+        while (PeekMessageW(&message, notification_window,
+                            pv::kMessageWorkerComplete,
+                            pv::kMessageWorkerComplete, PM_REMOVE)) {
             batch = completion_queue.DrainAll();
-            if (batch.results.empty()) Sleep(1);
         }
         Check(batch.results.size() == 1 && batch.results.front().cancelled,
               "worker must report work cancelled before claim");
@@ -242,6 +251,7 @@ void TestCancelledWorkReleasesInput() {
                   batch.released_inputs.front().compressed_slot == compressed_slot,
               "cancelled work must release its compressed input exactly once");
     }
+    DestroyWindow(notification_window);
 
     slots.ReleaseCompressed(compressed_slot);
     slots.ReleaseStaging(staging_slot);

@@ -50,7 +50,10 @@ private:
     ResourceSlots& slots_;
     HWND event_window_ = nullptr;
     std::vector<std::jthread> workers_;
-    std::vector<std::unique_ptr<WorkerMetrics>> worker_metrics_;
+    std::unique_ptr<WorkerMetrics[]> worker_metrics_;
+    std::size_t worker_count_ = 0;
+    std::uint64_t decode_count_base_ = 0;
+    std::uint64_t decode_nanoseconds_base_ = 0;
 };
 
 }  // namespace pv

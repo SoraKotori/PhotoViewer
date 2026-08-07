@@ -167,12 +167,18 @@ void ResourceSlotTests() {
     Check(slots.Compressed(compressed0).state ==
               pv::CompressedSlotState::FileReadDestination,
           "compressed acquisition state must describe its pipeline phase");
+    pv::IoRequest* const io_address = &slots.Compressed(compressed0).io;
     slots.Compressed(compressed0).state =
         pv::CompressedSlotState::CompressedDataAvailable;
     slots.ReleaseCompressed(compressed0);
     Check(slots.FreeCompressedCount() == 1 &&
               slots.Compressed(compressed0).state == pv::CompressedSlotState::Free,
           "compressed release must restore state and free index together");
+    const pv::SlotId recycled_compressed = slots.AcquireCompressed(4096, 5, 8);
+    Check(recycled_compressed == compressed0 &&
+              &slots.Compressed(recycled_compressed).io == io_address,
+          "compressed slot must retain an inline stable I/O request");
+    slots.ReleaseCompressed(recycled_compressed);
 
     const pv::SlotId staging0 = slots.AcquireStaging(4096, 3, 7);
     const pv::SlotId staging1 = slots.AcquireStaging(4096, 4, 7);
@@ -181,14 +187,20 @@ void ResourceSlotTests() {
     Check(slots.AcquireStaging(1, 5, 7) == pv::kInvalidSlot,
           "staging slot count must be a hard limit");
     Check(slots.StagingAt(staging0).state ==
-              pv::StagingSlotState::DecodeOutputMapped,
-          "staging acquisition state must describe its pipeline phase");
+              pv::StagingSlotState::Prepared,
+          "staging acquisition must reserve an unmapped prepared slot");
+    pv::WorkToken* const token_address = &slots.WorkTokenAt(staging0);
     slots.StagingAt(staging0).state =
         pv::StagingSlotState::DecodedPixelsAvailable;
     slots.ReleaseStaging(staging0);
     Check(slots.FreeStagingCount() == 1 &&
               slots.StagingAt(staging0).state == pv::StagingSlotState::Free,
           "staging release must restore state and free index together");
+    const pv::SlotId recycled_staging = slots.AcquireStaging(4096, 5, 8);
+    Check(recycled_staging == staging0 &&
+              &slots.WorkTokenAt(recycled_staging) == token_address,
+          "staging slot must retain a stable preallocated work token");
+    slots.ReleaseStaging(recycled_staging);
 
     constexpr pv::SlotId gpu0 = 0;
     constexpr pv::SlotId gpu1 = 1;
@@ -240,20 +252,20 @@ void ReservationTests() {
           "safe retired reservation must be reassigned without a second pool");
 
     pv::WorkQueue queue;
-    auto token = std::make_unique<pv::WorkToken>();
-    pv::DecodeWork work{3, 7, token.get(), 1, 2};
+    pv::WorkToken token;
+    pv::DecodeWork work{3, 7, &token, 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
     pv::DecodeWork cancelled;
-    Check(queue.TryCancel(token.get(), cancelled) && cancelled.index == 3,
+    Check(queue.TryCancel(&token, cancelled) && cancelled.index == 3,
           "unclaimed decode work must be synchronously cancellable");
     Check(queue.Size() == 0 &&
-              token->claim.load(std::memory_order_acquire) == pv::WorkClaim::Cancelled,
+              token.claim.load(std::memory_order_acquire) == pv::WorkClaim::Cancelled,
           "cancelled work must leave the queue exactly once");
 
-    auto low_token = std::make_unique<pv::WorkToken>();
-    auto high_token = std::make_unique<pv::WorkToken>();
-    pv::DecodeWork low{9, 1, low_token.get(), 0, 0};
-    pv::DecodeWork high{4, 1, high_token.get(), 0, 0};
+    pv::WorkToken low_token;
+    pv::WorkToken high_token;
+    pv::DecodeWork low{9, 1, &low_token, 0, 0};
+    pv::DecodeWork high{4, 1, &high_token, 0, 0};
     Check(queue.TryPush(low) && queue.TryPush(high),
           "priority reorder test work must enter queue");
     queue.Reorder(std::array<std::size_t, 2>{4, 9});
@@ -262,11 +274,9 @@ void ReservationTests() {
           "queued decode work must follow the latest navigation priority");
 
     pv::WorkQueue naturally_bounded_queue;
-    std::vector<std::unique_ptr<pv::WorkToken>> natural_tokens;
-    natural_tokens.reserve(32);
+    std::array<pv::WorkToken, 32> natural_tokens;
     for (std::size_t index = 0; index < 32; ++index) {
-        natural_tokens.push_back(std::make_unique<pv::WorkToken>());
-        pv::DecodeWork queued{index, 1, natural_tokens.back().get(), 0, 0};
+        pv::DecodeWork queued{index, 1, &natural_tokens[index], 0, 0};
         Check(naturally_bounded_queue.TryPush(queued),
               "work queue must not impose an independent item-count limit");
     }
