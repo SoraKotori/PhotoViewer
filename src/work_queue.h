@@ -75,6 +75,11 @@ private:
 
 class CompletionQueue {
 public:
+    struct Batch {
+        std::vector<DecodeResult> results;
+        std::vector<ReleasedInput> released_inputs;
+    };
+
     [[nodiscard]] bool Push(DecodeResult result) {
         std::lock_guard lock(mutex_);
         queue_.push_back(std::move(result));
@@ -83,40 +88,27 @@ public:
         return true;
     }
 
-    std::vector<DecodeResult> Drain() {
+    Batch DrainAll() {
         std::lock_guard lock(mutex_);
-        std::vector<DecodeResult> results;
-        results.reserve(queue_.size());
+        Batch batch;
+        batch.results.reserve(queue_.size());
         while (!queue_.empty()) {
-            results.push_back(std::move(queue_.front()));
+            batch.results.push_back(std::move(queue_.front()));
             queue_.pop_front();
         }
-        return results;
+        batch.released_inputs.reserve(released_inputs_.size());
+        while (!released_inputs_.empty()) {
+            batch.released_inputs.push_back(std::move(released_inputs_.front()));
+            released_inputs_.pop_front();
+        }
+        notification_pending_ = false;
+        return batch;
     }
 
     [[nodiscard]] bool PushReleasedInput(ReleasedInput input) {
         std::lock_guard lock(mutex_);
         released_inputs_.push_back(std::move(input));
         if (notification_pending_) return false;
-        notification_pending_ = true;
-        return true;
-    }
-
-    std::vector<ReleasedInput> DrainReleasedInputs() {
-        std::lock_guard lock(mutex_);
-        std::vector<ReleasedInput> inputs;
-        inputs.reserve(released_inputs_.size());
-        while (!released_inputs_.empty()) {
-            inputs.push_back(std::move(released_inputs_.front()));
-            released_inputs_.pop_front();
-        }
-        return inputs;
-    }
-
-    [[nodiscard]] bool AcknowledgeNotification() {
-        std::lock_guard lock(mutex_);
-        notification_pending_ = false;
-        if (queue_.empty() && released_inputs_.empty()) return false;
         notification_pending_ = true;
         return true;
     }

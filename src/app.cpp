@@ -338,7 +338,8 @@ void App::CompleteIoRequest(IoRequest* const request) {
 }
 
 void App::OnWorkerComplete() {
-    for (ReleasedInput& input : completion_queue_.DrainReleasedInputs()) {
+    CompletionQueue::Batch batch = completion_queue_.DrainAll();
+    for (ReleasedInput& input : batch.released_inputs) {
         if (input.compressed_slot == kInvalidSlot) continue;
         CompressedSlot& slot = resources_.slots->Compressed(input.compressed_slot);
         if (resources_.compressed_bytes >= slot.resource.size) {
@@ -353,7 +354,7 @@ void App::OnWorkerComplete() {
         }
         resources_.slots->ReleaseCompressed(input.compressed_slot);
     }
-    for (DecodeResult& result : completion_queue_.Drain()) {
+    for (DecodeResult& result : batch.results) {
         if (result.staging_slot == kInvalidSlot) continue;
         StagingSlot& slot = resources_.slots->StagingAt(result.staging_slot);
         graphics_.UnmapDecodeStaging(slot.resource);
@@ -379,9 +380,6 @@ void App::OnWorkerComplete() {
                 image.failed = true;
             }
         }
-    }
-    if (completion_queue_.AcknowledgeNotification()) {
-        PostMessageW(window_, kMessageWorkerComplete, 0, 0);
     }
     PumpPipeline();
 }

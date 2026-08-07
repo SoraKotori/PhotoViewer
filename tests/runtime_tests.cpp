@@ -227,20 +227,19 @@ void TestCancelledWorkReleasesInput() {
         pv::DecodeWork work{0, 1, token.get(), compressed_slot, staging_slot};
         Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
 
-        std::vector<pv::DecodeResult> results;
+        pv::CompletionQueue::Batch batch;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(5);
-        while (results.empty() && std::chrono::steady_clock::now() < deadline) {
-            results = completion_queue.Drain();
-            if (results.empty()) Sleep(1);
+        while (batch.results.empty() &&
+               std::chrono::steady_clock::now() < deadline) {
+            batch = completion_queue.DrainAll();
+            if (batch.results.empty()) Sleep(1);
         }
-        Check(results.size() == 1 && results.front().cancelled,
+        Check(batch.results.size() == 1 && batch.results.front().cancelled,
               "worker must report work cancelled before claim");
 
-        std::vector<pv::ReleasedInput> released =
-            completion_queue.DrainReleasedInputs();
-        Check(released.size() == 1 &&
-                  released.front().compressed_slot == compressed_slot,
+        Check(batch.released_inputs.size() == 1 &&
+                  batch.released_inputs.front().compressed_slot == compressed_slot,
               "cancelled work must release its compressed input exactly once");
     }
 

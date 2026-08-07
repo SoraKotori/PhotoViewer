@@ -274,6 +274,23 @@ void ReservationTests() {
           "work queue size must be bounded only by dispatched slot-backed work");
 }
 
+void CompletionQueueTests() {
+    pv::CompletionQueue queue;
+    Check(queue.PushReleasedInput(pv::ReleasedInput{3, 7, 1}),
+          "first completion event must request notification");
+    Check(!queue.Push(pv::DecodeResult{3, 7, true, false, S_OK, 2}),
+          "pending completion events must coalesce notification");
+
+    pv::CompletionQueue::Batch batch = queue.DrainAll();
+    Check(batch.released_inputs.size() == 1 && batch.results.size() == 1,
+          "one critical section must drain both completion event classes");
+    Check(queue.Push(pv::DecodeResult{4, 7, true, false, S_OK, 3}),
+          "atomic drain and acknowledgement must re-arm notification");
+    batch = queue.DrainAll();
+    Check(batch.results.size() == 1 && batch.results.front().index == 4,
+          "completion queue must remain reusable after a batch drain");
+}
+
 }  // namespace
 
 int main() {
@@ -282,6 +299,7 @@ int main() {
     PngTests();
     ResourceSlotTests();
     ReservationTests();
+    CompletionQueueTests();
     std::cout << "PASS: core tests physical_core_count=" << physical_core_count
               << " default_worker_count=" << pv::DefaultWorkerCount() << '\n';
     return 0;
