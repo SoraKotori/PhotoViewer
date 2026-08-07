@@ -19,6 +19,12 @@
 #  define deflate_decompress_bmi2	deflate_decompress_bmi2
 #  define FUNCNAME			deflate_decompress_bmi2
 #  define ATTRIBUTES			_target_attribute("bmi2")
+#  if defined(_MSC_VER) && defined(ARCH_X86_64)
+#    define SHIFT_BITBUF(word, count) \
+	((word) = _shrx_u64((word), (u8)(count)))
+#    define SHIFT_VARBITS(word, count) \
+	_shrx_u64((word), (u8)(count))
+#  endif
    /*
     * Even with __attribute__((target("bmi2"))), gcc doesn't reliably use the
     * bzhi instruction for 'word & BITMASK(count)'.  So use the bzhi intrinsic

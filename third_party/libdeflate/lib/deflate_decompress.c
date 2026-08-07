@@ -278,7 +278,7 @@ do {									\
  * be included for the intentional overrun in the match copy implementation.
  */
 #define FASTLOOP_MAX_BYTES_WRITTEN	\
-	(2 + DEFLATE_MAX_MATCH_LEN + (5 * WORDBYTES) - 1)
+	(2 + DEFLATE_MAX_MATCH_LEN + (2 * WORDBYTES) - 1)
 
 /*
  * This is the worst-case maximum number of input bytes that are read during
@@ -647,7 +647,8 @@ struct libdeflate_decompressor {
 	 * Furthermore, 'lens' need not be retained after building the litlen
 	 * and offset decode tables.  In fact, 'lens' can be in union with
 	 * 'litlen_decode_table' provided that 'offset_decode_table' is separate
-	 * and is built first.
+	 * and is built first.  Offset lengths needed for reuse are copied out
+	 * before the litlen table overwrites the scratch storage.
 	 */
 
 	union {
@@ -665,11 +666,14 @@ struct libdeflate_decompressor {
 	} u;
 
 	u32 offset_decode_table[OFFSET_ENOUGH];
+	u8 previous_offset_lens[DEFLATE_NUM_OFFSET_SYMS];
+	unsigned previous_num_offset_syms;
 
 	/* used only during build_decode_table() */
 	u16 sorted_syms[DEFLATE_MAX_NUM_SYMS];
 
 	bool static_codes_loaded;
+	bool dynamic_offset_codes_loaded;
 	unsigned litlen_tablebits;
 
 	/* The free() function for this struct, chosen at allocation time */
