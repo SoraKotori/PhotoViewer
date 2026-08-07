@@ -32,11 +32,55 @@ bool NavigationInputPending(const HWND window) noexcept {
                         kMessageValidationStep, PM_NOREMOVE);
 }
 
+DWORD QueryIoPrefixGranularity(const HANDLE file) noexcept {
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    DWORD granularity = std::max<DWORD>(4096, system.dwPageSize);
+    FILE_STORAGE_INFO storage{};
+    if (GetFileInformationByHandleEx(file, FileStorageInfo, &storage,
+                                     sizeof(storage))) {
+        granularity = std::max({granularity,
+                                storage.LogicalBytesPerSector,
+                                storage.PhysicalBytesPerSectorForAtomicity,
+                                storage.PhysicalBytesPerSectorForPerformance,
+                                storage.FileSystemEffectivePhysicalBytesPerSectorForAtomicity});
+    }
+    return granularity;
+}
+
+std::optional<std::size_t> DecodeStagingBytes(const PngInfo& png) noexcept {
+    const std::size_t row_bytes = static_cast<std::size_t>(png.width) * 4;
+    if (png.decoded_bytes > std::numeric_limits<std::size_t>::max() - png.height) {
+        return std::nullopt;
+    }
+    const std::size_t filtered_bytes = png.decoded_bytes + png.height;
+    if (filtered_bytes > std::numeric_limits<std::size_t>::max() - row_bytes) {
+        return std::nullopt;
+    }
+    return filtered_bytes + row_bytes;
+}
+
+LPARAM PackIoCompletion(const ULONG result,
+                        const ULONG_PTR transferred) noexcept {
+    const std::uint64_t packed =
+        (static_cast<std::uint64_t>(result) << 32) |
+        static_cast<std::uint32_t>(transferred);
+    return static_cast<LPARAM>(packed);
+}
+
+DWORD IoCompletionResult(const LPARAM completion) noexcept {
+    return static_cast<DWORD>(static_cast<std::uint64_t>(completion) >> 32);
+}
+
+DWORD IoCompletionTransferred(const LPARAM completion) noexcept {
+    return static_cast<DWORD>(static_cast<std::uint64_t>(completion));
+}
+
 }  // namespace
 
 App::App(Config config)
     : config_(std::move(config)) {
-    resources_.slots = std::make_unique<ResourceSlots>(
+    resources_.slots.emplace(
         config_.compressed_slot_count, config_.staging_slot_count,
         config_.gpu_texture_slot_count, config_.compressed_budget_bytes,
         config_.staging_cache_bytes);
@@ -44,8 +88,9 @@ App::App(Config config)
 
 App::~App() {
     StopValidationNavigationTimer();
+    catalog_io_.reset();
     decoders_.reset();
-    if (graphics_ready_ && resources_.slots) {
+    if (graphics_device_ready_ && resources_.slots) {
         for (SlotId id = 0; id < resources_.slots->StagingCount(); ++id) {
             DecodeStaging& staging = resources_.slots->StagingAt(id).resource;
             if (staging.mapped) graphics_.UnmapDecodeStaging(staging);
@@ -62,12 +107,32 @@ int App::Run(const HINSTANCE instance, const int show_command) {
         ThrowLastError("Set main thread priority");
     }
     InitializeWindow(instance, show_command);
-    decoders_ = std::make_unique<DecoderPool>(config_.worker_count, work_queue_,
-                                              completion_queue_, *resources_.slots,
-                                              window_);
+    validation_window_ready_ = std::chrono::steady_clock::now();
     if (!config_.initial_image.empty()) OpenInitialImage();
-    graphics_.Initialize(window_);
+    validation_initial_io_submitted_ = std::chrono::steady_clock::now();
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    decoders_.emplace(config_.worker_count, work_queue_, completion_queue_,
+                      *resources_.slots, window_);
+    validation_decoders_ready_ = std::chrono::steady_clock::now();
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    graphics_.InitializeDirect3D(window_);
+    graphics_device_ready_ = true;
+    validation_graphics_device_ready_ = std::chrono::steady_clock::now();
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    graphics_.InitializeDirect2D();
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    graphics_.InitializeSwapChain();
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    graphics_.InitializeBackBufferTarget();
     graphics_ready_ = true;
+    ProcessStartupCatalogCompletion();
+    ProcessStartupIoCompletion();
+    validation_graphics_ready_ = std::chrono::steady_clock::now();
     ShowWindow(window_, config_.validation_exit_after_present ? SW_HIDE : show_command);
     if (!config_.validation_exit_after_present) UpdateWindow(window_);
     if (config_.validation_exit_after_present) {
@@ -93,6 +158,29 @@ void App::InitializeWindow(const HINSTANCE instance, const int show_command) {
                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                               nullptr, nullptr, instance, this);
     if (!window_) ThrowLastError("CreateWindowExW");
+}
+
+void App::ProcessStartupIoCompletion() {
+    MSG pending{};
+    if (PeekMessageW(&pending, window_, kMessageIoHeaderReady,
+                     kMessageIoHeaderReady, PM_REMOVE)) {
+        OnIoHeaderReady(reinterpret_cast<IoRequest*>(pending.wParam),
+                        pending.lParam);
+    }
+    if (!PeekMessageW(&pending, window_, kMessageIoComplete,
+                      kMessageIoComplete, PM_REMOVE)) {
+        return;
+    }
+    OnIoComplete(reinterpret_cast<IoRequest*>(pending.wParam), pending.lParam);
+}
+
+void App::ProcessStartupCatalogCompletion() {
+    MSG pending{};
+    if (!PeekMessageW(&pending, window_, kMessageCatalogComplete,
+                      kMessageCatalogComplete, PM_REMOVE)) {
+        return;
+    }
+    OnCatalogComplete();
 }
 
 LRESULT CALLBACK App::WindowProcedure(const HWND window, const UINT message,
@@ -131,7 +219,13 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
             else if (wparam == VK_RIGHT) OnDirectionReleased(1);
             return 0;
         case kMessageIoComplete:
-            OnIoComplete(reinterpret_cast<IoRequest*>(wparam));
+            OnIoComplete(reinterpret_cast<IoRequest*>(wparam), lparam);
+            return 0;
+        case kMessageIoHeaderReady:
+            OnIoHeaderReady(reinterpret_cast<IoRequest*>(wparam), lparam);
+            return 0;
+        case kMessageCatalogComplete:
+            OnCatalogComplete();
             return 0;
         case kMessageWorkerComplete:
             OnWorkerComplete();
@@ -221,8 +315,9 @@ int App::EventLoop() {
 }
 
 void App::OpenInitialImage() {
-    resources_.catalog = config_.validation_file_list.empty()
-                             ? BuildCatalog(config_.initial_image)
+    const bool asynchronous_catalog = config_.validation_file_list.empty();
+    resources_.catalog = asynchronous_catalog
+                             ? BuildInitialCatalog(config_.initial_image)
                              : BuildCatalogFromList(config_.validation_file_list,
                                                     config_.initial_image);
     resources_.generation++;
@@ -231,13 +326,18 @@ void App::OpenInitialImage() {
     for (std::size_t index = 0; index < resources_.images.size(); ++index) {
         auto& image = resources_.images[index];
         image.generation = resources_.generation;
-        image.failed = resources_.catalog.items[index].file_bytes == 0;
+        const CatalogItem& item = resources_.catalog.items[index];
+        image.failed = item.file_size_known && item.file_bytes == 0;
     }
     resources_.navigation.Reset(resources_.catalog.initial_index,
                                 resources_.catalog.items.size());
     InitializeReservations();
     resources_.redraw_pending = true;
     PumpPipeline();
+    if (asynchronous_catalog) {
+        catalog_loading_ = true;
+        catalog_io_.emplace(config_.initial_image, window_);
+    }
 }
 
 void App::OnDirection(const int direction, const bool repeat,
@@ -258,14 +358,62 @@ void App::OnDirectionReleased(const int direction) {
     PumpPipeline();
 }
 
-void CALLBACK App::IoCompletion(PTP_CALLBACK_INSTANCE, void* context, void*,
-                                const ULONG io_result, const ULONG_PTR transferred,
+void App::OnCatalogComplete() {
+    if (!catalog_loading_ || !catalog_io_ || !catalog_io_->Advance()) return;
+    Catalog catalog = catalog_io_->TakeCatalog();
+    catalog_io_.reset();
+    catalog_loading_ = false;
+    if (catalog.items.empty()) {
+        throw std::runtime_error("asynchronous catalog returned no images");
+    }
+
+    const std::size_t initial = catalog.initial_index;
+    catalog.items[initial] = std::move(resources_.catalog.items[0]);
+    ImageRecord initial_image = std::move(resources_.images[0]);
+    initial_image.compressed_reservation = kInvalidReservation;
+    initial_image.staging_reservation = kInvalidReservation;
+    initial_image.source_reservation = kInvalidReservation;
+
+    std::vector<ImageRecord> images(catalog.items.size());
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        images[index].generation = resources_.generation;
+        images[index].failed = catalog.items[index].file_size_known &&
+                               catalog.items[index].file_bytes == 0;
+    }
+    images[initial] = std::move(initial_image);
+    if (images[initial].io) images[initial].io->index = initial;
+    if (images[initial].compressed_slot != kInvalidSlot) {
+        resources_.slots->Compressed(images[initial].compressed_slot).image = initial;
+    }
+    if (images[initial].staging_slot != kInvalidSlot) {
+        resources_.slots->StagingAt(images[initial].staging_slot).image = initial;
+    }
+
+    resources_.catalog = std::move(catalog);
+    resources_.images = std::move(images);
+    resources_.navigation.Reset(initial, resources_.images.size());
+    InitializeReservations();
+    resources_.redraw_pending = true;
+
+    for (IoRequest* const io : deferred_catalog_io_) CompleteIoRequest(io);
+    deferred_catalog_io_.clear();
+    PumpPipeline();
+}
+
+void CALLBACK App::IoCompletion(PTP_CALLBACK_INSTANCE, void* context,
+                                void* overlapped,
+                                const ULONG io_result,
+                                const ULONG_PTR transferred,
                                 PTP_IO) {
     auto* request = static_cast<IoRequest*>(context);
-    request->transferred.store(transferred, std::memory_order_relaxed);
-    request->result.store(io_result, std::memory_order_release);
+    const LPARAM completion = PackIoCompletion(io_result, transferred);
+    if (overlapped == &request->header_overlapped) {
+        PostMessageW(request->window, kMessageIoHeaderReady,
+                     reinterpret_cast<WPARAM>(request), completion);
+        return;
+    }
     PostMessageW(request->window, kMessageIoComplete,
-                 reinterpret_cast<WPARAM>(request), 0);
+                 reinterpret_cast<WPARAM>(request), completion);
 }
 
 void CALLBACK App::ValidationTimerCallback(PTP_CALLBACK_INSTANCE, void* context,
@@ -274,9 +422,65 @@ void CALLBACK App::ValidationTimerCallback(PTP_CALLBACK_INSTANCE, void* context,
     PostMessageW(app->window_, kMessageValidationStep, 0, 0);
 }
 
-void App::OnIoComplete(IoRequest* request) {
+void App::OnIoHeaderReady(IoRequest* request,
+                          const LPARAM completion) {
+    if (!request || request->index >= resources_.images.size()) return;
+    ImageRecord& image = resources_.images[request->index];
+    if (!image.io || image.io != request ||
+        request->generation != image.generation || request->header_completed) {
+        return;
+    }
+    const DWORD transferred = IoCompletionTransferred(completion);
+    request->header_result = IoCompletionResult(completion);
+    request->header_transferred = transferred;
+    request->header_completed = true;
+    if (request->header_result == ERROR_SUCCESS && transferred >= 24) {
+        const auto header = ParsePngHeader(std::span<const std::byte>(
+            request->destination, 24));
+        if (header) {
+            CatalogItem& item = resources_.catalog.items[request->index];
+            item.png = *header;
+            item.header_valid = true;
+            PrepareStagingForImage(request->index);
+        }
+    }
+    if (!request->content_submitted || request->content_completed) {
+        if (!request->content_submitted) {
+            request->result = ERROR_SUCCESS;
+            request->transferred = 0;
+        }
+        if (catalog_loading_) {
+            if (std::ranges::find(deferred_catalog_io_, request) ==
+                deferred_catalog_io_.end()) {
+                deferred_catalog_io_.push_back(request);
+            }
+        } else {
+            CompleteIoRequest(request);
+            PumpPipeline();
+        }
+    }
+}
+
+void App::OnIoComplete(IoRequest* request, LPARAM completion) {
     for (;;) {
-        CompleteIoRequest(request);
+        if (request && request->index < resources_.images.size()) {
+            ImageRecord& image = resources_.images[request->index];
+            if (image.io == request && !request->content_completed) {
+                request->result = IoCompletionResult(completion);
+                request->transferred = IoCompletionTransferred(completion);
+                request->content_completed = true;
+                if (!request->split_header || request->header_completed) {
+                    if (catalog_loading_) {
+                        if (std::ranges::find(deferred_catalog_io_, request) ==
+                            deferred_catalog_io_.end()) {
+                            deferred_catalog_io_.push_back(request);
+                        }
+                    } else {
+                        CompleteIoRequest(request);
+                    }
+                }
+            }
+        }
         MSG pending{};
         if (!PeekMessageW(&pending, nullptr, 0, 0, PM_NOREMOVE) ||
             pending.hwnd != window_ || pending.message != kMessageIoComplete) {
@@ -284,29 +488,40 @@ void App::OnIoComplete(IoRequest* request) {
         }
         PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE);
         request = reinterpret_cast<IoRequest*>(pending.wParam);
+        completion = pending.lParam;
     }
-    PumpPipeline();
+    if (!catalog_loading_) PumpPipeline();
 }
 
 void App::CompleteIoRequest(IoRequest* const request) {
     if (!request || request->index >= resources_.images.size()) return;
     ImageRecord& image = resources_.images[request->index];
-    if (!image.io || image.io.get() != request) return;
+    if (!image.io || image.io != request) return;
 
+    // The file operation has already completed and Main Thread owns all result
+    // state.  Join only the callback's PostMessage epilogue before destroying
+    // its registration; this never waits for storage I/O.
     WaitForThreadpoolIoCallbacks(request->threadpool_io, FALSE);
     CloseThreadpoolIo(request->threadpool_io);
     request->threadpool_io = nullptr;
     CloseHandle(request->file);
     request->file = INVALID_HANDLE_VALUE;
 
-    const DWORD io_result = request->result.load(std::memory_order_acquire);
-    const std::size_t transferred = request->transferred.load(std::memory_order_relaxed);
+    const DWORD io_result = request->result;
+    const std::size_t transferred = request->transferred;
     const SlotId compressed_slot = request->compressed_slot;
     CompressedSlot& slot = resources_.slots->Compressed(compressed_slot);
     const std::size_t allocation = slot.resource.size;
-    const bool success = io_result == ERROR_SUCCESS && transferred == allocation;
+    const bool header_success = !request->split_header ||
+        (request->header_result == ERROR_SUCCESS &&
+         request->header_transferred == request->prefix_bytes);
+    const std::size_t expected_content = request->split_header
+                                             ? allocation - request->prefix_bytes
+                                             : allocation;
+    const bool success = header_success && io_result == ERROR_SUCCESS &&
+                         transferred == expected_content;
     const bool current = request->generation == image.generation;
-    auto completed = std::move(image.io);
+    image.io = nullptr;
 
     const bool reserved = current && ReservationActive(
         resources_.compressed_reservations, image.compressed_reservation,
@@ -660,6 +875,14 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     std::ofstream output(config_.validation_report,
                          std::ios::out | (truncate ? std::ios::trunc : std::ios::app));
     if (!output) return;
+    const auto startup_nanoseconds = [&](const auto time) {
+        if (validation_cold_started_ == std::chrono::steady_clock::time_point{} ||
+            time == std::chrono::steady_clock::time_point{}) {
+            return std::int64_t{0};
+        }
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   time - validation_cold_started_).count();
+    };
     constexpr std::array names{"Outside", "WaitingIo", "IoInFlight", "CompressedReady",
                                "DecodeQueued", "DecodedStagingAvailable", "Uploading",
                                "PresentationTextureAvailable",
@@ -669,7 +892,18 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
         const std::size_t stage = static_cast<std::size_t>(StageOf(image));
         if (stage < counts.size()) ++counts[stage];
     }
-    output << "phase=" << phase << '\n';
+    output << "phase=" << phase << '\n'
+           << "startup_window_ready_nanoseconds="
+           << startup_nanoseconds(validation_window_ready_) << '\n'
+           << "startup_initial_io_submitted_nanoseconds="
+           << startup_nanoseconds(validation_initial_io_submitted_) << '\n'
+           << "startup_decoders_ready_nanoseconds="
+           << startup_nanoseconds(validation_decoders_ready_) << '\n'
+           << "startup_graphics_device_ready_nanoseconds="
+           << startup_nanoseconds(validation_graphics_device_ready_) << '\n'
+           << "startup_graphics_ready_nanoseconds="
+           << startup_nanoseconds(validation_graphics_ready_) << '\n'
+           << "io_prefix_granularity=" << io_prefix_granularity_ << '\n';
     for (std::size_t index = 0; index < names.size(); ++index) {
         output << names[index] << '=' << counts[index] << '\n';
     }
@@ -802,8 +1036,8 @@ void App::PumpPipeline() {
     if (resources_.images.empty()) return;
     for (int pass = 0; pass < 3; ++pass) {
         ReconcileReservations();
-        SubmitReads();
         DispatchDecodes();
+        SubmitReads();
         SubmitUploads();
         if (!TryPresent()) break;
     }
@@ -832,6 +1066,8 @@ PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
     }
     if (image.staging_slot != kInvalidSlot) {
         switch (resources_.slots->StagingAt(image.staging_slot).state) {
+            case StagingSlotState::Prepared:
+                break;
             case StagingSlotState::DecodeOutputMapped:
                 return PipelineStage::DecodeQueued;
             case StagingSlotState::DecodedPixelsAvailable:
@@ -925,9 +1161,10 @@ bool App::HasReadableSource(const std::size_t frame) const noexcept {
 bool App::CancelQueuedDecode(const std::size_t frame) {
     if (frame >= resources_.images.size()) return false;
     ImageRecord& image = resources_.images[frame];
+    if (!image.work_active || image.staging_slot == kInvalidSlot) return false;
+    WorkToken& work_token = resources_.slots->WorkTokenAt(image.staging_slot);
     DecodeWork cancelled;
-    if (!image.work_active ||
-        !work_queue_.TryCancel(image.work_token.get(), cancelled)) {
+    if (!work_queue_.TryCancel(&work_token, cancelled)) {
         return false;
     }
 
@@ -1053,13 +1290,16 @@ void App::ReconcileReservations() {
             ImageRecord& image = resources_.images[frame];
             if (image.staging_slot == kInvalidSlot) return true;
             StagingSlot& slot = resources_.slots->StagingAt(image.staging_slot);
-            if (slot.state == StagingSlotState::DecodedPixelsAvailable) return true;
+            if (slot.state == StagingSlotState::Prepared ||
+                slot.state == StagingSlotState::DecodedPixelsAvailable) {
+                return true;
+            }
             if (slot.state == StagingSlotState::DecodeOutputMapped ||
                 slot.state == StagingSlotState::CancellationPending) {
                 if (CancelQueuedDecode(frame)) return true;
                 if (image.work_active) {
-                    image.work_token->claim.store(WorkClaim::Cancelled,
-                                                  std::memory_order_release);
+                    resources_.slots->WorkTokenAt(image.staging_slot).claim.store(
+                        WorkClaim::Cancelled, std::memory_order_release);
                 }
                 slot.state = StagingSlotState::CancellationPending;
             }
@@ -1069,7 +1309,8 @@ void App::ReconcileReservations() {
             ImageRecord& image = resources_.images[frame];
             if (image.staging_slot != kInvalidSlot) {
                 StagingSlot& slot = resources_.slots->StagingAt(image.staging_slot);
-                if (slot.state == StagingSlotState::DecodedPixelsAvailable) {
+                if (slot.state == StagingSlotState::Prepared ||
+                    slot.state == StagingSlotState::DecodedPixelsAvailable) {
                     resources_.slots->ReleaseStaging(image.staging_slot);
                     image.staging_slot = kInvalidSlot;
                 }
@@ -1103,7 +1344,7 @@ void App::ReconcileReservations() {
         [&](const ReservationId, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
             if (image.io) {
-                CancelIoEx(image.io->file, &image.io->overlapped);
+                CancelIoEx(image.io->file, nullptr);
                 resources_.slots->Compressed(image.compressed_slot).state =
                     CompressedSlotState::CancellationPending;
                 return false;
@@ -1122,7 +1363,8 @@ void App::ReconcileReservations() {
         [&](const ReservationId id, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
             image.compressed_reservation = id;
-            image.failed = resources_.catalog.items[frame].file_bytes == 0;
+            const CatalogItem& item = resources_.catalog.items[frame];
+            image.failed = item.file_size_known && item.file_bytes == 0;
         },
         ReservationTable::FirstFree);
     work_queue_.Reorder(resources_.priority_order);
@@ -1140,70 +1382,173 @@ std::vector<std::size_t> App::PrioritizedCandidates(
     return candidates;
 }
 
+void App::PrepareStagingForImage(const std::size_t index) {
+    if (!graphics_device_ready_ || index >= resources_.images.size()) return;
+    ImageRecord& image = resources_.images[index];
+    if (image.failed || image.staging_slot != kInvalidSlot ||
+        !ReservationActive(resources_.staging_reservations,
+                           image.staging_reservation, index)) {
+        return;
+    }
+    const CatalogItem& item = resources_.catalog.items[index];
+    if (!item.header_valid) return;
+    const std::optional<std::size_t> staging_bytes =
+        DecodeStagingBytes(item.png);
+    if (!staging_bytes || *staging_bytes == 0 ||
+        *staging_bytes > config_.staging_cache_bytes) {
+        return;
+    }
+    const SlotId staging_slot = resources_.slots->AcquireStaging(
+        *staging_bytes, index, image.generation);
+    if (staging_slot == kInvalidSlot) return;
+    try {
+        graphics_.PrepareDecodeStaging(
+            resources_.slots->StagingAt(staging_slot).resource,
+            item.png.width, item.png.height);
+    } catch (...) {
+        resources_.slots->ReleaseStaging(staging_slot);
+        throw;
+    }
+    image.staging_slot = staging_slot;
+}
+
 void App::SubmitReads() {
     for (const std::size_t index : PrioritizedCandidates(PipelineStage::WaitingIo)) {
         ImageRecord& image = resources_.images[index];
-        const CatalogItem& item = resources_.catalog.items[index];
-        if (item.file_bytes == 0 ||
+        CatalogItem& item = resources_.catalog.items[index];
+        HANDLE opened_file = INVALID_HANDLE_VALUE;
+        if (!item.file_size_known) {
+            opened_file = CreateFileW(
+                item.path.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                    FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr);
+            LARGE_INTEGER file_size{};
+            if (opened_file == INVALID_HANDLE_VALUE ||
+                !GetFileSizeEx(opened_file, &file_size) ||
+                file_size.QuadPart <= 0 ||
+                static_cast<unsigned long long>(file_size.QuadPart) >
+                    std::numeric_limits<DWORD>::max()) {
+                if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+                image.failed = true;
+                continue;
+            }
+            item.file_bytes = static_cast<std::uint64_t>(file_size.QuadPart);
+            item.file_size_known = true;
+        }
+        if (item.file_bytes <= 24 ||
             item.file_bytes > std::numeric_limits<DWORD>::max()) {
+            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
             image.failed = true;
             continue;
         }
         const std::size_t compressed = static_cast<std::size_t>(item.file_bytes);
         if (compressed > config_.compressed_budget_bytes) {
+            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
             image.failed = true;
             continue;
         }
         if (resources_.compressed_bytes >
                 config_.compressed_budget_bytes - compressed) {
+            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
             continue;
         }
-        auto request = std::make_unique<IoRequest>();
-        request->window = window_;
-        request->index = index;
-        request->generation = image.generation;
-        request->compressed_slot = resources_.slots->AcquireCompressed(
+        const SlotId compressed_slot = resources_.slots->AcquireCompressed(
             compressed, index, image.generation);
-        if (request->compressed_slot == kInvalidSlot) {
+        if (compressed_slot == kInvalidSlot) {
+            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
             continue;
         }
-        image.compressed_slot = request->compressed_slot;
-        request->file = CreateFileW(item.path.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                    nullptr, OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
-                                        FILE_FLAG_SEQUENTIAL_SCAN,
-                                    nullptr);
-        if (request->file == INVALID_HANDLE_VALUE) {
-            resources_.slots->ReleaseCompressed(request->compressed_slot);
+        image.compressed_slot = compressed_slot;
+        CompressedSlot& compressed_state =
+            resources_.slots->Compressed(compressed_slot);
+        IoRequest& request = compressed_state.io;
+        request.Reset();
+        request.window = window_;
+        request.index = index;
+        request.generation = image.generation;
+        request.compressed_slot = compressed_slot;
+        request.file = opened_file != INVALID_HANDLE_VALUE
+                           ? opened_file
+                           : CreateFileW(
+                                 item.path.c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                     FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                                     FILE_FLAG_SEQUENTIAL_SCAN,
+                                 nullptr);
+        if (request.file == INVALID_HANDLE_VALUE) {
+            resources_.slots->ReleaseCompressed(compressed_slot);
             image.compressed_slot = kInvalidSlot;
             image.failed = true;
             continue;
         }
-        request->threadpool_io = CreateThreadpoolIo(request->file, &App::IoCompletion,
-                                                    request.get(), nullptr);
-        if (!request->threadpool_io) {
-            CloseHandle(request->file);
-            resources_.slots->ReleaseCompressed(request->compressed_slot);
+        request.threadpool_io = CreateThreadpoolIo(
+            request.file, &App::IoCompletion, &request, nullptr);
+        if (!request.threadpool_io) {
+            CloseHandle(request.file);
+            request.file = INVALID_HANDLE_VALUE;
+            resources_.slots->ReleaseCompressed(compressed_slot);
             image.compressed_slot = kInvalidSlot;
             image.failed = true;
             continue;
         }
 
         resources_.compressed_bytes += compressed;
-        image.io = std::move(request);
-        CompressedBuffer& buffer = resources_.slots->Compressed(
-            image.io->compressed_slot).resource;
-        StartThreadpoolIo(image.io->threadpool_io);
-        const BOOL submitted = ReadFile(image.io->file, buffer.data,
-                                        static_cast<DWORD>(buffer.size), nullptr,
-                                        &image.io->overlapped);
-        if (!submitted && GetLastError() != ERROR_IO_PENDING) {
+        image.io = &request;
+        CompressedBuffer& buffer = compressed_state.resource;
+        image.io->destination = buffer.data;
+        image.io->byte_count = static_cast<DWORD>(buffer.size);
+        image.io->split_header = !item.header_valid;
+        bool initial_submission_failed = false;
+        if (image.io->split_header) {
+            if (io_prefix_granularity_ == 0) {
+                io_prefix_granularity_ = QueryIoPrefixGranularity(image.io->file);
+            }
+            image.io->prefix_bytes = std::min(
+                image.io->byte_count, io_prefix_granularity_);
+            StartThreadpoolIo(image.io->threadpool_io);
+            const BOOL prefix_submitted = ReadFile(
+                image.io->file, buffer.data, image.io->prefix_bytes,
+                nullptr, &image.io->header_overlapped);
+            if (!prefix_submitted && GetLastError() != ERROR_IO_PENDING) {
+                initial_submission_failed = true;
+            } else if (image.io->prefix_bytes < image.io->byte_count) {
+                image.io->content_submitted = true;
+                image.io->content_overlapped.Offset = image.io->prefix_bytes;
+                StartThreadpoolIo(image.io->threadpool_io);
+                const BOOL content_submitted = ReadFile(
+                    image.io->file,
+                    buffer.data + image.io->prefix_bytes,
+                    image.io->byte_count - image.io->prefix_bytes,
+                    nullptr, &image.io->content_overlapped);
+                if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
+                    const DWORD error = GetLastError();
+                    CancelThreadpoolIo(image.io->threadpool_io);
+                    image.io->result = error;
+                    image.io->transferred = 0;
+                    image.io->content_completed = true;
+                }
+            }
+        } else {
+            image.io->content_submitted = true;
+            StartThreadpoolIo(image.io->threadpool_io);
+            const BOOL content_submitted = ReadFile(
+                image.io->file, buffer.data, image.io->byte_count,
+                nullptr, &image.io->content_overlapped);
+            if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
+                initial_submission_failed = true;
+            }
+        }
+        if (initial_submission_failed) {
             CancelThreadpoolIo(image.io->threadpool_io);
             CloseThreadpoolIo(image.io->threadpool_io);
             CloseHandle(image.io->file);
             resources_.slots->ReleaseCompressed(image.io->compressed_slot);
-            image.io.reset();
+            image.io = nullptr;
             image.compressed_slot = kInvalidSlot;
             resources_.compressed_bytes -= compressed;
             image.failed = true;
@@ -1225,34 +1570,41 @@ void App::DispatchDecodes() {
             continue;
         }
         const CatalogItem& item = resources_.catalog.items[index];
-        const std::size_t staging_bytes = item.png.decoded_bytes +
-            item.png.height + static_cast<std::size_t>(item.png.width) * 4;
-        if (staging_bytes == 0 || staging_bytes > config_.staging_cache_bytes) {
+        const std::optional<std::size_t> staging_bytes =
+            DecodeStagingBytes(item.png);
+        if (!staging_bytes || *staging_bytes == 0 ||
+            *staging_bytes > config_.staging_cache_bytes) {
             ReleaseCompressed(image);
             image.failed = true;
             continue;
         }
-        SlotId staging_slot = resources_.slots->AcquireStaging(
-            staging_bytes, index, image.generation);
+        PrepareStagingForImage(index);
+        const SlotId staging_slot = image.staging_slot;
         if (staging_slot == kInvalidSlot) continue;
-        DecodeStaging& staging = resources_.slots->StagingAt(staging_slot).resource;
-        graphics_.MapDecodeStaging(staging, item.png.width, item.png.height,
+        StagingSlot& staging_state = resources_.slots->StagingAt(staging_slot);
+        if (staging_state.state != StagingSlotState::Prepared ||
+            staging_state.image != index ||
+            staging_state.generation != image.generation) {
+            throw std::logic_error("invalid prepared staging slot");
+        }
+        graphics_.MapDecodeStaging(staging_state.resource,
+                                   item.png.width, item.png.height,
                                    item.png.decoded_bytes);
-        image.work_token->claim.store(WorkClaim::Queued,
-                                      std::memory_order_relaxed);
-        DecodeWork work{index, image.generation, image.work_token.get(),
+        staging_state.state = StagingSlotState::DecodeOutputMapped;
+        WorkToken& work_token = resources_.slots->WorkTokenAt(staging_slot);
+        work_token.claim.store(WorkClaim::Queued, std::memory_order_relaxed);
+        DecodeWork work{index, image.generation, &work_token,
                         image.compressed_slot,
                         staging_slot};
         resources_.slots->Compressed(image.compressed_slot).state =
             CompressedSlotState::DecodeInput;
         if (!work_queue_.TryPush(work)) {
-            graphics_.UnmapDecodeStaging(staging);
-            resources_.slots->ReleaseStaging(staging_slot);
+            graphics_.UnmapDecodeStaging(staging_state.resource);
+            staging_state.state = StagingSlotState::Prepared;
             resources_.slots->Compressed(image.compressed_slot).state =
                 CompressedSlotState::CompressedDataAvailable;
             break;
         }
-        image.staging_slot = staging_slot;
         image.work_active = true;
     }
 }
@@ -1400,7 +1752,7 @@ void App::ArmOldestFence() {
 
 void App::CancelAllIo() {
     for (ImageRecord& image : resources_.images) {
-        if (image.io) CancelIoEx(image.io->file, &image.io->overlapped);
+        if (image.io) CancelIoEx(image.io->file, nullptr);
     }
     for (ImageRecord& image : resources_.images) {
         if (!image.io) continue;
@@ -1414,7 +1766,7 @@ void App::CancelAllIo() {
             resources_.slots->ReleaseCompressed(image.io->compressed_slot);
             image.compressed_slot = kInvalidSlot;
         }
-        image.io.reset();
+        image.io = nullptr;
     }
 }
 

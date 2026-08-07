@@ -13,8 +13,13 @@ public:
     Graphics& operator=(const Graphics&) = delete;
 
     void Initialize(HWND window);
+    void InitializeDirect3D(HWND window);
+    void InitializeDirect2D();
+    void InitializeSwapChain();
+    void InitializeBackBufferTarget();
     void Resize(UINT width, UINT height);
 
+    void PrepareDecodeStaging(DecodeStaging& staging, UINT width, UINT height);
     void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
                           std::size_t decoded_bytes);
     void UnmapDecodeStaging(DecodeStaging& staging) noexcept;
@@ -35,7 +40,10 @@ public:
     void ArmFence(UINT64 value);
 
 private:
-    void CreateDeviceResources();
+    void InitializeDevice(HWND window);
+    void InitializeSurface();
+    void CreateDirect3DResources();
+    void CreateDirect2DResources();
     void CreateSwapChain();
     void CreateBackBufferTarget();
 

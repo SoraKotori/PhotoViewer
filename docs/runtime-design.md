@@ -18,10 +18,13 @@
 - 執行緒組成為一個 Main Thread 與多個 Worker Threads。
 - Main Thread 負責事件處理、導航授權、Producer、非同步檔案 I/O 提交與完成處理、工作派發、slot 狀態轉換、GPU 上傳及圖片呈現。
 - 事件只來自外部輸入、Windows 與 DXGI 訊號或非同步工作完成。
-- Main Thread 每次重新規劃後，依需求範圍與固定記憶體額度批次提交目前可執行的全部非同步檔案讀取。
+- Main Thread 每次重新規劃後，依需求範圍與固定記憶體額度批次提交目前可執行的非同步檔案讀取；一般資料夾冷啟動先提交首圖，目錄 I/O 完成後再以 Worker 數量為上限提交相鄰預取，避免同步目錄工作阻塞圖形初始化。
+- 一般資料夾開啟時只要求首圖路徑；Main Thread 以該路徑開啟一次檔案，從同一個 handle 取得大小並立刻提交非同步讀取，隨即以 `NtQueryDirectoryFileEx` 提交原生非同步目錄列舉。Windows I/O callback 只送出完成訊息，Main Thread 再解析目錄項目及其 `EndOfFile` 大小、定位排序後的下一張並立即預取。此流程不新增應用程式執行緒、不為大小讀取圖片內容，也不等待、sleep 或輪詢目錄 I/O。
 - 壓縮資料、解碼 staging texture 與 GPU texture 都由固定 Slot Storage 持續擁有；管線只傳遞 Slot ID，不移動大型資源所有權。
+- 固定大小的 `IoRequest` 由 compressed slot 直接內嵌持有，`WorkToken` 與 worker metrics 依設定數量各做一次連續陣列配置；圖片讀取、解碼派發及 slot 建立不做逐物件 heap allocation。
 - 每個 slot 的狀態直接表示該資源目前能被誰使用；可分配索引只收錄狀態為「可分配」的 Slot ID，供 Main Thread 快速取得。
-- 提交檔案讀取前取得壓縮 slot；解碼工作派發前取得 staging slot，由 Main Thread 建立或重用 `D3D11_USAGE_STAGING` texture 並映射其內容。
+- 提交檔案讀取前取得壓縮 slot。首次取得有效 PNG header 時，Main Thread 立即依寬高取得 staging slot 並建立或重用未映射的 `D3D11_USAGE_STAGING` texture；完整壓縮內容就緒後才映射並派發解碼。首圖與其後圖片使用完全相同的狀態流程。
+- 冷啟動在 decoder pool 建立前後及 Direct3D、Direct2D、swap chain、back buffer 各初始化邊界，只處理當下已經完成的 catalog／檔案 I/O；不等待、sleep 或輪詢。若 catalog 在進入 Direct3D 前完成，Main 立即一次派發全部 compressed reservations，使檔案 I/O 與圖形初始化自然重疊。
 - Workers 從 Work Queue 取得壓縮 slot 與已映射 staging slot 的 ID，直接在 staging texture 內完成解壓縮與反濾鏡，再將結果及 Slot ID 寫入 Completion Queue。
 - Main Thread 收到 Worker 完成結果後解除映射，取得 GPU texture slot，以 `CopySubresourceRegion` 提交非同步複製；GPU fence 完成後 staging slot 才回到「可分配」。
 - 元件邊界、狀態所有權、控制與資料流程及架構約束以本文件的[控制架構文字圖](#控制架構文字圖)為準。
@@ -51,6 +54,7 @@
 [基礎設施] 主事件迴圈
 │
 ├─讀取→ Windows 訊息
+├─讀取→ 目錄 I/O 完成訊號
 ├─讀取→ 檔案 I/O 完成訊號
 ├─讀取→ Worker 完成訊號
 ├─讀取→ GPU 上傳完成訊號
@@ -65,6 +69,8 @@
 ├─事件：開啟圖片 [外部輸入]────────────→ [事件 Handler] 開啟圖片
 ├─事件：方向鍵步進 [Windows 輸入]──────→ [事件 Handler] 方向鍵步進
 ├─事件：方向鍵放開 [Windows 輸入]──────→ [事件 Handler] 方向鍵放開
+├─事件：目錄 I/O 完成 [Windows 完成]────→ [事件 Handler] 目錄 I/O 完成
+├─事件：PNG header 就緒 [Windows 完成]──→ [事件 Handler] PNG header 就緒
 ├─事件：檔案 I/O 完成 [Windows 完成]────→ [事件 Handler] 檔案 I/O 完成
 ├─事件：Worker 工作完成 [Worker 完成]───→ [事件 Handler] Worker 工作完成
 ├─事件：GPU 上傳完成 [GPU 完成]────────→ [事件 Handler] GPU 上傳完成
@@ -229,7 +235,7 @@ Slot Storage 在整個工作階段持續擁有實體資源；回收只解除圖�
 └─判斷→ 待讀需求已全部提交，或下一筆會超過記憶體或 slot 數量上限時結束
 ```
 
-此呼叫一次提交所有目前可執行的讀取。需求範圍、記憶體上限與壓縮 slot 數量上限共同決定提交集合；任何釋放 slot 或記憶體額度的事件都會再次呼叫本流程。
+一般事件一次提交全部已取得 compressed reservation 且目前可執行的讀取，不另外以 Worker 數量或啟動批次限制截斷。一般資料夾冷啟動在暫時 catalog 只有首圖，因此先提交首圖；目錄 I/O 完成並建立完整 reservation 後，同一次共用流程會派發所有能取得 compressed slot 與記憶體額度的 reservation。固定驗證清單也遵守相同規則。Direct3D、Direct2D、swap chain 與 back buffer 各初始化階段之間，若 I/O 已完成便先填充 Work Queue，讓解碼與剩餘圖形初始化重疊，否則不等待並直接繼續。需求範圍、記憶體上限與壓縮 slot 數量上限共同決定提交集合；任何釋放 slot 或記憶體額度的事件都會再次呼叫本流程。
 
 #### 批次填充 Work Queue
 
@@ -245,8 +251,8 @@ Slot Storage 在整個工作階段持續擁有實體資源；回收只解除圖�
 │
 ├─計算→ 壓縮資料可用且仍需要解碼的圖片
 ├─計算→ 必須呈現的相鄰圖片優先，其次才是預取圖片
-├─判斷→ 對每個可取得解碼 staging texture 的圖片
-│   ├─寫入→ 取得可分配的 staging slot，建立或重用 staging texture 並映射
+├─判斷→ 對每個壓縮內容與 Prepared staging texture 都已就緒的圖片
+│   ├─寫入→ 映射已建立或重用的 staging texture
 │   ├─寫入→ 壓縮 slot 為解碼器正在讀取
 │   ├─寫入→ 圖片關聯解碼 staging texture Slot ID
 │   └─寫入→ Work Queue 工作
@@ -255,7 +261,7 @@ Slot Storage 在整個工作階段持續擁有實體資源；回收只解除圖�
 └─判斷→ 可解碼圖片已全部派發、staging texture 全部使用中或 Work Queue 已達安全容量時結束
 ```
 
-解碼 staging texture slot 在此呼叫實際取得並由 Main Thread 映射。若額度被較低優先的已解碼 staging 佔滿，先回收最低優先且尚未交由 GPU 的 staging，再派發下一張必須呈現的圖片。Worker 只依 Work Queue 內的 Slot ID 執行解碼；Main Thread 管理圖片關聯、slot 狀態與可分配索引。
+解碼 staging texture slot 通常已在 header 就緒事件中取得並建立為 `Prepared`，本流程只在完整壓縮內容可用後映射；對於 header 已快取的重新載入，本流程也會先走同一個 Prepare helper 再映射。若額度被較低優先的 Prepared 或已解碼 staging 佔滿，先回收最低優先且尚未交由 Worker／GPU 的 staging，再派發下一張必須呈現的圖片。Worker 只依 Work Queue 內的 Slot ID 執行解碼；Main Thread 管理圖片關聯、slot 狀態與可分配索引。
 
 #### 批次提交可執行的 GPU 上傳
 
@@ -326,21 +332,39 @@ GPU texture 建立不傳入初始像素資料。staging texture 在 fence 完成
 │
 ├─呼叫→ [事件專用] 建立瀏覽工作階段
 │   ├─讀取→ 事件攜帶的起始圖片路徑
-│   ├─寫入→ 圖片路徑表
-│   ├─寫入→ 圖片索引範圍
-│   ├─寫入→ 每張圖片的初始管線狀態
-│   ├─寫入→ 目前呈現索引
+│   ├─讀取→ 起始圖片的檔案大小中繼資料
+│   ├─寫入→ 只含起始圖片的暫時路徑表與管線狀態
+│   ├─提交→ 起始圖片的非同步檔案讀取
+│   ├─提交→ `NtQueryDirectoryFileEx` 原生非同步目錄列舉
+│   ├─寫入→ 暫時呈現索引
 │   ├─寫入→ 第一張短按等級的呈現承諾
 │   └─寫入→ 按住方向為停止
 │
 ├─呼叫→ 重新計算緩衝需求
-├─呼叫→ 批次提交可執行的檔案讀取
+├─呼叫→ 提交冷啟動第一批檔案讀取
 ├─呼叫→ 批次填充 Work Queue
 ├─呼叫→ 批次提交可執行的 GPU 上傳
 └─呼叫→ 嘗試提交下一張畫面
 ```
 
-建立工作階段初始化狀態；後續呼叫依圖片需求、關聯 Slot ID 與各 slot 狀態決定可立即推進的階段。
+一般資料夾工作階段先初始化首圖狀態並立刻提交首圖讀取；完整目錄由原生非同步 I/O 取得。驗證路徑清單模式仍同步建立固定清單。後續呼叫依圖片需求、關聯 Slot ID 與各 slot 狀態決定可立即推進的階段。
+
+#### 目錄 I/O 完成事件
+
+```text
+[事件 Handler] 目錄 I/O 完成
+│
+├─讀取→ `NtQueryDirectoryFileEx` 完成結果與目錄項目 buffer
+├─寫入→ 解析每筆 PNG 路徑及 `EndOfFile` 大小
+├─判斷→ 尚有項目時提交下一批原生非同步目錄查詢
+├─寫入→ 完成時排序路徑表並定位首圖正式索引
+├─寫入→ 將首圖既有 I/O 與 slot 關聯移至正式索引
+├─寫入→ 初始化其餘圖片的管線狀態與導航範圍
+├─呼叫→ 處理已到達但暫存的首圖 I/O 完成
+└─呼叫→ 一次提交全部可執行的 compressed reservations
+```
+
+此 Handler 只在 Windows I/O completion 到達後執行；沒有計時等待、sleep 或輪詢。合併時保留首圖已配置的壓縮 slot 與真實檔案大小，不重新讀取首圖。
 
 #### 方向鍵步進事件
 
@@ -390,6 +414,22 @@ GPU texture 建立不傳入初始像素資料。staging texture 在 fence 完成
 ```
 
 #### 檔案 I/O 完成事件
+
+首次讀取某張圖片時，Main Thread 先從檔案 handle 取得 storage sector 資訊，將至少包含 24-byte PNG header 的 prefix 向上提升到 system page／storage I/O granularity。接著以兩個獨立 `OVERLAPPED` 同時提交 `[0, prefix)` 與 `[prefix, EOF)`；兩段不接觸同一個底層 I/O 單位。已取得 header 的圖片再次載入時直接提交單次完整讀取。
+
+```text
+[事件 Handler] PNG header 就緒
+│
+├─讀取→ 壓縮 PNG slot 的前 24 bytes
+├─判斷→ PNG signature 與 IHDR 有效
+├─寫入→ 圖片寬度、高度、解碼輸出大小與 header 已知狀態
+├─讀取→ 圖片的 staging reservation 與固定 staging 記憶體額度
+├─寫入→ 取得 staging Slot ID 並關聯圖片／generation
+└─命令→ 立即建立或重用未映射的 `D3D11_USAGE_STAGING` texture
+    └─寫入→ staging slot 狀態為 Prepared
+```
+
+Windows callback 只把 Windows 已提供的 `io_result` 與 transferred bytes 打包進完成訊息，不讀寫 request 狀態。Main Thread 從訊息保存結果與 header 尺寸，並用一般布林欄位合併 prefix 與 body 完成狀態；不再為已完成的 I/O 重複呼叫 `GetOverlappedResult`，完成狀態也不需要跨執行緒 atomic 或 lock。Main Thread 不等待或輪詢 storage I/O；每個已同時具備 header 與完整內容的 request 立即推進 pipeline。texture 建立是 Main Thread 上的 D3D 記憶體準備，與仍在進行的 body storage I/O 互不相依；只有兩段讀取都完成後，壓縮 slot 才成為可解碼狀態。完成後關閉 threadpool I/O registration 前只收合已投遞訊息之 callback 的尾聲，以保證 callback context 生命週期。首圖在只有路徑的單項暫存 catalog 中先走同一個 header → Prepared texture 流程；非同步 catalog 完成並取得正式索引時，同步更新其 I/O、compressed slot 與 staging slot 的圖片索引。Catalog 完成後一次派發全部可執行的 compressed reservations；排序優先級仍使第二張最先提交，但不以人工批次上限省略其餘已授權讀取。
 
 ```text
 [事件 Handler] 檔案 I/O 完成
@@ -533,9 +573,10 @@ GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的
 ```text
 [系統服務] Windows 非同步檔案 I/O
 │
-├─讀取→ `批次提交可執行的檔案讀取` 提交的路徑、offset、長度與目的緩衝區
-├─寫入→ 提交時指定的壓縮 PNG slot
-└─事件→ 檔案 I/O 完成 [主事件迴圈]
+├─讀取→ `批次提交可執行的檔案讀取` 同時提交的對齊 prefix/body offset、長度與目的緩衝區
+├─寫入→ 同一壓縮 PNG slot 中互不重疊的 prefix/body 範圍
+├─事件→ 首次讀取的對齊 prefix 就緒 [主事件迴圈]
+└─事件→ body 或單次完整讀取就緒 [主事件迴圈]
 ```
 
 ```text
@@ -607,9 +648,9 @@ Work Queue 與 Completion Queue 是 Main Thread 和 Workers 之間的共享通�
 - 資源擁有者分別以 slot 狀態授予 Windows、單一 Worker 或 GPU 互斥的資源內容寫入期間。
 - 每個共用流程必須保留獨立文字圖；事件專用流程必須直接展開在對應 Handler 下。
 - 每個索引同時最多存在一條進行中的檔案讀取與解碼流程；同一張圖片取消後依當下索引狀態重新派發。
-- 檔案讀取以需求範圍及固定記憶體額度為準，一次批次提交全部可執行要求；在途 I/O 數量由提交結果產生。
+- 檔案讀取以需求範圍及固定記憶體額度為準；除冷啟動第一批外，一次批次提交全部可執行要求，在途 I/O 數量由提交結果產生。
 - Worker 的工作範圍為取得 Work Queue、解碼工作專屬記憶體資料，以及填充 Completion Queue。
-- 解碼 staging texture slot 從派發給 Worker 到解碼完成期間由該 Worker 獨占寫入；Main Thread 解除映射並提交 GPU 複製後，slot 持續作為 GPU 來源，直到 fence 完成才成為「可分配」。
+- 解碼 staging texture slot 在 header 就緒後可先處於未映射的 `Prepared`；從映射並派發給 Worker 到解碼完成期間由該 Worker 獨占寫入。Main Thread 解除映射並提交 GPU 複製後，slot 持續作為 GPU 來源，直到 fence 完成才成為「可分配」。範圍外、尚未映射的 Prepared slot 可直接回收。
 - GPU texture slot 由 Slot Storage 持續擁有；驅逐時解除圖片關聯，等待先前繪製完成後成為「可分配」。
 - 呈現授權由輸入事件建立；解碼與 GPU 推測性預取負責提前準備圖片資源。
 - 每個有效呈現授權依相鄰索引順序獲得獨立呈現機會。

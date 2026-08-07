@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common.h"
 #include "png.h"
 
 #include <filesystem>
@@ -11,6 +12,7 @@ struct CatalogItem {
     std::filesystem::path path;
     PngInfo png;
     std::uint64_t file_bytes = 0;
+    bool file_size_known = false;
     bool header_valid = false;
 };
 
@@ -19,8 +21,24 @@ struct Catalog {
     std::size_t initial_index = 0;
 };
 
-Catalog BuildCatalog(const std::filesystem::path& initial_image);
+Catalog BuildInitialCatalog(const std::filesystem::path& initial_image);
 Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
                              const std::filesystem::path& initial_image);
+
+class AsyncCatalog {
+public:
+    AsyncCatalog(const std::filesystem::path& initial_image, HWND window);
+    ~AsyncCatalog();
+
+    AsyncCatalog(const AsyncCatalog&) = delete;
+    AsyncCatalog& operator=(const AsyncCatalog&) = delete;
+
+    [[nodiscard]] bool Advance();
+    [[nodiscard]] Catalog TakeCatalog();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace pv

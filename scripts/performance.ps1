@@ -25,6 +25,40 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not ('PhotoViewer.ProcessMemoryCountersEx' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace PhotoViewer {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ProcessMemoryCountersEx {
+        public uint Size;
+        public uint PageFaultCount;
+        public UIntPtr PeakWorkingSetSize;
+        public UIntPtr WorkingSetSize;
+        public UIntPtr QuotaPeakPagedPoolUsage;
+        public UIntPtr QuotaPagedPoolUsage;
+        public UIntPtr QuotaPeakNonPagedPoolUsage;
+        public UIntPtr QuotaNonPagedPoolUsage;
+        public UIntPtr PagefileUsage;
+        public UIntPtr PeakPagefileUsage;
+        public UIntPtr PrivateUsage;
+    }
+
+    public static class ProcessMemory {
+        [DllImport("psapi.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetProcessMemoryInfo(
+            IntPtr process,
+            ref ProcessMemoryCountersEx counters,
+            uint size);
+    }
+}
+'@
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $viewer = Join-Path $projectRoot 'x64\Release\PhotoViewer.exe'
 if (-not (Test-Path -LiteralPath $viewer -PathType Leaf)) {
@@ -95,7 +129,7 @@ $inputMode = if ($ShortPresses) { 'short' } else { 'hold' }
 $measurements = @()
 $injectionMeasurements = @()
 $tailMeasurements = @()
-$privateMemoryMeasurements = @()
+$commitMeasurements = @()
 $workingSetMeasurements = @()
 $managedMemoryMeasurements = @()
 $coldStartMeasurements = @()
@@ -132,22 +166,18 @@ for ($run = 1; $run -le $Runs; ++$run) {
         -ArgumentList $arguments `
         -WindowStyle Hidden `
         -PassThru
-    [int64]$peakPrivateBytes = 0
-    [int64]$peakWorkingSetBytes = 0
-    while (-not $process.HasExited) {
-        try {
-            $process.Refresh()
-            $peakPrivateBytes = [math]::Max(
-                $peakPrivateBytes, $process.PrivateMemorySize64)
-            $peakWorkingSetBytes = [math]::Max(
-                $peakWorkingSetBytes, $process.WorkingSet64)
-        } catch {
-            # The process can exit between HasExited and Refresh.
-        }
-        Start-Sleep -Milliseconds 10
-    }
+    $processHandle = $process.SafeHandle
     $process.WaitForExit()
-    $privateMemoryMeasurements += $peakPrivateBytes
+    $memory = [PhotoViewer.ProcessMemoryCountersEx]::new()
+    $memory.Size = [Runtime.InteropServices.Marshal]::SizeOf($memory)
+    if (-not [PhotoViewer.ProcessMemory]::GetProcessMemoryInfo(
+        $processHandle.DangerousGetHandle(), [ref]$memory, $memory.Size)) {
+        throw "GetProcessMemoryInfo failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    [int64]$peakCommitBytes = $memory.PeakPagefileUsage.ToUInt64()
+    [int64]$peakWorkingSetBytes = $memory.PeakWorkingSetSize.ToUInt64()
+    [GC]::KeepAlive($processHandle)
+    $commitMeasurements += $peakCommitBytes
     $workingSetMeasurements += $peakWorkingSetBytes
     if ($process.ExitCode -ge 100 -and $process.ExitCode -le 109) {
         throw "Run $run timed out at pipeline stage $($process.ExitCode - 100)"
@@ -261,7 +291,7 @@ for ($run = 1; $run -le $Runs; ++$run) {
         LateReadyImages = $lateReadyCount
         InputInjectionMs = [math]::Round($injectionMs, 2)
         PipelineTailMs = [math]::Round($tailMs, 2)
-        PeakPrivateMiB = [math]::Round($peakPrivateBytes / 1MB, 1)
+        PeakCommitMiB = [math]::Round($peakCommitBytes / 1MB, 1)
         PeakWorkingSetMiB = [math]::Round($peakWorkingSetBytes / 1MB, 1)
         PeakManagedStorageMiB = [math]::Round($managedPeakBytes / 1MB, 1)
     }
@@ -309,8 +339,8 @@ $average = ($measurements | Measure-Object -Average).Average
         ($injectionMeasurements | Measure-Object -Maximum).Maximum, 2)
     MaximumPipelineTailMs = [math]::Round(
         ($tailMeasurements | Measure-Object -Maximum).Maximum, 2)
-    MaximumPrivateMiB = [math]::Round(
-        (($privateMemoryMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
+    MaximumCommitMiB = [math]::Round(
+        (($commitMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
     MaximumWorkingSetMiB = [math]::Round(
         (($workingSetMeasurements | Measure-Object -Maximum).Maximum / 1MB), 1)
     MaximumManagedStorageMiB = [math]::Round(

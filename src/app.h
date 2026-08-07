@@ -9,23 +9,10 @@
 
 namespace pv {
 
-struct IoRequest {
-    OVERLAPPED overlapped{};
-    HANDLE file = INVALID_HANDLE_VALUE;
-    PTP_IO threadpool_io = nullptr;
-    HWND window = nullptr;
-    std::size_t index = 0;
-    std::uint64_t generation = 0;
-    SlotId compressed_slot = kInvalidSlot;
-    std::atomic<DWORD> result{ERROR_IO_PENDING};
-    std::atomic<ULONG_PTR> transferred{0};
-};
-
 struct ImageRecord {
     bool failed = false;
     std::uint64_t generation = 0;
-    std::unique_ptr<IoRequest> io;
-    std::unique_ptr<WorkToken> work_token = std::make_unique<WorkToken>();
+    IoRequest* io = nullptr;
     bool work_active = false;
     ReservationId compressed_reservation = kInvalidReservation;
     ReservationId staging_reservation = kInvalidReservation;
@@ -47,7 +34,7 @@ struct ResourceContext {
 
     std::size_t compressed_bytes = 0;
     std::size_t gpu_bytes = 0;
-    std::unique_ptr<ResourceSlots> slots;
+    std::optional<ResourceSlots> slots;
     std::deque<UploadTicket> uploads;
 
     bool frame_credit = false;
@@ -72,15 +59,18 @@ private:
                                       ULONG_PTR transferred, PTP_IO io);
     static void CALLBACK ValidationTimerCallback(PTP_CALLBACK_INSTANCE instance,
                                                  void* context, PTP_TIMER timer);
-
     void InitializeWindow(HINSTANCE instance, int show_command);
+    void ProcessStartupCatalogCompletion();
+    void ProcessStartupIoCompletion();
     int EventLoop();
     LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
     void OpenInitialImage();
     void OnDirection(int direction, bool repeat, std::size_t repeat_count);
     void OnDirectionReleased(int direction);
-    void OnIoComplete(IoRequest* request);
+    void OnCatalogComplete();
+    void OnIoHeaderReady(IoRequest* request, LPARAM completion);
+    void OnIoComplete(IoRequest* request, LPARAM completion);
     void CompleteIoRequest(IoRequest* request);
     void OnWorkerComplete();
     void OnGpuComplete();
@@ -100,6 +90,7 @@ private:
     void PumpPipeline();
     void InitializeReservations();
     void ReconcileReservations();
+    void PrepareStagingForImage(std::size_t index);
     void SubmitReads();
     void DispatchDecodes();
     void SubmitUploads();
@@ -120,7 +111,10 @@ private:
     Config config_;
     HWND window_ = nullptr;
     bool running_ = true;
+    bool graphics_device_ready_ = false;
     bool graphics_ready_ = false;
+    bool catalog_loading_ = false;
+    DWORD io_prefix_granularity_ = 0;
     bool fullscreen_ = false;
     WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
     LONG_PTR windowed_style_ = 0;
@@ -133,6 +127,11 @@ private:
     std::size_t validation_navigation_cursor_ = 0;
     std::size_t validation_expected_index_ = 0;
     std::chrono::steady_clock::time_point validation_cold_started_{};
+    std::chrono::steady_clock::time_point validation_window_ready_{};
+    std::chrono::steady_clock::time_point validation_initial_io_submitted_{};
+    std::chrono::steady_clock::time_point validation_decoders_ready_{};
+    std::chrono::steady_clock::time_point validation_graphics_device_ready_{};
+    std::chrono::steady_clock::time_point validation_graphics_ready_{};
     std::chrono::steady_clock::time_point validation_navigation_started_{};
     std::chrono::steady_clock::time_point validation_navigation_injection_finished_{};
     std::vector<std::size_t> validation_ready_indices_;
@@ -140,12 +139,14 @@ private:
     std::vector<std::size_t> validation_presented_indices_;
     std::vector<std::uint64_t> validation_presented_nanoseconds_;
     PTP_TIMER validation_navigation_timer_ = nullptr;
+    std::vector<IoRequest*> deferred_catalog_io_;
     int exit_code_ = 0;
 
     Graphics graphics_;
     WorkQueue work_queue_;
     CompletionQueue completion_queue_;
-    std::unique_ptr<DecoderPool> decoders_;
+    std::optional<DecoderPool> decoders_;
+    std::optional<AsyncCatalog> catalog_io_;
     ResourceContext resources_;
 };
 

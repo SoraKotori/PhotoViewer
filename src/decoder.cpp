@@ -102,17 +102,15 @@ DecoderPool::DecoderPool(const std::size_t worker_count, WorkQueue& work_queue,
                          CompletionQueue& completion_queue, ResourceSlots& slots,
                          const HWND event_window)
     : work_queue_(work_queue), completion_queue_(completion_queue), slots_(slots),
-      event_window_(event_window) {
+      event_window_(event_window),
+      worker_metrics_(std::make_unique<WorkerMetrics[]>(worker_count)),
+      worker_count_(worker_count) {
     const std::vector<DWORD> cpu_sets = SelectCpuSets(worker_count);
-    worker_metrics_.reserve(worker_count);
-    for (std::size_t index = 0; index < worker_count; ++index) {
-        worker_metrics_.push_back(std::make_unique<WorkerMetrics>());
-    }
     workers_.reserve(worker_count);
     for (std::size_t index = 0; index < worker_count; ++index) {
         const bool has_cpu_set = index < cpu_sets.size();
         const DWORD cpu_set = has_cpu_set ? cpu_sets[index] : 0;
-        WorkerMetrics* const metrics = worker_metrics_[index].get();
+        WorkerMetrics* const metrics = &worker_metrics_[index];
         workers_.emplace_back([this, has_cpu_set, cpu_set, metrics](
                                   const std::stop_token stop) {
             if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
@@ -141,60 +139,77 @@ DecoderPool::~DecoderPool() {
 }
 
 void DecoderPool::ResetMetrics() noexcept {
-    for (const auto& metrics : worker_metrics_) {
-        metrics->decode_count.store(0, std::memory_order_relaxed);
-        metrics->decode_nanoseconds.store(0, std::memory_order_relaxed);
+    std::uint64_t count = 0;
+    std::uint64_t nanoseconds = 0;
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        count += worker_metrics_[index].decode_count.load(
+            std::memory_order_relaxed);
+        nanoseconds += worker_metrics_[index].decode_nanoseconds.load(
+            std::memory_order_relaxed);
     }
+    decode_count_base_ = count;
+    decode_nanoseconds_base_ = nanoseconds;
 }
 
 std::uint64_t DecoderPool::DecodeCount() const noexcept {
     std::uint64_t total = 0;
-    for (const auto& metrics : worker_metrics_) {
-        total += metrics->decode_count.load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        total += worker_metrics_[index].decode_count.load(std::memory_order_relaxed);
     }
-    return total;
+    return total >= decode_count_base_ ? total - decode_count_base_ : 0;
 }
 
 std::uint64_t DecoderPool::DecodeNanoseconds() const noexcept {
     std::uint64_t total = 0;
-    for (const auto& metrics : worker_metrics_) {
-        total += metrics->decode_nanoseconds.load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        total += worker_metrics_[index].decode_nanoseconds.load(
+            std::memory_order_relaxed);
     }
-    return total;
+    return total >= decode_nanoseconds_base_
+               ? total - decode_nanoseconds_base_
+               : 0;
 }
 
 std::size_t DecoderPool::SelectedCpuSetCount() const noexcept {
-    return static_cast<std::size_t>(std::count_if(
-        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
-            return metrics->selected_cpu_set.load(std::memory_order_relaxed);
-        }));
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        count += worker_metrics_[index].selected_cpu_set.load(
+            std::memory_order_relaxed);
+    }
+    return count;
 }
 
 std::size_t DecoderPool::UnthrottledWorkerCount() const noexcept {
-    return static_cast<std::size_t>(std::count_if(
-        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
-            return metrics->unthrottled.load(std::memory_order_relaxed);
-        }));
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        count += worker_metrics_[index].unthrottled.load(
+            std::memory_order_relaxed);
+    }
+    return count;
 }
 
 std::size_t DecoderPool::ElevatedWorkerCount() const noexcept {
-    return static_cast<std::size_t>(std::count_if(
-        worker_metrics_.begin(), worker_metrics_.end(), [](const auto& metrics) {
-            return metrics->elevated.load(std::memory_order_relaxed);
-        }));
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+        count += worker_metrics_[index].elevated.load(std::memory_order_relaxed);
+    }
+    return count;
 }
 
 void DecoderPool::WorkerMain(const std::stop_token stop, WorkerMetrics& metrics) {
     DecodeWork work;
+    std::uint64_t decode_count = 0;
+    std::uint64_t decode_nanoseconds = 0;
     while (work_queue_.Pop(work, stop)) {
         const auto begin = std::chrono::steady_clock::now();
         DecodeResult result = Decode(std::move(work));
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin);
-        metrics.decode_nanoseconds.fetch_add(
-            static_cast<std::uint64_t>(elapsed.count()),
-            std::memory_order_relaxed);
-        metrics.decode_count.fetch_add(1, std::memory_order_relaxed);
+        decode_nanoseconds += static_cast<std::uint64_t>(elapsed.count());
+        ++decode_count;
+        metrics.decode_nanoseconds.store(decode_nanoseconds,
+                                         std::memory_order_relaxed);
+        metrics.decode_count.store(decode_count, std::memory_order_relaxed);
         if (completion_queue_.Push(std::move(result))) {
             PostMessageW(event_window_, kMessageWorkerComplete, 0, 0);
         }
