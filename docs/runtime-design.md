@@ -224,20 +224,20 @@
 ├─擁有→ [共享通道] 工作佇列 [生產端：批次填充工作佇列；消費端：Workers]
 ├─擁有→ [共享通道] 完成佇列 [生產端：Workers；消費端：Worker 工作完成處理流程]
 │
-├─擁有→ [Slot Storage] GPU texture slots [內容寫入：GPU；內容讀取：Direct2D]
+├─擁有→ [Slot Storage] GPU Texture slots [內容寫入：GPU；內容讀取：Direct2D]
 │         └─[Slot 狀態]
 │             ├─可分配
 │             ├─GPU 正在寫入
 │             ├─可供 Direct2D 繪製
 │             └─等待先前繪製完成
-├─擁有→ [可分配索引] GPU texture Slot ID
+├─擁有→ [可分配索引] GPU Texture Slot ID
 ├─擁有→ [索引] 可呈現 GPU 圖片
-│         └─圖片索引 → 可供 Direct2D 繪製的 GPU texture Slot ID
+│         └─圖片索引 → 可供 Direct2D 繪製的 GPU Texture Slot ID
 ├─擁有→ [狀態] GPU 記憶體使用量
 ├─擁有→ [狀態] GPU 上傳工作
 │         ├─圖片索引
 │         ├─解碼 staging texture Slot ID
-│         ├─GPU texture Slot ID
+│         ├─GPU Texture Slot ID
 │         └─完成值
 │
 ├─擁有→ [狀態] Frame 提交額度
@@ -280,7 +280,7 @@
 ├─讀寫→ 工作佇列的生產端與工作取消旗標
 ├─讀寫→ 壓縮 PNG slot 狀態與可分配索引
 ├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
-├─讀寫→ GPU texture slot 狀態與可分配索引
+├─讀寫→ GPU Texture slot 狀態與可分配索引
 ├─讀寫→ 可呈現 GPU 圖片索引
 ├─讀寫→ staging 與 GPU 記憶體使用量
 │
@@ -297,10 +297,10 @@
 │   └─寫入→ staging slot 為可分配並加入可分配索引
 └─判斷→ 可呈現 GPU 圖片位於保留範圍外且索引與目前畫面相異
     ├─寫入→ 從可呈現 GPU 圖片索引移除圖片
-    └─寫入→ 對應 GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
+    └─寫入→ 對應 GPU Texture slot 等待先前繪製完成後設為可分配並加入可分配索引
 ```
 
-固定資源儲存區在整個工作階段持續擁有實體資源；回收時解除圖片與 Slot ID 的關聯並更新 slot 狀態。可分配索引專門提供可用 Slot ID；分配後的工作提交、完成處理與狀態轉換都直接攜帶 Slot ID。呈現時透過可呈現 GPU 圖片索引直接取得 GPU texture Slot ID。
+固定資源儲存區在整個工作階段持續擁有實體資源；回收時解除圖片與 Slot ID 的關聯並更新 slot 狀態。可分配索引專門提供可用 Slot ID；分配後的工作提交、完成處理與狀態轉換都直接攜帶 Slot ID。呈現時透過可呈現 GPU 圖片索引直接取得 GPU Texture Slot ID。
 
 #### 批次提交可執行的檔案讀取
 
@@ -367,26 +367,26 @@
 ├─讀取→ 每張圖片的需求狀態與關聯 staging Slot ID
 ├─讀取→ 可呈現 GPU 圖片索引
 ├─讀寫→ 解碼 staging texture slot 狀態
-├─讀寫→ GPU texture slot 狀態與可分配索引
+├─讀寫→ GPU Texture slot 狀態與可分配索引
 ├─讀寫→ GPU 記憶體使用量
 ├─讀寫→ GPU 上傳工作
 │
 ├─計算→ 關聯已解碼 staging slot，且不在可呈現 GPU 圖片索引或 GPU 上傳工作中的圖片
 ├─計算→ 下一張必須呈現的圖片優先，其次依距離排序
 ├─判斷→ 對每個目前可提交的圖片
-│   ├─寫入→ 取得可分配的 GPU texture slot 並設為 GPU 正在寫入
+│   ├─寫入→ 取得可分配的 GPU Texture slot 並設為 GPU 正在寫入
 │   ├─寫入→ GPU 上傳工作
 │   │   ├─圖片索引
 │   │   ├─解碼 staging texture Slot ID
-│   │   ├─GPU texture Slot ID
+│   │   ├─GPU Texture Slot ID
 │   │   └─GPU fence 完成值
-│   ├─提交→ 以空白初始資料建立 GPU texture
-│   ├─提交→ 從 staging texture 複製原始圖片範圍至 GPU texture
+│   ├─提交→ 以空白初始資料建立 GPU Texture
+│   ├─提交→ 從 staging texture 複製原始圖片範圍至 GPU Texture
 │   └─寫入→ staging slot 為 GPU 正在讀取
 └─判斷→ 待上傳圖片已全部提交、GPU 記憶體或 slot 數量上限或提交容量已用完時結束
 ```
 
-GPU texture 以空白初始內容建立。staging texture 在 fence 完成前持續作為非同步複製來源。
+GPU Texture 以空白初始內容建立。staging texture 在 fence 完成前持續作為非同步複製來源。
 
 #### 嘗試提交下一張畫面
 
@@ -397,13 +397,13 @@ GPU texture 以空白初始內容建立。staging texture 在 fence 完成前持
 ├─讀取→ 目前呈現索引
 ├─讀取→ 待完成呈現授權
 ├─讀取→ 可呈現 GPU 圖片索引
-├─讀取→ 索引直接取得的 GPU texture Slot ID 與 slot 狀態
+├─讀取→ 索引直接取得的 GPU Texture Slot ID 與 slot 狀態
 │
 ├─判斷→ 呈現授權序列為空時保持目前畫面
 ├─判斷→ 下一個相鄰索引仍在 GPU 上傳前階段時保持目前畫面並等待該索引
 ├─判斷→ Frame 提交額度處於等待狀態時等待後續額度事件
 └─判斷→ 呈現授權、相鄰 GPU 圖片與 Frame 額度全部可用
-    ├─提交→ Direct2D 使用該 GPU texture Slot ID 高品質繪製至實體像素 back buffer
+    ├─提交→ Direct2D 使用該 GPU Texture Slot ID 高品質繪製至實體像素 back buffer
     ├─提交→ DXGI SwapChain Present
     ├─寫入→ 消耗一份 Frame 提交額度
     ├─寫入→ 目前呈現索引
@@ -577,19 +577,19 @@ Worker 完成事件先解除 staging texture 映射，再依結果轉換 staging
 ├─呼叫→ [事件專用] 處理 GPU 上傳完成結果
 │   ├─讀取→ 本次事件提供的 GPU 上傳完成結果
 │   ├─讀寫→ GPU 上傳工作
-│   ├─讀寫→ GPU texture slot 狀態與可分配索引
+│   ├─讀寫→ GPU Texture slot 狀態與可分配索引
 │   ├─讀寫→ 解碼 staging texture slot 狀態與可分配索引
 │   ├─讀寫→ 可呈現 GPU 圖片索引
 │   ├─判斷→ 成功且圖片仍在 GPU 保留範圍
-│   │   ├─寫入→ GPU texture slot 為可供 Direct2D 繪製
+│   │   ├─寫入→ GPU Texture slot 為可供 Direct2D 繪製
 │   │   ├─寫入→ 可呈現 GPU 圖片索引
-│   │   │   └─圖片索引 → GPU texture Slot ID
+│   │   │   └─圖片索引 → GPU Texture Slot ID
 │   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   ├─判斷→ 成功但圖片已離開 GPU 保留範圍
-│   │   ├─寫入→ GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
+│   │   ├─寫入→ GPU Texture slot 等待先前繪製完成後設為可分配並加入可分配索引
 │   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   ├─判斷→ 失敗
-│   │   ├─寫入→ GPU texture slot 等待先前繪製完成後設為可分配並加入可分配索引
+│   │   ├─寫入→ GPU Texture slot 等待先前繪製完成後設為可分配並加入可分配索引
 │   │   └─寫入→ staging slot 為可分配並加入可分配索引
 │   └─判斷→ 每個完成結果
 │       └─寫入→ 移除對應 GPU 上傳工作
@@ -639,8 +639,8 @@ GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的
     ├─寫入→ 顯示表面實體像素尺寸
     ├─命令→ DXGI SwapChain ResizeBuffers
     ├─命令→ 重建 Direct2D back-buffer target
-    └─判斷→ 目前圖片對應的 GPU texture slot 可供 Direct2D 繪製且 Frame 提交額度可用
-        ├─提交→ Direct2D 使用該 GPU texture Slot ID 重新繪製目前圖片
+    └─判斷→ 目前圖片對應的 GPU Texture slot 可供 Direct2D 繪製且 Frame 提交額度可用
+        ├─提交→ Direct2D 使用該 GPU Texture Slot ID 重新繪製目前圖片
         ├─提交→ DXGI SwapChain Present
         └─寫入→ 消耗一份 Frame 提交額度
 ```
@@ -686,7 +686,7 @@ GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的
 [外部非同步執行器] GPU 命令佇列
 │
 ├─讀取→ GPU 上傳工作指定的解碼 staging texture slot
-├─寫入→ GPU 正在寫入的 GPU texture slot
+├─寫入→ GPU 正在寫入的 GPU Texture slot
 └─事件→ GPU 上傳完成 [主事件迴圈]
 ```
 
@@ -729,7 +729,7 @@ GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的
 
 [資源擁有者] 資源上下文
 │
-├─擁有→ 壓縮 PNG、解碼 staging texture 與 GPU texture 固定資源儲存區
+├─擁有→ 壓縮 PNG、解碼 staging texture 與 GPU Texture 固定資源儲存區
 ├─擁有→ 各類可分配索引與 slot 狀態
 ├─擁有→ 可呈現 GPU 圖片索引與 GPU 上傳工作
 ├─擁有→ 工作佇列 [共享：Workers]

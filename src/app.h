@@ -18,7 +18,7 @@ struct ImageRecord {
     bool work_active = false;
     ReservationId compressed_reservation = kInvalidReservation;
     ReservationId staging_reservation = kInvalidReservation;
-    ReservationId source_reservation = kInvalidReservation;
+    ReservationId gpu_texture_reservation = kInvalidReservation;
     SlotId compressed_slot = kInvalidSlot;
     SlotId staging_slot = kInvalidSlot;
 };
@@ -31,9 +31,9 @@ struct ResourceContext {
 
     ReservationTable compressed_reservations;
     ReservationTable staging_reservations;
-    ReservationTable source_reservations;
+    ReservationTable gpu_texture_reservations;
     std::vector<std::size_t> priority_order;
-    std::vector<std::size_t> source_desired;
+    std::vector<std::size_t> gpu_texture_desired;
     bool reservation_plan_dirty = true;
 
     std::size_t compressed_bytes = 0;
@@ -44,8 +44,8 @@ struct ResourceContext {
     bool frame_credit = false;
     bool redraw_pending = true;
     UINT64 armed_fence = 0;
-    SlotId reading_source_slot = kInvalidSlot;
-    UINT64 reading_source_fence = 0;
+    SlotId reading_gpu_texture_slot = kInvalidSlot;
+    UINT64 reading_gpu_texture_fence = 0;
 };
 
 class App {
@@ -114,7 +114,7 @@ private:
     [[nodiscard]] bool ReservationActive(const ReservationTable& table,
                                          ReservationId id,
                                          std::size_t frame) const noexcept;
-    [[nodiscard]] bool HasReadableSource(std::size_t frame) const noexcept;
+    [[nodiscard]] bool HasReadableGpuTexture(std::size_t frame) const noexcept;
     [[nodiscard]] bool CancelQueuedDecode(std::size_t frame);
     void ReleaseCompressed(ImageRecord& image);
     void CancelAllIo();

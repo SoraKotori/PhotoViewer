@@ -420,7 +420,7 @@ int App::EventLoop() {
             handles[count] = graphics_.FrameWaitableObject();
             kinds[count++] = Kind::Frame;
         }
-        if ((!resources_.uploads.empty() || resources_.reading_source_fence != 0) &&
+        if ((!resources_.uploads.empty() || resources_.reading_gpu_texture_fence != 0) &&
             graphics_.FenceEvent()) {
             handles[count] = graphics_.FenceEvent();
             kinds[count++] = Kind::Fence;
@@ -513,7 +513,7 @@ void App::OnCatalogComplete() {
     ImageRecord initial_image = std::move(resources_.images[0]);
     initial_image.compressed_reservation = kInvalidReservation;
     initial_image.staging_reservation = kInvalidReservation;
-    initial_image.source_reservation = kInvalidReservation;
+    initial_image.gpu_texture_reservation = kInvalidReservation;
 
     std::vector<ImageRecord> images(catalog.items.size());
     for (std::size_t index = 0; index < images.size(); ++index) {
@@ -746,19 +746,19 @@ void App::OnWorkerComplete() {
 
 void App::OnGpuComplete() {
     const UINT64 completed = graphics_.CompletedFenceValue();
-    if (resources_.reading_source_fence != 0 &&
-        resources_.reading_source_fence <= completed) {
-        if (resources_.reading_source_slot != kInvalidSlot) {
-            GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-                resources_.reading_source_slot);
-            if (source.state == GpuTextureSlotState::Reading) {
-                source.state = source.reserved_frame == source.content_frame
+    if (resources_.reading_gpu_texture_fence != 0 &&
+        resources_.reading_gpu_texture_fence <= completed) {
+        if (resources_.reading_gpu_texture_slot != kInvalidSlot) {
+            GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+                resources_.reading_gpu_texture_slot);
+            if (gpu_texture.state == GpuTextureSlotState::Reading) {
+                gpu_texture.state = gpu_texture.reserved_frame == gpu_texture.content_frame
                                    ? GpuTextureSlotState::Readable
                                    : GpuTextureSlotState::Writable;
             }
         }
-        resources_.reading_source_slot = kInvalidSlot;
-        resources_.reading_source_fence = 0;
+        resources_.reading_gpu_texture_slot = kInvalidSlot;
+        resources_.reading_gpu_texture_fence = 0;
     }
     while (!resources_.uploads.empty() &&
            resources_.uploads.front().fence_value <= completed) {
@@ -769,21 +769,21 @@ void App::OnGpuComplete() {
             continue;
         }
         ImageRecord& image = resources_.images[ticket.index];
-        GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-            ticket.source_texture_slot);
+        GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+            ticket.gpu_texture_slot);
         const bool keep_gpu = ticket.generation == image.generation &&
-            ReservationActive(resources_.source_reservations,
-                              image.source_reservation, ticket.index) &&
-            image.source_reservation == ticket.source_texture_slot &&
-            source.reserved_frame == ticket.index;
+            ReservationActive(resources_.gpu_texture_reservations,
+                              image.gpu_texture_reservation, ticket.index) &&
+            image.gpu_texture_reservation == ticket.gpu_texture_slot &&
+            gpu_texture.reserved_frame == ticket.index;
         if (keep_gpu) {
-            graphics_.FinishUpload(source.resource);
-            source.content_frame = ticket.index;
-            source.state = GpuTextureSlotState::Readable;
+            graphics_.FinishUpload(gpu_texture.resource);
+            gpu_texture.content_frame = ticket.index;
+            gpu_texture.state = GpuTextureSlotState::Readable;
             RecordValidationReady(ticket.index);
         } else {
-            source.content_frame = ticket.index;
-            source.state = GpuTextureSlotState::Writable;
+            gpu_texture.content_frame = ticket.index;
+            gpu_texture.state = GpuTextureSlotState::Writable;
         }
         resources_.slots->ReleaseStaging(ticket.staging_slot);
         if (image.staging_slot == ticket.staging_slot) {
@@ -1087,13 +1087,13 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     write_indices("Uploading_indices", PipelineStage::Uploading);
     write_indices("PresentationTextureAvailable_indices",
                   PipelineStage::PresentationTextureAvailable);
-    output << "ActiveReadableSource_indices=";
-    bool first_readable_source = true;
+    output << "ActiveReadableGpuTexture_indices=";
+    bool first_readable_gpu_texture = true;
     for (std::size_t index = 0; index < resources_.images.size(); ++index) {
-        if (!HasReadableSource(index)) continue;
-        if (!first_readable_source) output << ',';
+        if (!HasReadableGpuTexture(index)) continue;
+        if (!first_readable_gpu_texture) output << ',';
         output << index;
-        first_readable_source = false;
+        first_readable_gpu_texture = false;
     }
     output << '\n';
     const auto retiring_count = [](const ReservationTable& table) {
@@ -1117,19 +1117,19 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
            << "staging_reservations="
            << resources_.staging_reservations.AssignedCount() << '/'
            << resources_.staging_reservations.Capacity() << '\n'
-           << "source_reservations="
-           << resources_.source_reservations.AssignedCount() << '/'
-           << resources_.source_reservations.Capacity() << '\n'
+           << "gpu_texture_reservations="
+           << resources_.gpu_texture_reservations.AssignedCount() << '/'
+           << resources_.gpu_texture_reservations.Capacity() << '\n'
            << "compressed_retiring_reservations="
            << retiring_count(resources_.compressed_reservations) << '\n'
            << "staging_retiring_reservations="
            << retiring_count(resources_.staging_reservations) << '\n'
-           << "source_retiring_reservations="
-           << retiring_count(resources_.source_reservations) << '\n'
+           << "gpu_texture_retiring_reservations="
+           << retiring_count(resources_.gpu_texture_reservations) << '\n'
            << "retiring_reservations="
            << retiring_count(resources_.compressed_reservations) +
                   retiring_count(resources_.staging_reservations) +
-                  retiring_count(resources_.source_reservations)
+                  retiring_count(resources_.gpu_texture_reservations)
            << '\n'
            << "work_queue=" << work_queue_.Size() << '\n'
            << "uploads=" << resources_.uploads.size() << '\n'
@@ -1297,12 +1297,12 @@ PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
     const std::size_t frame = static_cast<std::size_t>(
         &image - resources_.images.data());
     if (image.failed) return PipelineStage::Failed;
-    if (image.source_reservation != kInvalidReservation &&
-        image.source_reservation < resources_.slots->GpuTextureCount()) {
-        const GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-            image.source_reservation);
-        if (source.reserved_frame == frame) {
-            switch (source.state) {
+    if (image.gpu_texture_reservation != kInvalidReservation &&
+        image.gpu_texture_reservation < resources_.slots->GpuTextureCount()) {
+        const GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+            image.gpu_texture_reservation);
+        if (gpu_texture.reserved_frame == frame) {
+            switch (gpu_texture.state) {
             case GpuTextureSlotState::Writing:
                 return PipelineStage::Uploading;
             case GpuTextureSlotState::Readable:
@@ -1374,19 +1374,19 @@ void App::InitializeReservations() {
     const std::size_t staging_capacity = fixed_capacity(
         config_.staging_slot_count, config_.staging_cache_bytes,
         staging_8k_bytes);
-    const std::size_t source_capacity = fixed_capacity(
+    const std::size_t gpu_texture_capacity = fixed_capacity(
         config_.GpuSlotCount(), config_.gpu_cache_bytes,
         decoded_8k_bytes);
 
     resources_.compressed_reservations.Reset(compressed_capacity);
     resources_.staging_reservations.Reset(staging_capacity);
-    resources_.source_reservations.Reset(source_capacity);
+    resources_.gpu_texture_reservations.Reset(gpu_texture_capacity);
     resources_.priority_order.clear();
-    resources_.source_desired.clear();
+    resources_.gpu_texture_desired.clear();
     resources_.reservation_plan_dirty = true;
-    for (SlotId id = 0; id < source_capacity; ++id) {
+    for (SlotId id = 0; id < gpu_texture_capacity; ++id) {
         if (!resources_.slots->ActivateGpuTexture(id)) {
-            throw std::logic_error("failed to activate SourceTexture slot");
+            throw std::logic_error("failed to activate GPU Texture slot");
         }
     }
 }
@@ -1397,18 +1397,18 @@ bool App::ReservationActive(const ReservationTable& table,
     return table.IsActive(id) && table.At(id).frame == frame;
 }
 
-bool App::HasReadableSource(const std::size_t frame) const noexcept {
+bool App::HasReadableGpuTexture(const std::size_t frame) const noexcept {
     if (frame >= resources_.images.size()) return false;
     const ImageRecord& image = resources_.images[frame];
-    if (!ReservationActive(resources_.source_reservations,
-                           image.source_reservation, frame)) {
+    if (!ReservationActive(resources_.gpu_texture_reservations,
+                           image.gpu_texture_reservation, frame)) {
         return false;
     }
-    const GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-        image.source_reservation);
-    return source.reserved_frame == frame && source.content_frame == frame &&
-           (source.state == GpuTextureSlotState::Readable ||
-            source.state == GpuTextureSlotState::Reading);
+    const GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+        image.gpu_texture_reservation);
+    return gpu_texture.reserved_frame == frame && gpu_texture.content_frame == frame &&
+           (gpu_texture.state == GpuTextureSlotState::Readable ||
+            gpu_texture.state == GpuTextureSlotState::Reading);
 }
 
 bool App::CancelQueuedDecode(const std::size_t frame) {
@@ -1460,48 +1460,48 @@ void App::RebuildReservationPlan() {
         }
     };
 
-    resources_.source_desired.clear();
-    const std::size_t source_capacity = resources_.source_reservations.Capacity();
-    resources_.source_desired.reserve(source_capacity);
+    resources_.gpu_texture_desired.clear();
+    const std::size_t gpu_texture_capacity = resources_.gpu_texture_reservations.Capacity();
+    resources_.gpu_texture_desired.reserve(gpu_texture_capacity);
     const std::size_t forward_capacity = std::min(
-        config_.gpu_forward_slot_count, source_capacity);
+        config_.gpu_forward_slot_count, gpu_texture_capacity);
     const std::size_t current = resources_.navigation.CurrentIndex();
-    append_unique(resources_.source_desired, current, source_capacity);
+    append_unique(resources_.gpu_texture_desired, current, gpu_texture_capacity);
     for (const std::size_t frame : resources_.priority_order) {
-        if (resources_.source_desired.size() >= forward_capacity) break;
+        if (resources_.gpu_texture_desired.size() >= forward_capacity) break;
         if (!resources_.images[frame].failed) {
-            append_unique(resources_.source_desired, frame, source_capacity);
+            append_unique(resources_.gpu_texture_desired, frame, gpu_texture_capacity);
         }
     }
     const std::size_t reverse_capacity = std::min(
         config_.gpu_reverse_slot_count,
-        source_capacity - resources_.source_desired.size());
+        gpu_texture_capacity - resources_.gpu_texture_desired.size());
     int direction = resources_.navigation.PreferredDirection();
     if (direction == 0) direction = 1;
     for (std::size_t distance = 1; distance <= reverse_capacity; ++distance) {
         if (direction > 0) {
             if (distance > current) break;
-            append_unique(resources_.source_desired, current - distance,
-                          source_capacity);
+            append_unique(resources_.gpu_texture_desired, current - distance,
+                          gpu_texture_capacity);
         } else {
             if (distance >= resources_.images.size() - current) break;
-            append_unique(resources_.source_desired, current + distance,
-                          source_capacity);
+            append_unique(resources_.gpu_texture_desired, current + distance,
+                          gpu_texture_capacity);
         }
     }
     for (const std::size_t frame : resources_.priority_order) {
         if (!resources_.images[frame].failed) {
-            append_unique(resources_.source_desired, frame, source_capacity);
+            append_unique(resources_.gpu_texture_desired, frame, gpu_texture_capacity);
         }
     }
 
-    // Every reserved SourceTexture must be backed by the upstream pipeline,
+    // Every reserved GPU Texture must be backed by the upstream pipeline,
     // including the configured reverse-direction set.  Put those frames ahead
-    // of speculative work so a direction change reorders SourceTexture,
+    // of speculative work so a direction change reorders GPU Texture,
     // staging, compressed I/O, and queued decodes as one pipeline operation.
     std::vector<std::size_t> upstream_order;
     upstream_order.reserve(resources_.priority_order.size());
-    for (const std::size_t frame : resources_.source_desired) {
+    for (const std::size_t frame : resources_.gpu_texture_desired) {
         append_unique(upstream_order, frame, resources_.images.size());
     }
     for (const std::size_t frame : resources_.priority_order) {
@@ -1524,7 +1524,7 @@ void App::ReconcileReservations() {
     const auto begin = measure ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
     if (!resources_.reservation_plan_dirty) {
-        for (const std::size_t frame : resources_.source_desired) {
+        for (const std::size_t frame : resources_.gpu_texture_desired) {
             if (resources_.images[frame].failed) {
                 resources_.reservation_plan_dirty = true;
                 break;
@@ -1541,10 +1541,10 @@ void App::ReconcileReservations() {
             frames.push_back(frame);
         }
     };
-    const std::vector<std::size_t>& source_desired = resources_.source_desired;
+    const std::vector<std::size_t>& gpu_texture_desired = resources_.gpu_texture_desired;
 
-    resources_.source_reservations.Reconcile(
-        source_desired,
+    resources_.gpu_texture_reservations.Reconcile(
+        gpu_texture_desired,
         [&](const ReservationId id, const std::size_t) {
             const GpuTextureSlotState state = resources_.slots->GpuTextureAt(id).state;
             return state == GpuTextureSlotState::Writable ||
@@ -1552,20 +1552,20 @@ void App::ReconcileReservations() {
         },
         [&](const ReservationId id, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
-            if (image.source_reservation == id) {
-                image.source_reservation = kInvalidReservation;
+            if (image.gpu_texture_reservation == id) {
+                image.gpu_texture_reservation = kInvalidReservation;
             }
-            GpuTextureSlot& source = resources_.slots->GpuTextureAt(id);
-            source.reserved_frame = kInvalidFrame;
-            source.state = GpuTextureSlotState::Writable;
+            GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(id);
+            gpu_texture.reserved_frame = kInvalidFrame;
+            gpu_texture.state = GpuTextureSlotState::Writable;
         },
         [&](const ReservationId id, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
-            image.source_reservation = id;
-            GpuTextureSlot& source = resources_.slots->GpuTextureAt(id);
-            source.reserved_frame = frame;
-            source.generation = image.generation;
-            source.state = source.content_frame == frame && source.resource.bitmap
+            image.gpu_texture_reservation = id;
+            GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(id);
+            gpu_texture.reserved_frame = frame;
+            gpu_texture.generation = image.generation;
+            gpu_texture.state = gpu_texture.content_frame == frame && gpu_texture.resource.bitmap
                                ? GpuTextureSlotState::Readable
                                : GpuTextureSlotState::Writable;
         },
@@ -1586,14 +1586,14 @@ void App::ReconcileReservations() {
         if (staging_desired.size() == resources_.staging_reservations.Capacity()) break;
         const ImageRecord& image = resources_.images[frame];
         if (image.failed) continue;
-        bool source_complete = false;
-        if (image.source_reservation != kInvalidReservation) {
-            const GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-                image.source_reservation);
-            source_complete = source.reserved_frame == frame &&
-                              source.state != GpuTextureSlotState::Writable;
+        bool gpu_texture_complete = false;
+        if (image.gpu_texture_reservation != kInvalidReservation) {
+            const GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+                image.gpu_texture_reservation);
+            gpu_texture_complete = gpu_texture.reserved_frame == frame &&
+                              gpu_texture.state != GpuTextureSlotState::Writable;
         }
-        if (!source_complete) append_unique(
+        if (!gpu_texture_complete) append_unique(
             staging_desired, frame, resources_.staging_reservations.Capacity());
     }
     resources_.staging_reservations.Reconcile(
@@ -2033,14 +2033,14 @@ void App::SubmitUploads() {
     for (const std::size_t index : PrioritizedCandidates(
              PipelineStage::DecodedStagingAvailable)) {
         ImageRecord& image = resources_.images[index];
-        if (!ReservationActive(resources_.source_reservations,
-                               image.source_reservation, index)) {
+        if (!ReservationActive(resources_.gpu_texture_reservations,
+                               image.gpu_texture_reservation, index)) {
             continue;
         }
-        GpuTextureSlot& source = resources_.slots->GpuTextureAt(
-            image.source_reservation);
-        if (source.state != GpuTextureSlotState::Writable ||
-            source.reserved_frame != index) {
+        GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(
+            image.gpu_texture_reservation);
+        if (gpu_texture.state != GpuTextureSlotState::Writable ||
+            gpu_texture.reserved_frame != index) {
             continue;
         }
         StagingSlot& staging_slot = resources_.slots->StagingAt(
@@ -2052,7 +2052,7 @@ void App::SubmitUploads() {
             image.failed = true;
             continue;
         }
-        const std::size_t old_bytes = source.resource.bytes;
+        const std::size_t old_bytes = gpu_texture.resource.bytes;
         const std::size_t retained_bytes = resources_.gpu_bytes >= old_bytes
                                                ? resources_.gpu_bytes - old_bytes
                                                : 0;
@@ -2062,12 +2062,12 @@ void App::SubmitUploads() {
         }
         UploadTicket ticket = graphics_.SubmitUpload(
             index, image.generation, image.staging_slot,
-            staging_slot.resource, source.resource);
-        ticket.source_texture_slot = image.source_reservation;
-        resources_.gpu_bytes = retained_bytes + source.resource.bytes;
+            staging_slot.resource, gpu_texture.resource);
+        ticket.gpu_texture_slot = image.gpu_texture_reservation;
+        resources_.gpu_bytes = retained_bytes + gpu_texture.resource.bytes;
         staging_slot.state = StagingSlotState::GpuCopySource;
-        source.content_frame = kInvalidFrame;
-        source.state = GpuTextureSlotState::Writing;
+        gpu_texture.content_frame = kInvalidFrame;
+        gpu_texture.state = GpuTextureSlotState::Writing;
         resources_.uploads.push_back(std::move(ticket));
         if (NavigationInputPending(window_)) break;
     }
@@ -2075,16 +2075,16 @@ void App::SubmitUploads() {
 }
 
 bool App::TryPresent() {
-    if (!resources_.frame_credit || resources_.reading_source_fence != 0) return false;
+    if (!resources_.frame_credit || resources_.reading_gpu_texture_fence != 0) return false;
     const auto next = resources_.navigation.NextIndex();
     if (next) {
         ImageRecord& image = resources_.images[*next];
-        if (!HasReadableSource(*next)) return false;
-        const SlotId source_id = image.source_reservation;
-        GpuTextureSlot& source = resources_.slots->GpuTextureAt(source_id);
-        resources_.reading_source_fence = graphics_.Draw(source.resource);
-        source.state = GpuTextureSlotState::Reading;
-        resources_.reading_source_slot = source_id;
+        if (!HasReadableGpuTexture(*next)) return false;
+        const SlotId gpu_texture_id = image.gpu_texture_reservation;
+        GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(gpu_texture_id);
+        resources_.reading_gpu_texture_fence = graphics_.Draw(gpu_texture.resource);
+        gpu_texture.state = GpuTextureSlotState::Reading;
+        resources_.reading_gpu_texture_slot = gpu_texture_id;
         ArmOldestFence();
         resources_.frame_credit = false;
         resources_.redraw_pending = false;
@@ -2130,12 +2130,12 @@ bool App::TryPresent() {
     if (resources_.redraw_pending) {
         const std::size_t current_index = resources_.navigation.CurrentIndex();
         ImageRecord& current = resources_.images[current_index];
-        if (HasReadableSource(current_index)) {
-            const SlotId source_id = current.source_reservation;
-            GpuTextureSlot& source = resources_.slots->GpuTextureAt(source_id);
-            resources_.reading_source_fence = graphics_.Draw(source.resource);
-            source.state = GpuTextureSlotState::Reading;
-            resources_.reading_source_slot = source_id;
+        if (HasReadableGpuTexture(current_index)) {
+            const SlotId gpu_texture_id = current.gpu_texture_reservation;
+            GpuTextureSlot& gpu_texture = resources_.slots->GpuTextureAt(gpu_texture_id);
+            resources_.reading_gpu_texture_fence = graphics_.Draw(gpu_texture.resource);
+            gpu_texture.state = GpuTextureSlotState::Reading;
+            resources_.reading_gpu_texture_slot = gpu_texture_id;
             ArmOldestFence();
             resources_.frame_credit = false;
             resources_.redraw_pending = false;
@@ -2156,7 +2156,7 @@ void App::ReleaseCompressed(ImageRecord& image) {
 }
 
 void App::ArmOldestFence() {
-    UINT64 value = resources_.reading_source_fence;
+    UINT64 value = resources_.reading_gpu_texture_fence;
     if (!resources_.uploads.empty() &&
         (value == 0 || resources_.uploads.front().fence_value < value)) {
         value = resources_.uploads.front().fence_value;

@@ -146,7 +146,7 @@ struct UploadTicket {
     std::uint64_t generation = 0;
     UINT64 fence_value = 0;
     SlotId staging_slot = kInvalidSlot;
-    SlotId source_texture_slot = kInvalidSlot;
+    SlotId gpu_texture_slot = kInvalidSlot;
     std::size_t bytes = 0;
 };
 

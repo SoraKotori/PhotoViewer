@@ -42,9 +42,9 @@
 | `--compressed-slot-count=` | 24 | 壓縮 PNG slot 數量上限 |
 | `--staging-cache-mib=` | 無限制 | 解碼 staging texture Slot Storage 記憶體上限 |
 | `--staging-slot-count=` | 20 | 解碼 staging texture slot 數量上限 |
-| `--gpu-cache-mib=` | 無限制 | GPU texture 記憶體上限 |
-| `--gpu-reverse-slot-count=` | 1 | 反方向的 GPU texture slots |
-| `--gpu-forward-slot-count=` | 5 | 目前方向的 GPU texture slots；包含目前畫面 |
+| `--gpu-cache-mib=` | 無限制 | GPU Texture 記憶體上限 |
+| `--gpu-reverse-slot-count=` | 1 | 反方向的 GPU Texture slots |
+| `--gpu-forward-slot-count=` | 5 | 目前方向的 GPU Texture slots；包含目前畫面 |
 
 ## 系統需求
 
@@ -65,7 +65,7 @@
 |---|---:|---:|---:|
 | 壓縮 PNG 資料 | 24 | 約 40 MiB | 約 960 MiB 系統記憶體 |
 | 解碼 staging texture | 20 | 約 126.56 MiB | 約 2531.25 MiB 系統記憶體 |
-| GPU texture | 6（1 reverse + 5 forward） | 約 126.56 MiB | 約 759.38 MiB VRAM |
+| GPU Texture | 6（1 reverse + 5 forward） | 約 126.56 MiB | 約 759.38 MiB VRAM |
 
 持續切換時的最低頻寬估算如下：
 

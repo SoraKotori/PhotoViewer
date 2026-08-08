@@ -260,11 +260,11 @@ public:
         return work_tokens_[id];
     }
     [[nodiscard]] GpuTextureSlot& GpuTextureAt(SlotId id) {
-        if (id >= gpu_texture_count_) throw std::out_of_range("GPU texture slot");
+        if (id >= gpu_texture_count_) throw std::out_of_range("GPU Texture slot");
         return gpu_textures_[id];
     }
     [[nodiscard]] const GpuTextureSlot& GpuTextureAt(SlotId id) const {
-        if (id >= gpu_texture_count_) throw std::out_of_range("GPU texture slot");
+        if (id >= gpu_texture_count_) throw std::out_of_range("GPU Texture slot");
         return gpu_textures_[id];
     }
 
