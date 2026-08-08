@@ -4,8 +4,10 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <numeric>
+#include <type_traits>
 
 namespace pv {
 namespace {
@@ -76,13 +78,90 @@ DWORD IoCompletionTransferred(const LPARAM completion) noexcept {
     return static_cast<DWORD>(static_cast<std::uint64_t>(completion));
 }
 
+DWORD IoRingResult(const HRESULT result) noexcept {
+    if (SUCCEEDED(result)) return ERROR_SUCCESS;
+    if (HRESULT_FACILITY(result) == FACILITY_WIN32) {
+        return HRESULT_CODE(result);
+    }
+    return ERROR_GEN_FAILURE;
+}
+
+std::uint64_t FileTimeTicks(const FILETIME time) noexcept {
+    ULARGE_INTEGER value{};
+    value.LowPart = time.dwLowDateTime;
+    value.HighPart = time.dwHighDateTime;
+    return value.QuadPart;
+}
+
+template <typename Function>
+Function LoadKernelFunction(const HMODULE module, const char* name) noexcept {
+    const FARPROC address = GetProcAddress(module, name);
+    Function function = nullptr;
+    static_assert(sizeof(function) == sizeof(address));
+    std::memcpy(&function, &address, sizeof(function));
+    return function;
+}
+
 }  // namespace
 
 App::App(Config config)
     : config_(std::move(config)) {
+    io_completion_port_ = CreateIoCompletionPort(
+        INVALID_HANDLE_VALUE, nullptr, 0, 1);
+    if (!io_completion_port_) ThrowLastError("CreateIoCompletionPort");
+    const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (kernelbase) {
+        io_ring_api_.query_capabilities = LoadKernelFunction<
+            decltype(io_ring_api_.query_capabilities)>(
+                kernelbase, "QueryIoRingCapabilities");
+        io_ring_api_.create = LoadKernelFunction<decltype(io_ring_api_.create)>(
+            kernelbase, "CreateIoRing");
+        io_ring_api_.submit = LoadKernelFunction<decltype(io_ring_api_.submit)>(
+            kernelbase, "SubmitIoRing");
+        io_ring_api_.close = LoadKernelFunction<decltype(io_ring_api_.close)>(
+            kernelbase, "CloseIoRing");
+        io_ring_api_.pop = LoadKernelFunction<decltype(io_ring_api_.pop)>(
+            kernelbase, "PopIoRingCompletion");
+        io_ring_api_.set_completion_event = LoadKernelFunction<
+            decltype(io_ring_api_.set_completion_event)>(
+                kernelbase, "SetIoRingCompletionEvent");
+        io_ring_api_.build_read = LoadKernelFunction<
+            decltype(io_ring_api_.build_read)>(kernelbase, "BuildIoRingReadFile");
+        io_ring_api_.build_register_buffers = LoadKernelFunction<
+            decltype(io_ring_api_.build_register_buffers)>(
+                kernelbase, "BuildIoRingRegisterBuffers");
+        const bool complete_api = io_ring_api_.query_capabilities &&
+            io_ring_api_.create && io_ring_api_.submit && io_ring_api_.close &&
+            io_ring_api_.pop && io_ring_api_.set_completion_event &&
+            io_ring_api_.build_read && io_ring_api_.build_register_buffers;
+        if (complete_api) {
+            IORING_CAPABILITIES capabilities{};
+            if (SUCCEEDED(io_ring_api_.query_capabilities(&capabilities))) {
+                const UINT32 requested = static_cast<UINT32>(std::min<std::size_t>(
+                    std::numeric_limits<UINT32>::max(),
+                    config_.compressed_slot_count * 2 + 8));
+                const UINT32 queue_size = std::min(
+                    requested, capabilities.MaxSubmissionQueueSize);
+                IORING_CREATE_FLAGS flags{};
+                if (queue_size != 0 && SUCCEEDED(io_ring_api_.create(
+                        capabilities.MaxVersion, flags, queue_size,
+                        std::min(queue_size, capabilities.MaxCompletionQueueSize),
+                        &io_ring_))) {
+                    io_ring_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (!io_ring_event_ || FAILED(io_ring_api_.set_completion_event(
+                            io_ring_, io_ring_event_))) {
+                        if (io_ring_event_) CloseHandle(io_ring_event_);
+                        io_ring_event_ = nullptr;
+                        io_ring_api_.close(io_ring_);
+                        io_ring_ = nullptr;
+                    }
+                }
+            }
+        }
+    }
     resources_.slots.emplace(
         config_.compressed_slot_count, config_.staging_slot_count,
-        config_.gpu_texture_slot_count, config_.compressed_budget_bytes,
+        config_.GpuSlotCount(), config_.compressed_budget_bytes,
         config_.staging_cache_bytes);
 }
 
@@ -97,6 +176,14 @@ App::~App() {
         }
     }
     CancelAllIo();
+    if (io_ring_event_) {
+        CloseHandle(io_ring_event_);
+        io_ring_event_ = nullptr;
+    }
+    if (io_completion_port_) {
+        CloseHandle(io_completion_port_);
+        io_completion_port_ = nullptr;
+    }
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
@@ -161,26 +248,77 @@ void App::InitializeWindow(const HINSTANCE instance, const int show_command) {
 }
 
 void App::ProcessStartupIoCompletion() {
-    MSG pending{};
-    if (PeekMessageW(&pending, window_, kMessageIoHeaderReady,
-                     kMessageIoHeaderReady, PM_REMOVE)) {
-        OnIoHeaderReady(reinterpret_cast<IoRequest*>(pending.wParam),
-                        pending.lParam);
+    DrainIoCompletions();
+}
+
+bool App::TryInitializeIoRing() {
+    if (!io_ring_ || io_ring_buffers_registered_) {
+        return io_ring_ && io_ring_buffers_registered_;
     }
-    if (!PeekMessageW(&pending, window_, kMessageIoComplete,
-                      kMessageIoComplete, PM_REMOVE)) {
-        return;
+    if (resources_.compressed_reservations.Capacity() == 0) return false;
+    for (const ImageRecord& image : resources_.images) {
+        if (image.io) return false;
     }
-    OnIoComplete(reinterpret_cast<IoRequest*>(pending.wParam), pending.lParam);
+    std::size_t largest = 0;
+    for (const CatalogItem& item : resources_.catalog.items) {
+        if (!item.file_size_known || item.file_bytes == 0 ||
+            item.file_bytes > std::numeric_limits<DWORD>::max()) {
+            return false;
+        }
+        largest = std::max(largest, static_cast<std::size_t>(item.file_bytes));
+    }
+    constexpr std::size_t registration_alignment = 64 * 1024;
+    if (largest > std::numeric_limits<DWORD>::max() -
+                      (registration_alignment - 1)) {
+        return false;
+    }
+    const std::size_t registered_bytes =
+        ((largest + registration_alignment - 1) / registration_alignment) *
+        registration_alignment;
+    // Register every physical compressed slot.  Restricting registration to
+    // the current reservation capacity would let a previously allocated but
+    // unregistered free slot win the best-fit search after a catalog merge.
+    const std::size_t count = resources_.slots->CompressedCount();
+    if (!resources_.slots->PreallocateCompressed(count, registered_bytes)) {
+        return false;
+    }
+    std::vector<IORING_BUFFER_INFO> buffers;
+    buffers.reserve(count);
+    io_ring_buffer_slots_.clear();
+    io_ring_buffer_slots_.reserve(count);
+    for (SlotId id = 0; id < count; ++id) {
+        const CompressedBuffer& buffer = resources_.slots->Compressed(id).resource;
+        if (!buffer.data || buffer.allocation_size >
+                                std::numeric_limits<UINT32>::max()) {
+            io_ring_buffer_slots_.clear();
+            return false;
+        }
+        buffers.push_back(IORING_BUFFER_INFO{
+            buffer.data, static_cast<UINT32>(buffer.allocation_size)});
+        io_ring_buffer_slots_.push_back(id);
+    }
+    constexpr UINT_PTR registration_user_data = 1;
+    HRESULT result = io_ring_api_.build_register_buffers(
+        io_ring_, static_cast<UINT32>(buffers.size()), buffers.data(),
+        registration_user_data);
+    if (SUCCEEDED(result)) {
+        result = io_ring_api_.submit(io_ring_, 1, INFINITE, nullptr);
+    }
+    IORING_CQE completion{};
+    if (SUCCEEDED(result)) result = io_ring_api_.pop(io_ring_, &completion);
+    if (FAILED(result) || completion.UserData != registration_user_data ||
+        FAILED(completion.ResultCode)) {
+        io_ring_buffer_slots_.clear();
+        io_ring_api_.close(io_ring_);
+        io_ring_ = nullptr;
+        return false;
+    }
+    io_ring_buffers_registered_ = true;
+    return true;
 }
 
 void App::ProcessStartupCatalogCompletion() {
-    MSG pending{};
-    if (!PeekMessageW(&pending, window_, kMessageCatalogComplete,
-                      kMessageCatalogComplete, PM_REMOVE)) {
-        return;
-    }
-    OnCatalogComplete();
+    DrainIoCompletions();
 }
 
 LRESULT CALLBACK App::WindowProcedure(const HWND window, const UINT message,
@@ -218,15 +356,6 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
             if (wparam == VK_LEFT) OnDirectionReleased(-1);
             else if (wparam == VK_RIGHT) OnDirectionReleased(1);
             return 0;
-        case kMessageIoComplete:
-            OnIoComplete(reinterpret_cast<IoRequest*>(wparam), lparam);
-            return 0;
-        case kMessageIoHeaderReady:
-            OnIoHeaderReady(reinterpret_cast<IoRequest*>(wparam), lparam);
-            return 0;
-        case kMessageCatalogComplete:
-            OnCatalogComplete();
-            return 0;
         case kMessageWorkerComplete:
             OnWorkerComplete();
             return 0;
@@ -255,6 +384,8 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
                 InjectValidationNavigation();
             } else if (wparam == 3 && config_.validation_fullscreen) {
                 OnFullscreenValidationTimer();
+            } else if (wparam == 4 && validation_navigation_timer_active_) {
+                InjectValidationNavigationStep();
             }
             return 0;
         case WM_ERASEBKGND:
@@ -263,6 +394,7 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
             KillTimer(window_, 1);
             KillTimer(window_, 2);
             KillTimer(window_, 3);
+            KillTimer(window_, 4);
             StopValidationNavigationTimer();
             running_ = false;
             PostQuitMessage(exit_code_);
@@ -275,9 +407,15 @@ LRESULT App::HandleWindowMessage(const UINT message, const WPARAM wparam,
 int App::EventLoop() {
     int exit_code = 0;
     while (running_) {
-        HANDLE handles[2]{};
-        enum class Kind { Frame, Fence } kinds[2]{};
+        HANDLE handles[4]{};
+        enum class Kind { Frame, Fence, Io } kinds[4]{};
         DWORD count = 0;
+        handles[count] = io_completion_port_;
+        kinds[count++] = Kind::Io;
+        if (io_ring_event_) {
+            handles[count] = io_ring_event_;
+            kinds[count++] = Kind::Io;
+        }
         if (!resources_.frame_credit && graphics_.FrameWaitableObject()) {
             handles[count] = graphics_.FrameWaitableObject();
             kinds[count++] = Kind::Frame;
@@ -293,7 +431,8 @@ int App::EventLoop() {
         if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count) {
             const DWORD index = result - WAIT_OBJECT_0;
             if (kinds[index] == Kind::Frame) OnFrameCredit();
-            else OnGpuComplete();
+            else if (kinds[index] == Kind::Fence) OnGpuComplete();
+            else DrainIoCompletions();
         }
 
         MSG message{};
@@ -336,7 +475,7 @@ void App::OpenInitialImage() {
     PumpPipeline();
     if (asynchronous_catalog) {
         catalog_loading_ = true;
-        catalog_io_.emplace(config_.initial_image, window_);
+        catalog_io_.emplace(config_.initial_image, io_completion_port_);
     }
 }
 
@@ -349,12 +488,14 @@ void App::OnDirection(const int direction, const bool repeat,
     } else {
         resources_.navigation.Step(direction, repeat, repeat_count);
     }
+    resources_.reservation_plan_dirty = true;
     PumpPipeline();
 }
 
 void App::OnDirectionReleased(const int direction) {
     if (resources_.images.empty()) return;
     resources_.navigation.Release(direction);
+    resources_.reservation_plan_dirty = true;
     PumpPipeline();
 }
 
@@ -400,26 +541,48 @@ void App::OnCatalogComplete() {
     PumpPipeline();
 }
 
-void CALLBACK App::IoCompletion(PTP_CALLBACK_INSTANCE, void* context,
-                                void* overlapped,
-                                const ULONG io_result,
-                                const ULONG_PTR transferred,
-                                PTP_IO) {
-    auto* request = static_cast<IoRequest*>(context);
-    const LPARAM completion = PackIoCompletion(io_result, transferred);
-    if (overlapped == &request->header_overlapped) {
-        PostMessageW(request->window, kMessageIoHeaderReady,
-                     reinterpret_cast<WPARAM>(request), completion);
-        return;
+void App::DrainIoCompletions() {
+    bool drained = false;
+    if (io_ring_) {
+        IORING_CQE completion{};
+        while (io_ring_api_.pop(io_ring_, &completion) == S_OK) {
+            drained = true;
+            constexpr UINT_PTR tag_mask = 3;
+            const UINT_PTR tag = completion.UserData & tag_mask;
+            auto* request = reinterpret_cast<IoRequest*>(
+                completion.UserData & ~tag_mask);
+            const LPARAM packed = PackIoCompletion(
+                IoRingResult(completion.ResultCode), completion.Information);
+            if (tag == 1) OnIoHeaderReady(request, packed);
+            else if (tag == 2) OnIoComplete(request, packed);
+        }
     }
-    PostMessageW(request->window, kMessageIoComplete,
-                 reinterpret_cast<WPARAM>(request), completion);
-}
-
-void CALLBACK App::ValidationTimerCallback(PTP_CALLBACK_INSTANCE, void* context,
-                                           PTP_TIMER) {
-    auto* app = static_cast<App*>(context);
-    PostMessageW(app->window_, kMessageValidationStep, 0, 0);
+    for (;;) {
+        DWORD transferred = 0;
+        ULONG_PTR key = 0;
+        OVERLAPPED* overlapped = nullptr;
+        const BOOL success = GetQueuedCompletionStatus(
+            io_completion_port_, &transferred, &key, &overlapped, 0);
+        if (!overlapped) {
+            if (!success && GetLastError() == WAIT_TIMEOUT) break;
+            if (!success) ThrowLastError("GetQueuedCompletionStatus");
+            continue;
+        }
+        drained = true;
+        if (key == kCatalogIoCompletionKey) {
+            OnCatalogComplete();
+            continue;
+        }
+        auto* request = reinterpret_cast<IoRequest*>(key);
+        const DWORD result = success ? ERROR_SUCCESS : GetLastError();
+        const LPARAM completion = PackIoCompletion(result, transferred);
+        if (overlapped == &request->header_overlapped) {
+            OnIoHeaderReady(request, completion);
+        } else {
+            OnIoComplete(request, completion);
+        }
+    }
+    if (drained && !catalog_loading_) PumpPipeline();
 }
 
 void App::OnIoHeaderReady(IoRequest* request,
@@ -456,41 +619,29 @@ void App::OnIoHeaderReady(IoRequest* request,
             }
         } else {
             CompleteIoRequest(request);
-            PumpPipeline();
         }
     }
 }
 
 void App::OnIoComplete(IoRequest* request, LPARAM completion) {
-    for (;;) {
-        if (request && request->index < resources_.images.size()) {
-            ImageRecord& image = resources_.images[request->index];
-            if (image.io == request && !request->content_completed) {
-                request->result = IoCompletionResult(completion);
-                request->transferred = IoCompletionTransferred(completion);
-                request->content_completed = true;
-                if (!request->split_header || request->header_completed) {
-                    if (catalog_loading_) {
-                        if (std::ranges::find(deferred_catalog_io_, request) ==
-                            deferred_catalog_io_.end()) {
-                            deferred_catalog_io_.push_back(request);
-                        }
-                    } else {
-                        CompleteIoRequest(request);
+    if (request && request->index < resources_.images.size()) {
+        ImageRecord& image = resources_.images[request->index];
+        if (image.io == request && !request->content_completed) {
+            request->result = IoCompletionResult(completion);
+            request->transferred = IoCompletionTransferred(completion);
+            request->content_completed = true;
+            if (!request->split_header || request->header_completed) {
+                if (catalog_loading_) {
+                    if (std::ranges::find(deferred_catalog_io_, request) ==
+                        deferred_catalog_io_.end()) {
+                        deferred_catalog_io_.push_back(request);
                     }
+                } else {
+                    CompleteIoRequest(request);
                 }
             }
         }
-        MSG pending{};
-        if (!PeekMessageW(&pending, nullptr, 0, 0, PM_NOREMOVE) ||
-            pending.hwnd != window_ || pending.message != kMessageIoComplete) {
-            break;
-        }
-        PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE);
-        request = reinterpret_cast<IoRequest*>(pending.wParam);
-        completion = pending.lParam;
     }
-    if (!catalog_loading_) PumpPipeline();
 }
 
 void App::CompleteIoRequest(IoRequest* const request) {
@@ -498,12 +649,6 @@ void App::CompleteIoRequest(IoRequest* const request) {
     ImageRecord& image = resources_.images[request->index];
     if (!image.io || image.io != request) return;
 
-    // The file operation has already completed and Main Thread owns all result
-    // state.  Join only the callback's PostMessage epilogue before destroying
-    // its registration; this never waits for storage I/O.
-    WaitForThreadpoolIoCallbacks(request->threadpool_io, FALSE);
-    CloseThreadpoolIo(request->threadpool_io);
-    request->threadpool_io = nullptr;
     CloseHandle(request->file);
     request->file = INVALID_HANDLE_VALUE;
 
@@ -768,6 +913,30 @@ void App::InjectValidationNavigation() {
     validation_navigation_started_ = std::chrono::steady_clock::now();
     validation_navigation_injection_finished_ = {};
     WriteValidationReport("warmup-complete", true);
+    validation_pump_count_ = 0;
+    validation_pump_nanoseconds_ = 0;
+    validation_plan_count_ = 0;
+    validation_plan_nanoseconds_ = 0;
+    validation_reconcile_count_ = 0;
+    validation_reconcile_nanoseconds_ = 0;
+    validation_dispatch_nanoseconds_ = 0;
+    validation_submit_reads_nanoseconds_ = 0;
+    validation_acquire_compressed_nanoseconds_ = 0;
+    validation_open_file_nanoseconds_ = 0;
+    validation_associate_iocp_nanoseconds_ = 0;
+    validation_read_file_nanoseconds_ = 0;
+    validation_read_file_synchronous_count_ = 0;
+    validation_read_file_pending_count_ = 0;
+    validation_submit_uploads_nanoseconds_ = 0;
+    validation_try_present_nanoseconds_ = 0;
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        validation_main_kernel_started_ = FileTimeTicks(kernel);
+        validation_main_user_started_ = FileTimeTicks(user);
+    }
     decoders_->ResetMetrics();
     graphics_.ResetMetrics();
     if (config_.validation_navigation_interval_ms == 0) {
@@ -783,23 +952,18 @@ void App::InjectValidationNavigation() {
             resources_.navigation.Release(direction);
             ++validation_navigation_cursor_;
         }
+        resources_.reservation_plan_dirty = true;
         validation_navigation_injection_finished_ = std::chrono::steady_clock::now();
         PumpPipeline();
         return;
     }
     InjectValidationNavigationStep();
     if (validation_navigation_cursor_ < config_.validation_navigation.size()) {
-        validation_navigation_timer_ = CreateThreadpoolTimer(
-            &App::ValidationTimerCallback, this, nullptr);
-        if (!validation_navigation_timer_) {
-            ThrowLastError("CreateThreadpoolTimer validation navigation");
+        if (SetTimer(window_, 4, config_.validation_navigation_interval_ms,
+                     nullptr) == 0) {
+            ThrowLastError("SetTimer validation navigation");
         }
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<LONGLONG>(
-            config_.validation_navigation_interval_ms) * 10'000LL;
-        SetThreadpoolTimer(validation_navigation_timer_,
-                           reinterpret_cast<FILETIME*>(&due),
-                           config_.validation_navigation_interval_ms, 0);
+        validation_navigation_timer_active_ = true;
     }
 }
 
@@ -822,6 +986,7 @@ void App::InjectValidationNavigationStep() {
     } else {
         resources_.navigation.Step(direction, validation_navigation_cursor_ != 0);
     }
+    resources_.reservation_plan_dirty = true;
     ++validation_navigation_cursor_;
     if (validation_navigation_cursor_ >= config_.validation_navigation.size()) {
         validation_navigation_injection_finished_ = std::chrono::steady_clock::now();
@@ -837,11 +1002,9 @@ void App::InjectValidationNavigationStep() {
 }
 
 void App::StopValidationNavigationTimer() {
-    if (!validation_navigation_timer_) return;
-    SetThreadpoolTimer(validation_navigation_timer_, nullptr, 0, 0);
-    WaitForThreadpoolTimerCallbacks(validation_navigation_timer_, TRUE);
-    CloseThreadpoolTimer(validation_navigation_timer_);
-    validation_navigation_timer_ = nullptr;
+    if (!validation_navigation_timer_active_) return;
+    KillTimer(window_, 4);
+    validation_navigation_timer_active_ = false;
 }
 
 void App::RecordValidationPresentation(const std::size_t index) {
@@ -924,6 +1087,15 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     write_indices("Uploading_indices", PipelineStage::Uploading);
     write_indices("PresentationTextureAvailable_indices",
                   PipelineStage::PresentationTextureAvailable);
+    output << "ActiveReadableSource_indices=";
+    bool first_readable_source = true;
+    for (std::size_t index = 0; index < resources_.images.size(); ++index) {
+        if (!HasReadableSource(index)) continue;
+        if (!first_readable_source) output << ',';
+        output << index;
+        first_readable_source = false;
+    }
+    output << '\n';
     const auto retiring_count = [](const ReservationTable& table) {
         std::size_t count = 0;
         for (ReservationId id = 0; id < table.Capacity(); ++id) {
@@ -948,6 +1120,12 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
            << "source_reservations="
            << resources_.source_reservations.AssignedCount() << '/'
            << resources_.source_reservations.Capacity() << '\n'
+           << "compressed_retiring_reservations="
+           << retiring_count(resources_.compressed_reservations) << '\n'
+           << "staging_retiring_reservations="
+           << retiring_count(resources_.staging_reservations) << '\n'
+           << "source_retiring_reservations="
+           << retiring_count(resources_.source_reservations) << '\n'
            << "retiring_reservations="
            << retiring_count(resources_.compressed_reservations) +
                   retiring_count(resources_.staging_reservations) +
@@ -1003,6 +1181,12 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
         output << 0;
     }
     const auto report_time = std::chrono::steady_clock::now();
+    FILETIME main_created{};
+    FILETIME main_exited{};
+    FILETIME main_kernel{};
+    FILETIME main_user{};
+    const bool have_main_times = GetThreadTimes(
+        GetCurrentThread(), &main_created, &main_exited, &main_kernel, &main_user);
     output << '\n' << "navigation_completion_nanoseconds=";
     if (validation_navigation_started_ != std::chrono::steady_clock::time_point{}) {
         output << std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1023,6 +1207,43 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
     output << '\n'
            << "decode_count=" << decoders_->DecodeCount() << '\n'
            << "decode_nanoseconds=" << decoders_->DecodeNanoseconds() << '\n'
+           << "pipeline_pump_count=" << validation_pump_count_ << '\n'
+           << "pipeline_pump_nanoseconds=" << validation_pump_nanoseconds_ << '\n'
+           << "reservation_plan_count=" << validation_plan_count_ << '\n'
+           << "reservation_plan_nanoseconds=" << validation_plan_nanoseconds_ << '\n'
+           << "reservation_reconcile_count=" << validation_reconcile_count_ << '\n'
+           << "reservation_reconcile_nanoseconds="
+           << validation_reconcile_nanoseconds_ << '\n'
+           << "dispatch_decode_nanoseconds="
+           << validation_dispatch_nanoseconds_ << '\n'
+           << "submit_reads_nanoseconds="
+           << validation_submit_reads_nanoseconds_ << '\n'
+           << "acquire_compressed_nanoseconds="
+           << validation_acquire_compressed_nanoseconds_ << '\n'
+           << "open_file_nanoseconds="
+           << validation_open_file_nanoseconds_ << '\n'
+           << "associate_iocp_nanoseconds="
+           << validation_associate_iocp_nanoseconds_ << '\n'
+           << "read_file_nanoseconds="
+           << validation_read_file_nanoseconds_ << '\n'
+           << "read_file_synchronous_count="
+           << validation_read_file_synchronous_count_ << '\n'
+           << "read_file_pending_count="
+           << validation_read_file_pending_count_ << '\n'
+           << "submit_uploads_nanoseconds="
+           << validation_submit_uploads_nanoseconds_ << '\n'
+           << "try_present_nanoseconds="
+           << validation_try_present_nanoseconds_ << '\n'
+           << "main_thread_kernel_nanoseconds="
+           << (have_main_times
+                   ? (FileTimeTicks(main_kernel) - validation_main_kernel_started_) * 100ULL
+                   : 0ULL)
+           << '\n'
+           << "main_thread_user_nanoseconds="
+           << (have_main_times
+                   ? (FileTimeTicks(main_user) - validation_main_user_started_) * 100ULL
+                   : 0ULL)
+           << '\n'
            << "selected_cpu_set_count=" << decoders_->SelectedCpuSetCount() << '\n'
            << "unthrottled_worker_count=" << decoders_->UnthrottledWorkerCount() << '\n'
            << "elevated_worker_count=" << decoders_->ElevatedWorkerCount() << '\n'
@@ -1034,12 +1255,41 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
 
 void App::PumpPipeline() {
     if (resources_.images.empty()) return;
+    const bool measure = validation_navigation_started_ !=
+                         std::chrono::steady_clock::time_point{};
+    const auto begin = measure ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    const auto measured = [&](auto&& operation, std::uint64_t& nanoseconds) {
+        if (!measure) return operation();
+        const auto operation_begin = std::chrono::steady_clock::now();
+        if constexpr (std::is_void_v<std::invoke_result_t<decltype(operation)>>) {
+            operation();
+            nanoseconds += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - operation_begin).count());
+        } else {
+            auto result = operation();
+            nanoseconds += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - operation_begin).count());
+            return result;
+        }
+    };
     for (int pass = 0; pass < 3; ++pass) {
         ReconcileReservations();
-        DispatchDecodes();
-        SubmitReads();
-        SubmitUploads();
-        if (!TryPresent()) break;
+        measured([&] { DispatchDecodes(); }, validation_dispatch_nanoseconds_);
+        measured([&] { SubmitReads(); }, validation_submit_reads_nanoseconds_);
+        measured([&] { SubmitUploads(); }, validation_submit_uploads_nanoseconds_);
+        if (!measured([&] { return TryPresent(); },
+                      validation_try_present_nanoseconds_)) {
+            break;
+        }
+    }
+    if (measure) {
+        ++validation_pump_count_;
+        validation_pump_nanoseconds_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
     }
 }
 
@@ -1125,12 +1375,15 @@ void App::InitializeReservations() {
         config_.staging_slot_count, config_.staging_cache_bytes,
         staging_8k_bytes);
     const std::size_t source_capacity = fixed_capacity(
-        config_.gpu_texture_slot_count, config_.gpu_cache_bytes,
+        config_.GpuSlotCount(), config_.gpu_cache_bytes,
         decoded_8k_bytes);
 
     resources_.compressed_reservations.Reset(compressed_capacity);
     resources_.staging_reservations.Reset(staging_capacity);
     resources_.source_reservations.Reset(source_capacity);
+    resources_.priority_order.clear();
+    resources_.source_desired.clear();
+    resources_.reservation_plan_dirty = true;
     for (SlotId id = 0; id < source_capacity; ++id) {
         if (!resources_.slots->ActivateGpuTexture(id)) {
             throw std::logic_error("failed to activate SourceTexture slot");
@@ -1190,7 +1443,11 @@ bool App::CancelQueuedDecode(const std::size_t frame) {
     return true;
 }
 
-void App::ReconcileReservations() {
+void App::RebuildReservationPlan() {
+    const bool measure = validation_navigation_started_ !=
+                         std::chrono::steady_clock::time_point{};
+    const auto begin = measure ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     resources_.priority_order = resources_.navigation.PlannedOrder(
         resources_.images.size());
 
@@ -1203,33 +1460,88 @@ void App::ReconcileReservations() {
         }
     };
 
-    std::vector<std::size_t> source_desired;
+    resources_.source_desired.clear();
     const std::size_t source_capacity = resources_.source_reservations.Capacity();
-    source_desired.reserve(source_capacity);
-    const std::size_t forward_capacity = source_capacity > 2
-                                             ? source_capacity - 2
-                                             : source_capacity;
+    resources_.source_desired.reserve(source_capacity);
+    const std::size_t forward_capacity = std::min(
+        config_.gpu_forward_slot_count, source_capacity);
+    const std::size_t current = resources_.navigation.CurrentIndex();
+    append_unique(resources_.source_desired, current, source_capacity);
     for (const std::size_t frame : resources_.priority_order) {
-        if (source_desired.size() >= forward_capacity) break;
+        if (resources_.source_desired.size() >= forward_capacity) break;
         if (!resources_.images[frame].failed) {
-            append_unique(source_desired, frame, source_capacity);
+            append_unique(resources_.source_desired, frame, source_capacity);
         }
     }
-    const std::size_t current = resources_.navigation.CurrentIndex();
-    append_unique(source_desired, current, source_capacity);
+    const std::size_t reverse_capacity = std::min(
+        config_.gpu_reverse_slot_count,
+        source_capacity - resources_.source_desired.size());
     int direction = resources_.navigation.PreferredDirection();
     if (direction == 0) direction = 1;
-    if ((direction > 0 && current > 0) ||
-        (direction < 0 && current + 1 < resources_.images.size())) {
-        append_unique(source_desired,
-                      direction > 0 ? current - 1 : current + 1,
-                      source_capacity);
+    for (std::size_t distance = 1; distance <= reverse_capacity; ++distance) {
+        if (direction > 0) {
+            if (distance > current) break;
+            append_unique(resources_.source_desired, current - distance,
+                          source_capacity);
+        } else {
+            if (distance >= resources_.images.size() - current) break;
+            append_unique(resources_.source_desired, current + distance,
+                          source_capacity);
+        }
     }
     for (const std::size_t frame : resources_.priority_order) {
         if (!resources_.images[frame].failed) {
-            append_unique(source_desired, frame, source_capacity);
+            append_unique(resources_.source_desired, frame, source_capacity);
         }
     }
+
+    // Every reserved SourceTexture must be backed by the upstream pipeline,
+    // including the configured reverse-direction set.  Put those frames ahead
+    // of speculative work so a direction change reorders SourceTexture,
+    // staging, compressed I/O, and queued decodes as one pipeline operation.
+    std::vector<std::size_t> upstream_order;
+    upstream_order.reserve(resources_.priority_order.size());
+    for (const std::size_t frame : resources_.source_desired) {
+        append_unique(upstream_order, frame, resources_.images.size());
+    }
+    for (const std::size_t frame : resources_.priority_order) {
+        append_unique(upstream_order, frame, resources_.images.size());
+    }
+    resources_.priority_order = std::move(upstream_order);
+    work_queue_.Reorder(resources_.priority_order);
+    resources_.reservation_plan_dirty = false;
+    if (measure) {
+        ++validation_plan_count_;
+        validation_plan_nanoseconds_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+    }
+}
+
+void App::ReconcileReservations() {
+    const bool measure = validation_navigation_started_ !=
+                         std::chrono::steady_clock::time_point{};
+    const auto begin = measure ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    if (!resources_.reservation_plan_dirty) {
+        for (const std::size_t frame : resources_.source_desired) {
+            if (resources_.images[frame].failed) {
+                resources_.reservation_plan_dirty = true;
+                break;
+            }
+        }
+    }
+    if (resources_.reservation_plan_dirty) RebuildReservationPlan();
+
+    const auto append_unique = [](std::vector<std::size_t>& frames,
+                                  const std::size_t frame,
+                                  const std::size_t capacity) {
+        if (frames.size() < capacity &&
+            std::find(frames.begin(), frames.end(), frame) == frames.end()) {
+            frames.push_back(frame);
+        }
+    };
+    const std::vector<std::size_t>& source_desired = resources_.source_desired;
 
     resources_.source_reservations.Reconcile(
         source_desired,
@@ -1344,7 +1656,11 @@ void App::ReconcileReservations() {
         [&](const ReservationId, const std::size_t frame) {
             ImageRecord& image = resources_.images[frame];
             if (image.io) {
-                CancelIoEx(image.io->file, nullptr);
+                // A submitted kernel I/O owns the compressed slot until its
+                // completion packet arrives.  Mark the reservation retiring,
+                // but do not cancel and resubmit the same pages when direction
+                // input oscillates.  If the frame becomes wanted again before
+                // completion, Reconcile clears retiring and the result is kept.
                 resources_.slots->Compressed(image.compressed_slot).state =
                     CompressedSlotState::CancellationPending;
                 return false;
@@ -1367,7 +1683,12 @@ void App::ReconcileReservations() {
             image.failed = item.file_size_known && item.file_bytes == 0;
         },
         ReservationTable::FirstFree);
-    work_queue_.Reorder(resources_.priority_order);
+    if (measure) {
+        ++validation_reconcile_count_;
+        validation_reconcile_nanoseconds_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+    }
 }
 
 std::vector<std::size_t> App::PrioritizedCandidates(
@@ -1413,25 +1734,55 @@ void App::PrepareStagingForImage(const std::size_t index) {
 }
 
 void App::SubmitReads() {
+    const bool measure = validation_navigation_started_ !=
+                         std::chrono::steady_clock::time_point{};
+    const auto measured = [&](auto&& operation, std::uint64_t& nanoseconds) {
+        if (!measure) return operation();
+        const auto begin = std::chrono::steady_clock::now();
+        auto result = operation();
+        nanoseconds += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        return result;
+    };
+    if (io_ring_ && !io_ring_buffers_registered_) {
+        bool active = false;
+        for (const ImageRecord& image : resources_.images) {
+            active = active || image.io != nullptr;
+        }
+        if (active) return;
+        if (!TryInitializeIoRing() && io_ring_) {
+            io_ring_api_.close(io_ring_);
+            io_ring_ = nullptr;
+        }
+    }
+    const bool use_io_ring = io_ring_ && io_ring_buffers_registered_;
+    UINT32 io_ring_entries = 0;
     for (const std::size_t index : PrioritizedCandidates(PipelineStage::WaitingIo)) {
         ImageRecord& image = resources_.images[index];
         CatalogItem& item = resources_.catalog.items[index];
-        HANDLE opened_file = INVALID_HANDLE_VALUE;
+        HANDLE opened_file = measured(
+            [&] {
+                return CreateFileW(
+                    item.path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+                    nullptr);
+            },
+            validation_open_file_nanoseconds_);
+        if (opened_file == INVALID_HANDLE_VALUE) {
+            image.failed = true;
+            continue;
+        }
         if (!item.file_size_known) {
-            opened_file = CreateFileW(
-                item.path.c_str(), GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr, OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
-                    FILE_FLAG_SEQUENTIAL_SCAN,
-                nullptr);
             LARGE_INTEGER file_size{};
-            if (opened_file == INVALID_HANDLE_VALUE ||
-                !GetFileSizeEx(opened_file, &file_size) ||
+            if (!GetFileSizeEx(opened_file, &file_size) ||
                 file_size.QuadPart <= 0 ||
                 static_cast<unsigned long long>(file_size.QuadPart) >
                     std::numeric_limits<DWORD>::max()) {
-                if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+                CloseHandle(opened_file);
                 image.failed = true;
                 continue;
             }
@@ -1440,25 +1791,41 @@ void App::SubmitReads() {
         }
         if (item.file_bytes <= 24 ||
             item.file_bytes > std::numeric_limits<DWORD>::max()) {
-            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+            CloseHandle(opened_file);
             image.failed = true;
             continue;
         }
         const std::size_t compressed = static_cast<std::size_t>(item.file_bytes);
         if (compressed > config_.compressed_budget_bytes) {
-            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+            CloseHandle(opened_file);
             image.failed = true;
             continue;
         }
         if (resources_.compressed_bytes >
                 config_.compressed_budget_bytes - compressed) {
-            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+            CloseHandle(opened_file);
             continue;
         }
-        const SlotId compressed_slot = resources_.slots->AcquireCompressed(
-            compressed, index, image.generation);
+        if (io_prefix_granularity_ == 0) {
+            io_prefix_granularity_ = QueryIoPrefixGranularity(opened_file);
+        }
+        const std::size_t granularity = io_prefix_granularity_;
+        if (granularity == 0 ||
+            compressed > std::numeric_limits<DWORD>::max() - (granularity - 1)) {
+            CloseHandle(opened_file);
+            image.failed = true;
+            continue;
+        }
+        const std::size_t transfer_bytes =
+            ((compressed + granularity - 1) / granularity) * granularity;
+        const SlotId compressed_slot = measured(
+            [&] {
+                return resources_.slots->AcquireCompressed(
+                    transfer_bytes, index, image.generation);
+            },
+            validation_acquire_compressed_nanoseconds_);
         if (compressed_slot == kInvalidSlot) {
-            if (opened_file != INVALID_HANDLE_VALUE) CloseHandle(opened_file);
+            CloseHandle(opened_file);
             continue;
         }
         image.compressed_slot = compressed_slot;
@@ -1470,64 +1837,104 @@ void App::SubmitReads() {
         request.index = index;
         request.generation = image.generation;
         request.compressed_slot = compressed_slot;
-        request.file = opened_file != INVALID_HANDLE_VALUE
-                           ? opened_file
-                           : CreateFileW(
-                                 item.path.c_str(), GENERIC_READ,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                     FILE_SHARE_DELETE,
-                                 nullptr, OPEN_EXISTING,
-                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
-                                     FILE_FLAG_SEQUENTIAL_SCAN,
-                                 nullptr);
-        if (request.file == INVALID_HANDLE_VALUE) {
-            resources_.slots->ReleaseCompressed(compressed_slot);
-            image.compressed_slot = kInvalidSlot;
-            image.failed = true;
-            continue;
-        }
-        request.threadpool_io = CreateThreadpoolIo(
-            request.file, &App::IoCompletion, &request, nullptr);
-        if (!request.threadpool_io) {
-            CloseHandle(request.file);
-            request.file = INVALID_HANDLE_VALUE;
-            resources_.slots->ReleaseCompressed(compressed_slot);
-            image.compressed_slot = kInvalidSlot;
-            image.failed = true;
-            continue;
+        request.file = opened_file;
+        UINT32 registered_buffer = 0;
+        if (use_io_ring) {
+            const auto found = std::find(io_ring_buffer_slots_.begin(),
+                                         io_ring_buffer_slots_.end(),
+                                         compressed_slot);
+            if (found == io_ring_buffer_slots_.end()) {
+                CloseHandle(request.file);
+                request.file = INVALID_HANDLE_VALUE;
+                resources_.slots->ReleaseCompressed(compressed_slot);
+                image.compressed_slot = kInvalidSlot;
+                continue;
+            }
+            registered_buffer = static_cast<UINT32>(
+                std::distance(io_ring_buffer_slots_.begin(), found));
+            request.using_io_ring = true;
+        } else {
+            const HANDLE associated_port = measured(
+                [&] {
+                    return CreateIoCompletionPort(
+                        request.file, io_completion_port_,
+                        reinterpret_cast<ULONG_PTR>(&request), 0);
+                },
+                validation_associate_iocp_nanoseconds_);
+            if (associated_port != io_completion_port_) {
+                CloseHandle(request.file);
+                request.file = INVALID_HANDLE_VALUE;
+                resources_.slots->ReleaseCompressed(compressed_slot);
+                image.compressed_slot = kInvalidSlot;
+                image.failed = true;
+                continue;
+            }
         }
 
         resources_.compressed_bytes += compressed;
         image.io = &request;
         CompressedBuffer& buffer = compressed_state.resource;
+        buffer.size = compressed;
         image.io->destination = buffer.data;
-        image.io->byte_count = static_cast<DWORD>(buffer.size);
+        image.io->byte_count = static_cast<DWORD>(compressed);
+        image.io->transfer_count = static_cast<DWORD>(transfer_bytes);
         image.io->split_header = !item.header_valid;
+        const auto submit_read = [&](const DWORD buffer_offset,
+                                     const DWORD bytes,
+                                     const std::uint64_t file_offset,
+                                     const UINT_PTR tag,
+                                     OVERLAPPED* overlapped) {
+            if (!use_io_ring) {
+                return ReadFile(image.io->file, buffer.data + buffer_offset,
+                                bytes, nullptr, overlapped);
+            }
+            const UINT_PTR user_data =
+                reinterpret_cast<UINT_PTR>(image.io) | tag;
+            const HRESULT result = io_ring_api_.build_read(
+                io_ring_, IoRingHandleRefFromHandle(image.io->file),
+                IoRingBufferRefFromIndexAndOffset(registered_buffer,
+                                                  buffer_offset),
+                bytes, file_offset, user_data, IOSQE_FLAGS_NONE);
+            if (FAILED(result)) {
+                SetLastError(IoRingResult(result));
+                return FALSE;
+            }
+            ++io_ring_entries;
+            SetLastError(ERROR_IO_PENDING);
+            return FALSE;
+        };
         bool initial_submission_failed = false;
         if (image.io->split_header) {
-            if (io_prefix_granularity_ == 0) {
-                io_prefix_granularity_ = QueryIoPrefixGranularity(image.io->file);
-            }
             image.io->prefix_bytes = std::min(
                 image.io->byte_count, io_prefix_granularity_);
-            StartThreadpoolIo(image.io->threadpool_io);
-            const BOOL prefix_submitted = ReadFile(
-                image.io->file, buffer.data, image.io->prefix_bytes,
-                nullptr, &image.io->header_overlapped);
+            const DWORD prefix_transfer = std::min(
+                image.io->transfer_count, io_prefix_granularity_);
+            const BOOL prefix_submitted = measured(
+                [&] {
+                    return submit_read(0, prefix_transfer, 0, 1,
+                                       &image.io->header_overlapped);
+                },
+                validation_read_file_nanoseconds_);
+            ++(prefix_submitted ? validation_read_file_synchronous_count_
+                                : validation_read_file_pending_count_);
             if (!prefix_submitted && GetLastError() != ERROR_IO_PENDING) {
                 initial_submission_failed = true;
-            } else if (image.io->prefix_bytes < image.io->byte_count) {
+            } else if (prefix_transfer < image.io->transfer_count) {
                 image.io->content_submitted = true;
-                image.io->content_overlapped.Offset = image.io->prefix_bytes;
-                StartThreadpoolIo(image.io->threadpool_io);
-                const BOOL content_submitted = ReadFile(
-                    image.io->file,
-                    buffer.data + image.io->prefix_bytes,
-                    image.io->byte_count - image.io->prefix_bytes,
-                    nullptr, &image.io->content_overlapped);
+                image.io->content_overlapped.Offset = prefix_transfer;
+                const BOOL content_submitted = measured(
+                    [&] {
+                        return submit_read(
+                            prefix_transfer,
+                            image.io->transfer_count - prefix_transfer,
+                            prefix_transfer, 2,
+                            &image.io->content_overlapped);
+                    },
+                    validation_read_file_nanoseconds_);
+                ++(content_submitted ? validation_read_file_synchronous_count_
+                                     : validation_read_file_pending_count_);
                 if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
                     const DWORD error = GetLastError();
-                    CancelThreadpoolIo(image.io->threadpool_io);
                     image.io->result = error;
                     image.io->transferred = 0;
                     image.io->content_completed = true;
@@ -1535,23 +1942,36 @@ void App::SubmitReads() {
             }
         } else {
             image.io->content_submitted = true;
-            StartThreadpoolIo(image.io->threadpool_io);
-            const BOOL content_submitted = ReadFile(
-                image.io->file, buffer.data, image.io->byte_count,
-                nullptr, &image.io->content_overlapped);
+            const BOOL content_submitted = measured(
+                [&] {
+                    return submit_read(0, image.io->transfer_count, 0, 2,
+                                       &image.io->content_overlapped);
+                },
+                validation_read_file_nanoseconds_);
+            ++(content_submitted ? validation_read_file_synchronous_count_
+                                 : validation_read_file_pending_count_);
             if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
                 initial_submission_failed = true;
             }
         }
         if (initial_submission_failed) {
-            CancelThreadpoolIo(image.io->threadpool_io);
-            CloseThreadpoolIo(image.io->threadpool_io);
             CloseHandle(image.io->file);
             resources_.slots->ReleaseCompressed(image.io->compressed_slot);
             image.io = nullptr;
             image.compressed_slot = kInvalidSlot;
             resources_.compressed_bytes -= compressed;
             image.failed = true;
+        }
+    }
+    if (use_io_ring && io_ring_entries != 0) {
+        const HRESULT result = measured(
+            [&] { return io_ring_api_.submit(io_ring_, 0, 0, nullptr); },
+            validation_read_file_nanoseconds_);
+        if (FAILED(result)) {
+            throw std::runtime_error("SubmitIoRing failed (HRESULT " +
+                                     std::to_string(
+                                         static_cast<unsigned long>(result)) +
+                                     ")");
         }
     }
 }
@@ -1669,6 +2089,7 @@ bool App::TryPresent() {
         resources_.frame_credit = false;
         resources_.redraw_pending = false;
         resources_.navigation.CompletePresentation(*next);
+        resources_.reservation_plan_dirty = true;
         RecordValidationPresentation(*next);
         SetWindowTextW(window_, resources_.catalog.items[*next].path.filename().c_str());
         if (config_.validation_exit_after_present) {
@@ -1751,14 +2172,50 @@ void App::ArmOldestFence() {
 }
 
 void App::CancelAllIo() {
+    if (io_ring_) {
+        io_ring_api_.close(io_ring_);
+        io_ring_ = nullptr;
+        io_ring_buffers_registered_ = false;
+    }
+    std::size_t pending_operations = 0;
     for (ImageRecord& image : resources_.images) {
-        if (image.io) CancelIoEx(image.io->file, nullptr);
+        if (image.io && !image.io->using_io_ring &&
+            image.io->file != INVALID_HANDLE_VALUE) {
+            CancelIoEx(image.io->file, nullptr);
+            if (image.io->split_header && !image.io->header_completed) {
+                ++pending_operations;
+            }
+            if (image.io->content_submitted && !image.io->content_completed) {
+                ++pending_operations;
+            }
+        }
+    }
+    while (pending_operations != 0) {
+        DWORD transferred = 0;
+        ULONG_PTR key = 0;
+        OVERLAPPED* overlapped = nullptr;
+        const BOOL success = GetQueuedCompletionStatus(
+            io_completion_port_, &transferred, &key, &overlapped, INFINITE);
+        if (!overlapped) {
+            if (!success) ThrowLastError("GetQueuedCompletionStatus shutdown");
+            continue;
+        }
+        auto* request = reinterpret_cast<IoRequest*>(key);
+        if (overlapped == &request->header_overlapped) {
+            if (!request->header_completed) {
+                request->header_completed = true;
+                --pending_operations;
+            }
+        } else if (overlapped == &request->content_overlapped &&
+                   !request->content_completed) {
+            request->content_completed = true;
+            --pending_operations;
+        }
     }
     for (ImageRecord& image : resources_.images) {
         if (!image.io) continue;
-        WaitForThreadpoolIoCallbacks(image.io->threadpool_io, TRUE);
-        CloseThreadpoolIo(image.io->threadpool_io);
         CloseHandle(image.io->file);
+        image.io->file = INVALID_HANDLE_VALUE;
         if (image.io->compressed_slot != kInvalidSlot) {
             const std::size_t bytes = resources_.slots->Compressed(
                 image.io->compressed_slot).resource.size;
