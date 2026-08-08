@@ -17,9 +17,6 @@
   - [各階段獨立維護 reservation](#各階段獨立維護-reservation)
   - [初始指派與逐份改派](#初始指派與逐份改派)
   - [各資源的 slot 狀態](#各資源的-slot-狀態)
-    - [CompressedBuffer](#compressedbuffer)
-    - [UploadBuffer](#uploadbuffer)
-    - [GPU Texture](#gpu-texture-1)
   - [解碼並行度、slot 與記憶體容量](#解碼並行度slot-與記憶體容量)
   - [容量不足時的阻塞傳遞](#容量不足時的阻塞傳遞)
 - [方向切換前，GPU Texture 應如何安排](#方向切換前gpu-texture-應如何安排)
@@ -270,6 +267,13 @@ reservation 數量 = slot 數量
 
 reservation 已指派給某個 frame 後，該 frame 進入此階段時一定能取得對應的實體 slot 容量。
 
+當 reservation 計算要求移除某個 frame 時，不會先撤回 reservation：
+
+* slot 為 `Readable`：結束內容保留，使 slot 轉為 `Writable`，再改派 reservation。
+* slot 為 `Reading`：暫不改派；讀取完成並使 slot 轉為 `Writable` 後，再改派 reservation。
+
+CompressedBuffer 與 UploadBuffer 一旦進入 `Writable`，既有內容便不再有效，因此沒有 `Writable → Readable` 的重新採用路徑。
+
 ---
 
 ### GPU Texture
@@ -299,6 +303,14 @@ slotState     = Writable
 * GPU 尚未開始把它覆寫成 Frame 105
 
 Frame 97 不占用另一份資源。它只是該 texture 在這次改派完成覆寫前的現有內容。
+
+GPU Texture reservation 的改派順序如下：
+
+1. 先計算希望改派的新 frame，不立即改變 `reservedFrame`。
+2. slot 為 `Writing` 或 `Reading` 時延後改派，等待目前操作完成。
+3. slot 為 `Readable`，而目前內容不再需要保留時，先使 slot 轉為 `Writable`。
+4. slot 可安全改派後，才更新 `reservedFrame`。
+5. 若 slot 尚未被覆寫，且 `contentFrame` 等於新的 `reservedFrame`，重新採用既有內容，使 slot 從 `Writable` 轉為 `Readable`；否則維持 `Writable`，等待 GPU 傳輸。
 
 ---
 
@@ -358,152 +370,64 @@ GPU Texture 的目標集合另受雙向播放範圍限制，配置方式從下�
 
 ### 各資源的 slot 狀態
 
-| 階段 | 實體 slot 保存的內容 | 開始占用 slot | 可以安全重用 slot |
-| --- | --- | --- | --- |
-| CompressedBuffer | 壓縮 PNG 資料 | 開始讀檔前 | 解碼完成並釋放壓縮資料後 |
-| UploadBuffer | 解碼後的像素資料 | 解碼開始寫入前 | GPU 傳輸完成後 |
-| GPU Texture | GPU 上的 frame 內容 | reservation 綁定該 slot 時 | frame 離開 GPU Texture reservation 範圍，且 GPU 完成最後一次讀寫後 |
-
-CompressedBuffer、UploadBuffer 與 GPU Texture 統一使用四種狀態：
+CompressedBuffer、UploadBuffer 與 GPU Texture 的 slot 都使用下列五種存取狀態：
 
 | 狀態 | 抽象定義 |
 | --- | --- |
-| `Writable` | 下一個合法操作是寫入，但尚未開始 |
-| `Writing` | 上游操作正在寫入 slot |
-| `Readable` | 寫入已完成，內容可供下游讀取 |
-| `Reading` | 下游操作正在讀取 slot |
+| `Writable` | slot 可以安全準備下一次寫入 |
+| `Writing` | 寫入操作正在存取並寫入 slot |
+| `CancellingWrite` | 已對正在產生 slot 內容的操作提出取消要求，但該操作可能仍在存取 slot |
+| `Readable` | slot 內容有效，可以開始讀取 |
+| `Reading` | 讀取操作正在存取並讀取 slot，讀取不改變 slot 內容 |
 
-「完成」屬於觸發狀態轉移的事件。
+`Writable` 只表示 slot 可以安全準備下一次寫入，不表示它已適合任意 frame。開始寫入前仍須確認 slot 能承接目標 frame；確認成功後，只有在寫入實際開始時才轉為 `Writing`。若無法承接，slot 維持 `Writable`。
 
-#### CompressedBuffer
+所有合法的 slot 狀態轉移如下：
 
-| 狀態 | 在此階段的語意 |
-| --- | --- |
-| `Writable` | 可以開始讀取 PNG 檔案，將壓縮資料寫入 buffer |
-| `Writing` | 檔案讀取正在寫入壓縮資料 |
-| `Readable` | 檔案讀取完成，壓縮資料有效，等待解碼 |
-| `Reading` | 解碼操作正在讀取壓縮資料 |
+```mermaid
+stateDiagram-v2
+    [*] --> Writable
 
-正常流轉：
+    Writable --> Writing: 寫入已開始
+    Writing --> Readable: 寫入已完成，結果已接受
+    Writing --> Writable: 寫入已完成，結果未接受
+    Writing --> Writable: 寫入已失敗
+    Writing --> CancellingWrite: 操作取消要求已提出
+    CancellingWrite --> Writable: 操作已停止存取
 
-```text
-Writable
-→ 檔案讀取開始
-→ Writing
-→ 檔案讀取完成
-→ Readable
-→ 解碼開始
-→ Reading
-→ 解碼完成並釋放壓縮資料
-→ Writable
+    Readable --> Reading: 讀取已開始
+    Reading --> Writable: 讀取已完成，內容已消耗
+    Reading --> Readable: 讀取已完成，內容仍保留
+    Readable --> Writable: 內容保留已結束
+    Writable --> Readable: 既有內容已重新採用
 ```
 
-#### UploadBuffer
+「內容保留已結束」與「既有內容已重新採用」只列舉 slot 可能發生的狀態變化；本節不定義兩者的觸發條件。
 
-| 狀態 | 在此階段的語意 |
-| --- | --- |
-| `Writable` | 可以由解碼操作寫入像素資料 |
-| `Writing` | 解碼操作正在寫入像素資料 |
-| `Readable` | 解碼完成，像素資料有效，等待 GPU 傳輸 |
-| `Reading` | GPU 傳輸正在讀取像素資料 |
+狀態圖列出單一 slot 的所有可能路徑。pipeline 操作可能在同一個事件中同時轉移輸入與輸出 slots，對應關係如下：
 
-正常流轉：
+| Pipeline 操作 | 事件 | CompressedBuffer | UploadBuffer | GPU Texture |
+| --- | --- | --- | --- | --- |
+| 檔案讀取 | 已開始 | `Writable → Writing` | — | — |
+| 檔案讀取 | 已完成，結果已接受 | `Writing → Readable` | — | — |
+| 檔案讀取 | 已完成，結果未接受 | `Writing → Writable` | — | — |
+| 檔案讀取 | 已失敗 | `Writing → Writable` | — | — |
+| 檔案讀取 | 取消要求已提出 | `Writing → CancellingWrite` | — | — |
+| 檔案讀取 | 取消要求後已停止存取 | `CancellingWrite → Writable` | — | — |
+| 解碼 | 已開始 | `Readable → Reading` | `Writable → Writing` | — |
+| 解碼 | 已完成，結果已接受 | `Reading → Writable` | `Writing → Readable` | — |
+| 解碼 | 已完成，結果未接受 | `Reading → Writable` | `Writing → Writable` | — |
+| 解碼 | 已失敗 | `Reading → Writable` | `Writing → Writable` | — |
+| GPU 傳輸 | 已開始 | — | `Readable → Reading` | `Writable → Writing` |
+| GPU 傳輸 | 已完成，結果已接受 | — | `Reading → Writable` | `Writing → Readable` |
+| GPU 傳輸 | 已完成，結果未接受 | — | `Reading → Writable` | `Writing → Writable` |
+| GPU 傳輸 | 已失敗 | — | `Reading → Writable` | `Writing → Writable` |
+| 畫面繪製 | 已開始 | — | — | `Readable → Reading` |
+| 畫面繪製 | 已完成 | — | — | `Reading → Readable` |
 
-```text
-Writable
-→ 解碼開始
-→ Writing
-→ 解碼完成
-→ Readable
-→ GPU 傳輸開始
-→ Reading
-→ GPU 傳輸完成
-→ Writable
-```
+`CancellingWrite` 只用於已提出實際取消要求的檔案讀取。取消決定不可撤回；不論檔案讀取最後回報成功、取消或失敗，收到完成通知後都轉為 `Writable`。解碼與已提交的 GPU 傳輸不進入 `CancellingWrite`；它們維持原本的 `Writing` 或 `Reading` 直到操作完成，再依完成結果是否接受轉移狀態。若操作在開始前撤回，所有 slots 都保持原狀態。
 
-#### GPU Texture
-
-| 狀態 | 在此階段的語意 |
-| --- | --- |
-| `Writable` | 現有內容不符合 reservation，可以開始寫入目標 frame |
-| `Writing` | GPU 傳輸正在寫入目標 frame |
-| `Readable` | 內容符合 reservation，可以供畫面繪製讀取 |
-| `Reading` | 畫面繪製正在讀取 texture |
-
-正常流轉：
-
-```text
-Writable
-→ GPU 傳輸開始
-→ Writing
-→ GPU 傳輸完成
-→ Readable
-→ 畫面繪製開始
-→ Reading
-```
-
-畫面繪製完成後有兩種轉移：
-
-```text
-Reading
-→ 保留目前 frame
-→ Readable
-```
-
-或：
-
-```text
-Reading
-→ reservation 改派給其他 frame
-→ Writable
-```
-
-如果 texture 尚未開始寫入，而方向切換後的 reservation 恰好等於現有內容，則可以直接轉移：
-
-```text
-Writable
-→ reservation 改為 contentFrame
-→ Readable
-```
-
-直接沿用既有 GPU Texture 內容。
-
-方向切換可能使正在準備的結果失去用途。操作仍須安全完成，但完成後可以直接回到 `Writable`：
-
-```text
-Writing
-→ 操作完成，結果已退出需求範圍
-→ Writable
-```
-
-尚未開始下游讀取的結果也可以直接捨棄：
-
-```text
-Readable
-→ 結果已退出需求範圍
-→ Writable
-```
-
-因此，寫入完成、讀取完成、重用、改派與結果失效都屬於事件或動作；slot 狀態固定為上述四種。
-
-三種資源的正常生命週期可以概括為：
-
-```text
-CompressedBuffer
-Writable → Writing → Readable → Reading → Writable
-
-UploadBuffer
-Writable → Writing → Readable → Reading → Writable
-
-GPU Texture
-Writable → Writing → Readable → Reading
-Reading → Readable（保留目前 frame）
-Reading → Writable（改派後等待寫入其他 frame）
-```
-
-CompressedBuffer 與 UploadBuffer 可以依實際完成順序亂序重用。GPU Texture 必須配合顯示順序與雙向播放範圍，因此通常持有較久。
-
-BackBuffer 由畫面提交機制管理，不屬於上述三張 reservation 表。
+BackBuffer 由畫面提交機制管理，不屬於上述三種 slot 資源。
 
 ---
 
@@ -1236,7 +1160,10 @@ reservation 的指派順序有序
 17. 方向切換能力只由 GPU Texture reservation 範圍中的逆向 frame 提供。
 
 18. `nextFrameToDisplay` 的 GPU Texture 狀態為 `Readable` 時，開始畫面繪製並轉為 `Reading`；
-    畫面繪製完成後，依 reservation 是否保留目前 frame 轉回 `Readable` 或 `Writable`。
+    畫面繪製完成後固定轉回 `Readable`。
+
+19. GPU Texture 的 `Readable` frame 離開 reservation 範圍時，獨立的 reservation 改派動作才將 slot 轉為 `Writable`；
+    reservation 改派不會改變 `Reading` slot，必須先等畫面繪製完成並轉為 `Readable`。
 
 ```
 
