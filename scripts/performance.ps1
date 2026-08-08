@@ -13,7 +13,9 @@ param(
     [ValidateRange(1, 4096)]
     [int]$StagingSlots = 8,
     [ValidateRange(1, 4096)]
-    [int]$GpuTextureSlots = 3,
+    [int]$GpuForwardSlots = 2,
+    [ValidateRange(0, 4096)]
+    [int]$GpuReverseSlots = 1,
     [ValidateRange(1, 4096)]
     [int]$CompressedSlots = 8,
     [ValidateSet('L', 'R')]
@@ -26,6 +28,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($GpuForwardSlots + $GpuReverseSlots -gt 4096) {
+    throw 'Combined GPU slot count exceeds 4096'
+}
 
 if (-not ('PhotoViewer.ProcessMemoryCountersEx' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -145,7 +151,8 @@ for ($run = 1; $run -le $Runs; ++$run) {
         ('"' + $sample + '"'),
         "--workers=$Workers",
         "--staging-slot-count=$StagingSlots",
-        "--gpu-texture-slot-count=$GpuTextureSlots",
+        "--gpu-forward-slot-count=$GpuForwardSlots",
+        "--gpu-reverse-slot-count=$GpuReverseSlots",
         "--compressed-slot-count=$CompressedSlots",
         "--validation-file-list=$fileList",
         "--validation-navigation=$navigation",
@@ -312,7 +319,8 @@ $average = ($measurements | Measure-Object -Average).Average
     Runs = $Runs
     Workers = $Workers
     StagingSlots = $StagingSlots
-    GpuTextureSlots = $GpuTextureSlots
+    GpuForwardSlots = $GpuForwardSlots
+    GpuReverseSlots = $GpuReverseSlots
     CompressedSlots = $CompressedSlots
     Direction = $Direction
     InputMode = $inputMode

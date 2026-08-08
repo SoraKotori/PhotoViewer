@@ -5,7 +5,7 @@
 - [背景](#背景)
 - [核心問題](#核心問題)
   - [中間階段會亂序完成](#中間階段會亂序完成)
-  - [較晚顯示的 frame 不能搶光容量](#較晚顯示的-frame-不能搶光容量)
+  - [較早顯示的 frame 必須保有容量](#較早顯示的-frame-必須保有容量)
   - [方向切換後，舊方向的工作可能仍在執行](#方向切換後舊方向的工作可能仍在執行)
   - [SourceTexture 的 GPU 傳輸也會亂序](#sourcetexture-的-gpu-傳輸也會亂序)
 - [基本解法：固定數量 reservation、亂序執行、有序顯示](#基本解法固定數量-reservation亂序執行有序顯示)
@@ -20,7 +20,7 @@
     - [CompressedBuffer](#compressedbuffer)
     - [UploadBuffer](#uploadbuffer)
     - [SourceTexture](#sourcetexture-1)
-  - [decoder worker、slot 與記憶體容量](#decoder-workerslot-與記憶體容量)
+  - [CPU 並行度、slot 與記憶體容量](#cpu-並行度slot-與記憶體容量)
   - [容量不足時的阻塞傳遞](#容量不足時的阻塞傳遞)
 - [方向切換前，SourceTexture 應如何安排](#方向切換前sourcetexture-應如何安排)
 - [方向切換時的 reservation 改派策略](#方向切換時的-reservation-改派策略)
@@ -50,11 +50,11 @@
 - [如何維持 30 FPS](#如何維持-30-fps)
   - [準備足夠的逆向 frame](#準備足夠的逆向-frame)
   - [長期吞吐量必須高於 30 張／秒](#長期吞吐量必須高於-30-張秒)
-  - [必須看連續具有 Readable SourceTexture 的 frame 數量](#必須看連續具有-readable-sourcetexture-的-frame-數量)
+  - [SourceTexture 狀態與呈現條件](#sourcetexture-狀態與呈現條件)
 - [反覆切換 100、99、100、99](#反覆切換-1009910099)
 - [為什麼這個方法有效](#為什麼這個方法有效)
   - [reservation 數量永遠等於 slot 數量](#reservation-數量永遠等於-slot-數量)
-  - [已經開始的工作不會被錯誤重用](#已經開始的工作不會被錯誤重用)
+  - [已經開始的工作保持資源所有權](#已經開始的工作保持資源所有權)
   - [較早 frame 的容量受到保證](#較早-frame-的容量受到保證)
   - [允許所有中間階段保持亂序](#允許所有中間階段保持亂序)
   - [能利用 SourceTexture 尚未被覆寫的內容](#能利用-sourcetexture-尚未被覆寫的內容)
@@ -132,7 +132,7 @@ Frame 104 可能比 Frame 101 更早完成讀檔、解碼或 GPU 傳輸。
 
 ---
 
-### 較晚顯示的 frame 不能搶光容量
+### 較早顯示的 frame 必須保有容量
 
 假設 UploadBuffer 有 8 個 slots。
 
@@ -172,7 +172,7 @@ Frame 101 解碼完成
 * 某些 GPU 傳輸已經提交
 * 某些 SourceTexture 正在被畫面繪製使用
 
-尚未開始的工作可以重新排程；已經開始的 CPU 或 GPU 操作則不能假裝已經消失，必須等目前操作安全結束。
+尚未開始的工作可以重新排程；已經開始的 CPU 或 GPU 操作持續保有資源，並在目前操作安全結束後進入下一次排程。
 
 ---
 
@@ -193,18 +193,20 @@ Frame 101 解碼完成
 所以 SourceTexture 可能出現：
 
 ```text
-99：SourceTexture 不是 Readable
+99：SourceTexture 是 Writing
 98：SourceTexture 是 Readable
 97：SourceTexture 是 Readable
 96：SourceTexture 是 Readable
 95：SourceTexture 是 Readable
 ```
 
-雖然已有四張完成，但仍不能顯示 98，因為下一張必須是 99。
+雖然已有四張完成，顯示順序仍要求下一張為 99；Frame 99 的 GPU 工作完成並使 SourceTexture 從 `Writing` 轉為 `Readable` 後，才提交該 frame。
 
-因此系統不能只統計 `Readable` SourceTexture 的總數，而必須關心：
+因此畫面前進的必要條件是：
 
-> 從下一張應顯示的 frame 開始，有多少個連續 frame 具有 `Readable` SourceTexture。
+> `nextFrameToDisplay` 的 SourceTexture 已進入 `Readable`。
+
+上例的 `nextFrameToDisplay` 是 Frame 99，其 SourceTexture 狀態為 `Writing`，所以畫面維持目前 frame。GPU 完成事件將其狀態轉為 `Readable` 後，畫面提交 Frame 99；接著依顯示順序使用狀態已為 `Readable` 的 Frame 98～95。
 
 ---
 
@@ -226,7 +228,7 @@ SourceTexture slots
 * `順向 frame`：沿目前播放方向繼續播放時，接下來會顯示的 frame
 * `逆向 frame`：切換播放方向後，接下來會顯示的 frame
 
-reservation 的數量始終固定。播放期間只會指派或改派，不會建立第二批 reservation。
+reservation 的數量始終固定。播放期間只能指派或改派既有 reservation。
 
 對容量為 `N` 的階段，系統維持恰好 `N` 份 reservation。
 
@@ -244,14 +246,6 @@ reservation[0 ... N-1]
 
 ```text
 reservation 數量 = slot 數量
-```
-
-不是：
-
-```text
-正在使用的 slot
-+
-額外的 reservation
 ```
 
 正在執行、等待執行與已經完成的 frame，都包含在這 `N` 份 reservation 之中。
@@ -284,7 +278,7 @@ reservation 數量 = slot 數量
 持有 reservation 的 frame 數量 = 8
 ```
 
-reservation 已指派給某個 frame 後，該 frame 進入此階段時就一定能取得實體 slot，不會被其他 frame 搶走容量。
+reservation 已指派給某個 frame 後，該 frame 進入此階段時一定能取得對應的實體 slot 容量。
 
 ---
 
@@ -324,7 +318,7 @@ Frame 97 不占用另一份資源。它只是該 texture 在這次改派完成�
 
 CompressedBuffer、UploadBuffer 與 SourceTexture 各自維護獨立的 reservation 表。
 
-reservation 不會從一個階段移動到下一個階段。同一個 frame 在跨階段交接時，可以同時出現在多張 reservation 表中。例如解碼進行中時，該 frame 可能同時持有 CompressedBuffer 與 UploadBuffer 的 reservation。
+每個階段的 reservation 固定屬於該階段。同一個 frame 在跨階段交接時，可以同時出現在多張 reservation 表中。例如解碼進行中時，該 frame 可能同時持有 CompressedBuffer 與 UploadBuffer 的 reservation。
 
 若下一階段的 reservation 尚未指派給該 frame，資料會留在目前階段，並繼續占用目前的實體 slot，直到下游容量可用。
 
@@ -344,7 +338,7 @@ Frame 1 → Frame 2 → Frame 3 → ...
 Frame 1、2、3、4、5、6、7、8
 ```
 
-不能在 Frame 3 尚無 reservation 時，先將容量指派給 Frame 10。
+容量必須依顯示順序指派：Frame 3 取得 reservation 後，才輪到 Frame 10。
 
 若 Frame 5～8 較早完成上一階段，它們可以先取得四個實體 slots 並開始工作。Frame 1～4 的 reservation 仍然保證另外四個 slots 的容量，因此四張同時完成上一階段時，都能進入目前階段。
 
@@ -360,7 +354,7 @@ Frame 9、10、11、12
 Frame 1、2、3、4、9、10、11、12
 ```
 
-reservation 集合不必是連續區段，也不必等待最早顯示的 frame 完成後整批前移。只需維持：
+reservation 集合可以是離散區段，並在各 frame 完成時逐份前移。系統只需維持：
 
 ```text
 reservation 的指派順序 = 顯示需求順序
@@ -376,9 +370,9 @@ SourceTexture 的目標集合另受雙向播放範圍限制，配置方式從下
 
 | 階段 | 實體 slot 保存的內容 | 開始占用 slot | 可以安全重用 slot |
 | --- | --- | --- | --- |
-| CompressedBuffer | 壓縮 PNG 資料 | 開始讀檔前 | 解碼不再需要壓縮資料後 |
+| CompressedBuffer | 壓縮 PNG 資料 | 開始讀檔前 | 解碼完成並釋放壓縮資料後 |
 | UploadBuffer | 解碼後的像素資料 | 解碼開始寫入前 | GPU 傳輸完成後 |
-| SourceTexture | GPU 上的 frame 內容 | reservation 綁定該 slot 時 | frame 離開 SourceTexture reservation 範圍，且 GPU 不再讀寫該 slot 後 |
+| SourceTexture | GPU 上的 frame 內容 | reservation 綁定該 slot 時 | frame 離開 SourceTexture reservation 範圍，且 GPU 完成最後一次讀寫後 |
 
 CompressedBuffer、UploadBuffer 與 SourceTexture 統一使用四種狀態：
 
@@ -389,7 +383,7 @@ CompressedBuffer、UploadBuffer 與 SourceTexture 統一使用四種狀態：
 | `Readable` | 寫入已完成，內容可供下游讀取 |
 | `Reading` | 下游操作正在讀取 slot |
 
-「完成」是狀態轉移事件，不是額外狀態。
+「完成」屬於觸發狀態轉移的事件。
 
 #### CompressedBuffer
 
@@ -410,7 +404,7 @@ Writable
 → Readable
 → 解碼開始
 → Reading
-→ 解碼不再需要壓縮資料
+→ 解碼完成並釋放壓縮資料
 → Writable
 ```
 
@@ -482,13 +476,13 @@ Writable
 → Readable
 ```
 
-不需要重新執行 GPU 傳輸。
+直接沿用既有 GPU texture 內容。
 
 方向切換可能使正在準備的結果失去用途。操作仍須安全完成，但完成後可以直接回到 `Writable`：
 
 ```text
 Writing
-→ 操作完成，但結果已不再需要
+→ 操作完成，結果已退出需求範圍
 → Writable
 ```
 
@@ -496,11 +490,11 @@ Writing
 
 ```text
 Readable
-→ 結果不再需要
+→ 結果已退出需求範圍
 → Writable
 ```
 
-因此，寫入完成、讀取完成、重用、改派與結果失效都是事件或動作，不是第五種 slot 狀態。
+因此，寫入完成、讀取完成、重用、改派與結果失效都屬於事件或動作；slot 狀態固定為上述四種。
 
 三種資源的正常生命週期可以概括為：
 
@@ -523,9 +517,9 @@ BackBuffer 由畫面提交機制管理，不屬於上述三張 reservation 表�
 
 ---
 
-### decoder worker、slot 與記憶體容量
+### CPU 並行度、slot 與記憶體容量
 
-decoder worker 是執行解碼工作的單元，不是長期保存 frame 的資源。frame 不需要預先綁定特定 worker，worker 完成一張後即可處理另一張。
+同時執行的 CPU 工作各自需要輸入與輸出資源，因此 CPU 工作並行度會形成最低 slot 需求。frame 資源由固定 slot 保存；CPU 工作完成後，執行額度可以承接下一項工作，實體 slot 則依 pipeline 狀態繼續交給下游或回到可分配狀態。
 
 需要 reservation 的是會跨越非同步階段並持續占用容量的 CompressedBuffer、UploadBuffer 與 SourceTexture。
 
@@ -543,7 +537,7 @@ UploadBuffer 容量     ≥ slot 數量 × 126.56 MiB
 SourceTexture 容量    ≥ slot 數量 × 126.56 MiB
 ```
 
-UploadBuffer 的數量通常需要高於同時工作的 decoder worker 數量，因為部分 UploadBuffer 可能已完成解碼，但仍在等待 GPU 傳輸。reservation 數量不能超過實際記憶體容量能支持的 slot 數量。
+UploadBuffer 的數量通常需要高於同時執行的解碼工作數量，因為部分 UploadBuffer 可能已完成解碼，但仍在等待 GPU 傳輸。reservation 數量必須落在實際記憶體容量可支持的 slot 數量內。
 
 ---
 
@@ -552,20 +546,24 @@ UploadBuffer 的數量通常需要高於同時工作的 decoder worker 數量，
 SourceTexture 受顯示順序限制，通常是最容易形成阻塞的階段。若沒有 SourceTexture reservation 可以指派給已解碼的 frame，阻塞會依序向上游傳遞：
 
 ```text
-SourceTexture 無法改派
+SourceTexture 等待可改派容量
 → 已解碼 frame 繼續占用 UploadBuffer
-→ decoder worker 無法取得新的 UploadBuffer
+→ CPU 工作等待可用 UploadBuffer
 → 已讀取 frame 繼續占用 CompressedBuffer
 → 暫停發出新的讀檔工作
 ```
 
-這是固定容量 pipeline 的正常流量控制。上游不得繞過 reservation 繼續建立無界限工作，否則固定 slot 數量將無法限制記憶體使用量。
+這是固定容量 pipeline 的正常流量控制。上游只能在取得 reservation 後建立工作，使未完成工作總量與記憶體使用量始終受固定 slot 數量約束。
 
 ---
 
 ## 方向切換前，SourceTexture 應如何安排
 
-若要求在任意時間切換方向後仍能維持 30 FPS，就不能把全部 SourceTexture reservation 都指派給順向 frame。
+若要求在任意時間切換方向後仍能維持 30 FPS，SourceTexture reservation 必須同時配置順向與逆向 frame。
+
+SourceTexture reservation 分別配置順向與逆向容量。方向切換時，三個 pipeline
+階段都必須依新方向重新計算需求順序；已經 Readable 的 SourceTexture
+只負責讓下一張立即呈現，上游 reservation 同時依新方向重新排程。
 
 假設目前顯示 Frame `P`，SourceTexture 共 `N` 個 slots，應將 reservation 分成：
 
@@ -638,7 +636,7 @@ SourceTexture 的 8 個 reservation 為：
 改派：104 → 96
 ```
 
-方向切換不是額外建立另一組 reservation。
+方向切換沿用同一組 reservation。
 
 整個過程中永遠維持：
 
@@ -646,7 +644,7 @@ SourceTexture 的 8 個 reservation 為：
 SourceTexture reservation 數量 = 8
 ```
 
-只把 reservation 從不再需要的 frame 逐步改派給新方向的 frame。
+只把需求範圍外 frame 的 reservation 逐步改派給新方向的 frame。
 
 ---
 
@@ -688,7 +686,7 @@ S6 尚未開始覆寫，而且目前內容正好是 Frame 96：
 狀態：Readable
 ```
 
-不需要重新解碼，也不需要重新執行 GPU 傳輸。
+可直接沿用既有解碼結果與 GPU texture 內容。
 
 因此 Frame 103 暫時沒有 reservation。
 
@@ -703,7 +701,7 @@ reservation：104
 GPU 傳輸已提交
 ```
 
-在 GPU 傳輸完成前，不能把 S7 改成 Frame 103，也不能把它視為可供新方向使用的空 slot。
+在 GPU 傳輸完成前，S7 持續保留給 Frame 104；傳輸完成後才進入新方向的改派候選集合。
 
 所以切換瞬間的 reservation 是：
 
@@ -731,7 +729,7 @@ Frame 103 此時只是：
 S7 的內容變成 104
 ```
 
-Frame 104 已不再需要，因此立即改派這份 reservation：
+Frame 104 已退出需求範圍，因此立即改派這份 reservation：
 
 ```text
 104 → 103
@@ -794,10 +792,10 @@ reservation 的作用是保證：
 
 ```text
 SourceTexture reservation 已指派給 Frame 96
-Frame 102 不能搶走 Frame 96 的 slot
+Frame 96 的 slot 容量保持專用
 ```
 
-但 reservation 不保證 Frame 96 一定先完成。
+reservation 只保證容量；完成順序由實際執行決定。
 
 因此還需要 deadline 排程。
 
@@ -831,7 +829,7 @@ Frame 96 即使已經有 SourceTexture reservation，仍可能因讀檔、解碼
 
 較早要顯示的 frame 具有較高優先級。
 
-例如 Frame 95 已經解碼完成，而 Frame 96 剛完成讀檔，可以先對 Frame 95 提交 GPU 傳輸，但不能讓大量較晚顯示 frame 的 GPU 傳輸長時間阻塞 Frame 96。
+例如 Frame 95 已經解碼完成，而 Frame 96 剛完成讀檔，可以先對 Frame 95 提交 GPU 傳輸；queue 深度與優先級必須同時為 Frame 96 保留及時提交的機會。
 
 因此 GPU 傳輸 queue 也必須控制排隊深度，避免較晚顯示之 frame 的 GPU 傳輸占滿 queue。
 
@@ -853,7 +851,7 @@ Frame 96 即使已經有 SourceTexture reservation，仍可能因讀檔、解碼
 
 ### 讀檔正在進行
 
-不能立即把實體 buffer 當成空閒。
+讀檔進行期間，實體 buffer 保持占用狀態。
 
 處理方式是：
 
@@ -866,13 +864,13 @@ Frame 96 即使已經有 SourceTexture reservation，仍可能因讀檔、解碼
 完成後：
 
 * 若原 frame 再次成為需要的 frame，維持原指派
-* 若不再需要，就將該 reservation 改派給新方向最早仍無 reservation 的 frame
+* 若原 frame 已退出需求範圍，就將該 reservation 改派給新方向最早仍無 reservation 的 frame
 
 ### 已經讀取完成但尚未解碼
 
 若壓縮內容正好是新方向需要的 frame，可以直接把 reservation 改派給該 frame，並沿用現有內容。
 
-若不再需要，可以立即重新使用該 CompressedBuffer。
+若原 frame 已退出需求範圍，該 CompressedBuffer 可以立即重新使用。
 
 整個過程中：
 
@@ -882,7 +880,7 @@ CompressedBuffer reservation 數量
 CompressedBuffer slot 數量
 ```
 
-不會因方向切換而額外增加另一批 reservation。
+方向切換沿用並改派同一批 reservation。
 
 ---
 
@@ -898,13 +896,12 @@ UploadBuffer 同樣維持固定數量 reservation。
 
 ### 解碼進行中
 
-不能立即重用該 UploadBuffer。
+解碼進行期間，該 UploadBuffer 保持由目前工作占用。
 
-必須等待目前的解碼完成，完成後若舊 frame 不再需要：
+必須等待目前的解碼完成，完成後若舊 frame 已退出需求範圍：
 
 ```text
-不提交 GPU 傳輸
-直接將 reservation 改派給新方向 frame
+將 reservation 直接改派給新方向 frame
 ```
 
 ### 解碼完成，但 GPU 傳輸尚未提交
@@ -950,7 +947,7 @@ GPU 傳輸完成後：
 nextFrameToDisplay = 99
 ```
 
-畫面繪製與畫面提交不需要等待整條 pipeline 重建。
+畫面繪製與畫面提交可立即沿用仍有效的 SourceTexture。
 
 只要 Frame 99 的 SourceTexture 為 `Readable`，就能在下一個 display tick 顯示。
 
@@ -970,7 +967,7 @@ CompressedBuffer 與 UploadBuffer 的 reservation，也依相同的顯示 deadli
 
 ### 第三步：維持仍然有效的 reservation
 
-方向切換前後都需要的 frame，不做任何改動。
+方向切換前後都需要的 frame 沿用原 reservation。
 
 例如：
 
@@ -990,11 +987,11 @@ CompressedBuffer 與 UploadBuffer 的 reservation，也依相同的顯示 deadli
 
 ### 第五步：讓已開始的操作安全完成
 
-正在讀檔、解碼、GPU 傳輸或畫面繪製的 slot，在操作完成前不改派 reservation。
+正在讀檔、解碼、GPU 傳輸或畫面繪製的 slot，在操作完成前保持原 reservation。
 
 每當一份舊方向 reservation 可以安全改派，就立即指派給新方向最早仍無 reservation 的 frame。
 
-不必等待所有舊方向工作一起完成。
+每份 reservation 都在自身工作完成時獨立進入改派流程。
 
 ---
 
@@ -1002,19 +999,19 @@ CompressedBuffer 與 UploadBuffer 的 reservation，也依相同的顯示 deadli
 
 新方向的讀檔、解碼與 GPU 傳輸可以依前一階段的實際完成順序執行。
 
-但所需 frame 都已獲指派 reservation，因此較晚顯示的 frame 不會搶走較早顯示的 frame 容量。
+所需 frame 都已獲指派 reservation，因此較早顯示的 frame 始終保有已指派容量。
 
 ---
 
 ### 第七步：畫面提交嚴格依新方向執行
 
-即使 Frame 95 的 SourceTexture 比 Frame 96 更早進入 `Readable`，仍然只能：
+即使 Frame 95 的 SourceTexture 比 Frame 96 更早進入 `Readable`，畫面也只能依下列順序提交：
 
 ```text
 99 → 98 → 97 → 96 → 95
 ```
 
-不能越過 SourceTexture 尚未進入 `Readable` 的 Frame 96。
+Frame 96 的 SourceTexture 進入 `Readable` 後，才提交 Frame 96 與其後的 Frame 95。
 
 ---
 
@@ -1042,13 +1039,13 @@ B ≥ ceil(30 × L)
 
 至少需要 6 張逆向 frame，實際還應加入安全餘量。
 
-這些逆向 frame 都有正式的 SourceTexture reservation，不會增加額外 slot。
+這些逆向 frame 都使用固定 SourceTexture slot 總數內的正式 reservation。
 
 ---
 
 ### 長期吞吐量必須高於 30 張／秒
 
-方向切換只影響 pipeline 的工作方向，不會降低基本吞吐量要求。
+方向切換後仍適用相同的基本吞吐量要求。
 
 系統仍需穩定達到：
 
@@ -1070,11 +1067,11 @@ GPU 傳輸：
 ≈ 3.71 GiB/s
 ```
 
-實際硬體必須有額外餘裕，不能只剛好等於理論值。
+實際硬體必須在理論值之上保留額外餘裕。
 
 ---
 
-### 必須看連續具有 Readable SourceTexture 的 frame 數量
+### SourceTexture 狀態與呈現條件
 
 假設切換後各 frame 的 SourceTexture 狀態為：
 
@@ -1082,32 +1079,12 @@ GPU 傳輸：
 99 Readable
 98 Readable
 97 Readable
-96 非 Readable
+96 Writing
 95 Readable
 94 Readable
 ```
 
-共有 5 個 frame 的 SourceTexture 為 `Readable`，但從 Frame 99 開始連續符合的只有：
-
-```text
-99、98、97
-```
-
-所以有效安全時間只有：
-
-```text
-3 × 33.33 ms ≈ 100 ms
-```
-
-Frame 95、94 提前完成，不能補償 Frame 96 的缺口。
-
-因此監控指標應是：
-
-```text
-從 nextFrameToDisplay 開始，連續具有 Readable SourceTexture 的 frame 數量
-```
-
-而不是所有 `Readable` SourceTexture 的總數。
+`nextFrameToDisplay` 依序指向 Frame 99、98、97 時，其 SourceTexture 狀態都是 `Readable`，因此畫面依序提交這三張。接著 `nextFrameToDisplay` 指向 Frame 96；其狀態為 `Writing`，所以畫面維持 Frame 97。GPU 完成事件將 Frame 96 轉為 `Readable` 後，畫面提交 Frame 96，再依序使用狀態已為 `Readable` 的 Frame 95、94。
 
 ---
 
@@ -1128,12 +1105,12 @@ Frame 95、94 提前完成，不能補償 Frame 96 的缺口。
 
 只是在兩個 SourceTexture 間重複畫面繪製與提交。
 
-這段期間不需要：
+這段期間直接沿用：
 
 ```text
-重新讀檔
-重新解碼
-重新執行 GPU 傳輸
+既有檔案內容
+既有解碼結果
+既有 GPU texture 內容
 ```
 
 顯示需求可以重複，但 frame 資源以 frame ID 重用。
@@ -1152,17 +1129,17 @@ Frame 95、94 提前完成，不能補償 Frame 96 的缺口。
 
 ### reservation 數量永遠等於 slot 數量
 
-不會因方向切換額外建立另一組 reservation，因此不會重複計算容量。
+所有方向共用同一組固定 reservation，因此容量只計算一次。
 
 方向切換只是逐份替換 reservation。
 
 ---
 
-### 已經開始的工作不會被錯誤重用
+### 已經開始的工作保持資源所有權
 
 正在讀檔、解碼、GPU 傳輸或畫面繪製的實體資源，在操作完成前仍保持原 reservation。
 
-因此不會發生同一個 slot 同時被兩個 frame 使用。
+因此每個 slot 在任一時刻只屬於一個 frame。
 
 ---
 
@@ -1174,13 +1151,13 @@ Frame 95、94 提前完成，不能補償 Frame 96 的缺口。
 99 → 98 → 97 → 96...
 ```
 
-即使 Frame 95 比 Frame 96 更早完成，Frame 95 也不能搶走已指派給 Frame 96 的 SourceTexture 容量。
+即使 Frame 95 比 Frame 96 更早完成，已指派給 Frame 96 的 SourceTexture 容量仍保持給 Frame 96。
 
 ---
 
 ### 允許所有中間階段保持亂序
 
-讀檔、解碼與 GPU 傳輸不需要等待前一張完成。
+讀檔、解碼與 GPU 傳輸可依各自的資料就緒狀態開始。
 
 只要每張 frame 已有 reservation，就可以在前一階段完成時立即執行。
 
@@ -1200,7 +1177,7 @@ GPU 尚未開始覆寫
 
 方向切換後恰好需要 Frame 96，就可以將 reservation 改成 96，並將 slotState 直接改為 `Readable`。
 
-不需要重新執行 GPU 傳輸。
+直接沿用既有 GPU texture 內容。
 
 ---
 
@@ -1229,19 +1206,18 @@ reservation 的指派順序有序
    各自維護獨立的 reservation 表。
 
 3. 每個階段的 reservation 數量永遠等於 slot 數量；
-   reservation 代表容量保證，不是額外資源。
+   reservation 只代表既有 slot 的容量保證。
 
 4. 同一個 frame 可以同時持有不同階段的 reservation；
    下游容量不足時，資料留在目前階段並占用原 slot。
 
 5. reservation 依顯示需求順序指派，
-   但集合不必連續，工作與 slot 重用都可以亂序完成。
+   集合可以是離散區段，工作與 slot 重用都可以亂序完成。
 
-6. decoder worker 是執行單元，不持有 reservation；
+6. CPU 工作並行度與 reservation 所代表的容量分開計算；reservation 由各階段的固定 slot 持有，
    slot 數量必須同時符合平行度與總記憶體容量限制。
 
-7. 方向切換時，不建立第二組 reservation；
-   只逐份改派原有 reservation。
+7. 方向切換時沿用同一組 reservation，並逐份改派原有 reservation。
 
 8. 尚未開始工作的舊方向 reservation 可以立即改派。
 
@@ -1255,7 +1231,7 @@ reservation 的指派順序有序
    reservedFrame、contentFrame 與 slotState。
 
 12. 若 slotState 為 `Writable`，且 contentFrame 符合 reservedFrame，
-   可以直接轉為 `Readable`，不需要重新執行 GPU 傳輸。
+    可以直接轉為 `Readable` 並沿用既有 GPU texture 內容。
 
 13. 新方向讀檔、解碼與 GPU 傳輸可以亂序完成。
 
@@ -1267,16 +1243,15 @@ reservation 的指派順序有序
 
 16. 畫面提交必須嚴格依目前播放方向執行。
 
-17. 方向切換能力來自 SourceTexture reservation 範圍中的逆向 frame，
-    不是依賴偶然尚未被覆寫的舊內容。
+17. 方向切換能力只由 SourceTexture reservation 範圍中的逆向 frame 提供。
 
-18. 30 FPS 的安全量應看 nextFrameToDisplay 起算，
-    連續具有 `Readable` SourceTexture 的 frame 數量，
-    不能只看所有 `Readable` SourceTexture 的總數。
+18. `nextFrameToDisplay` 的 SourceTexture 狀態為 `Readable` 時，開始畫面繪製並轉為 `Reading`；
+    畫面繪製完成後，依 reservation 是否保留目前 frame 轉回 `Readable` 或 `Writable`。
+
 ```
 
 整個模型可以概括為：
 
 > **固定容量、固定數量 reservation、方向切換時逐份改派、工作亂序完成、結果依播放順序提交。**
 
-這個方法既不會因方向切換重複計算容量，也能容納解碼與 GPU 傳輸的亂序行為，同時維持最終顯示順序與 30 FPS 的 deadline 要求。
+這個方法讓所有方向共用同一份容量，並容納解碼與 GPU 傳輸的亂序行為，同時維持最終顯示順序與 30 FPS 的 deadline 要求。

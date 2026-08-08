@@ -7,7 +7,7 @@
 namespace pv {
 namespace {
 
-std::optional<std::size_t> ParsePositive(std::wstring_view value) {
+std::optional<std::size_t> ParseNonNegative(std::wstring_view value) {
     if (value.empty()) return std::nullopt;
     std::size_t result = 0;
     for (const wchar_t ch : value) {
@@ -18,8 +18,12 @@ std::optional<std::size_t> ParsePositive(std::wstring_view value) {
         }
         result = result * 10 + digit;
     }
-    if (result == 0) return std::nullopt;
     return result;
+}
+
+std::optional<std::size_t> ParsePositive(const std::wstring_view value) {
+    const auto result = ParseNonNegative(value);
+    return result && *result != 0 ? result : std::nullopt;
 }
 
 std::size_t ParseMibOption(std::wstring_view argument, std::wstring_view prefix) {
@@ -106,11 +110,20 @@ Config ParseConfig() {
                 std::wstring_view(L"--staging-slot-count=").size()));
             if (!value || *value > 4096) throw std::invalid_argument("invalid staging slot count");
             config.staging_slot_count = *value;
-        } else if (argument.starts_with(L"--gpu-texture-slot-count=")) {
+        } else if (argument.starts_with(L"--gpu-forward-slot-count=")) {
             const auto value = ParsePositive(argument.substr(
-                std::wstring_view(L"--gpu-texture-slot-count=").size()));
-            if (!value || *value > 4096) throw std::invalid_argument("invalid GPU texture slot count");
-            config.gpu_texture_slot_count = *value;
+                std::wstring_view(L"--gpu-forward-slot-count=").size()));
+            if (!value || *value > 4096) {
+                throw std::invalid_argument("invalid GPU forward slot count");
+            }
+            config.gpu_forward_slot_count = *value;
+        } else if (argument.starts_with(L"--gpu-reverse-slot-count=")) {
+            const auto value = ParseNonNegative(argument.substr(
+                std::wstring_view(L"--gpu-reverse-slot-count=").size()));
+            if (!value || *value > 4096) {
+                throw std::invalid_argument("invalid GPU reverse slot count");
+            }
+            config.gpu_reverse_slot_count = *value;
         } else if (argument.starts_with(L"--compressed-slot-count=")) {
             const auto value = ParsePositive(argument.substr(
                 std::wstring_view(L"--compressed-slot-count=").size()));
@@ -127,6 +140,9 @@ Config ParseConfig() {
         } else {
             throw std::invalid_argument("multiple image paths supplied");
         }
+    }
+    if (config.GpuSlotCount() > 4096) {
+        throw std::invalid_argument("combined GPU slot count exceeds 4096");
     }
     return config;
 }

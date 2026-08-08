@@ -34,18 +34,19 @@ struct IoRequest {
         header_overlapped = {};
         content_overlapped = {};
         file = INVALID_HANDLE_VALUE;
-        threadpool_io = nullptr;
         window = nullptr;
         index = 0;
         generation = 0;
         compressed_slot = kInvalidSlot;
         destination = nullptr;
         byte_count = 0;
+        transfer_count = 0;
         prefix_bytes = 0;
         split_header = false;
         header_completed = false;
         content_submitted = false;
         content_completed = false;
+        using_io_ring = false;
         header_result = ERROR_IO_PENDING;
         header_transferred = 0;
         result = ERROR_IO_PENDING;
@@ -55,18 +56,19 @@ struct IoRequest {
     OVERLAPPED header_overlapped{};
     OVERLAPPED content_overlapped{};
     HANDLE file = INVALID_HANDLE_VALUE;
-    PTP_IO threadpool_io = nullptr;
     HWND window = nullptr;
     std::size_t index = 0;
     std::uint64_t generation = 0;
     SlotId compressed_slot = kInvalidSlot;
     std::byte* destination = nullptr;
     DWORD byte_count = 0;
+    DWORD transfer_count = 0;
     DWORD prefix_bytes = 0;
     bool split_header = false;
     bool header_completed = false;
     bool content_submitted = false;
     bool content_completed = false;
+    bool using_io_ring = false;
     DWORD header_result = ERROR_IO_PENDING;
     ULONG_PTR header_transferred = 0;
     DWORD result = ERROR_IO_PENDING;
@@ -144,6 +146,32 @@ public:
         slot.image = image;
         slot.generation = generation;
         return id;
+    }
+
+    [[nodiscard]] bool PreallocateCompressed(const std::size_t count,
+                                             const std::size_t bytes) {
+        if (count > compressed_count_) return false;
+        const auto required = CompressedAllocationSize(bytes);
+        if (!required) return false;
+        std::size_t projected = compressed_committed_bytes_;
+        for (SlotId id = 0; id < count; ++id) {
+            const std::size_t before = Compressed(id).resource.allocation_size;
+            if (before < *required) {
+                if (projected - before > compressed_budget_ - *required) {
+                    return false;
+                }
+                projected = projected - before + *required;
+            }
+        }
+        for (SlotId id = 0; id < count; ++id) {
+            CompressedBuffer& buffer = Compressed(id).resource;
+            const std::size_t before = buffer.allocation_size;
+            if (!buffer.Allocate(bytes)) return false;
+            buffer.size = 0;
+            compressed_committed_bytes_ = compressed_committed_bytes_ - before +
+                                          buffer.allocation_size;
+        }
+        return true;
     }
 
     [[nodiscard]] SlotId AcquireStaging(std::size_t bytes, std::size_t image,

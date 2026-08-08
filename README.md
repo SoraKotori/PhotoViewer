@@ -21,8 +21,8 @@
 
 - 從使用者指定的圖片開始瀏覽同一資料夾中的圖片。
 - 使用左方向鍵切換上一張，右方向鍵切換下一張。
-- 短按時只切換一張，多次短按必須被依序完成，不得遺漏。
-- 長按時依序切換，不得跳過中間圖片，放開後停在當前圖片。
+- 短按時只切換一張，多次短按依輸入順序逐張完成。
+- 長按時依圖片順序逐張切換，放開後停在當前圖片。
 - 到達資料夾邊界時停止，不循環。
 - 使用 F11 切換無邊框全螢幕，再次按下 F11 還原原視窗狀態。
 
@@ -43,7 +43,8 @@
 | `--staging-cache-mib=` | 無限制 | 解碼 staging texture Slot Storage 記憶體上限 |
 | `--staging-slot-count=` | 20 | 解碼 staging texture slot 數量上限 |
 | `--gpu-cache-mib=` | 無限制 | GPU texture 記憶體上限 |
-| `--gpu-texture-slot-count=` | 6 | GPU texture slot 數量上限 |
+| `--gpu-reverse-slot-count=` | 1 | 反方向的 GPU texture slots |
+| `--gpu-forward-slot-count=` | 5 | 目前方向的 GPU texture slots；包含目前畫面 |
 
 ## 系統需求
 
@@ -64,7 +65,7 @@
 |---|---:|---:|---:|
 | 壓縮 PNG 資料 | 24 | 約 40 MiB | 約 960 MiB 系統記憶體 |
 | 解碼 staging texture | 20 | 約 126.56 MiB | 約 2531.25 MiB 系統記憶體 |
-| GPU texture | 6 | 約 126.56 MiB | 約 759.38 MiB VRAM |
+| GPU texture | 6（1 reverse + 5 forward） | 約 126.56 MiB | 約 759.38 MiB VRAM |
 
 持續切換時的最低頻寬估算如下：
 
@@ -83,8 +84,9 @@
 | `--workers=` | 5 |
 | `--compressed-slot-count=` | 8 |
 | `--staging-slot-count=` | 8 |
-| `--gpu-texture-slot-count=` | 3 |
+| `--gpu-reverse-slot-count=` | 1 |
+| `--gpu-forward-slot-count=` | 2 |
 
 驗收使用 7680 × 4320、8-bit RGBA、non-interlaced PNG。導覽開始延遲由私有測試設定指定；第一張作為初始圖片並獨立記錄，後續圖片的可呈現時間必須符合設定的時限。
 
-效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。大型資料搬移保持顯式，CPU 密集工作由 Workers 執行，Main Thread 僅負責控制、提交與完成處理。
+效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。底層執行緒、I/O、解碼與資源所有權設計統一記錄於 [runtime-design.md](docs/runtime-design.md)。

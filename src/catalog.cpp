@@ -76,6 +76,7 @@ using NtQueryDirectoryFileExFn = LONG(NTAPI*)(
     ULONG, void*);
 
 constexpr LONG kStatusPending = 0x00000103L;
+constexpr LONG kStatusBufferOverflow = static_cast<LONG>(0x80000005UL);
 constexpr LONG kStatusNoMoreFiles = static_cast<LONG>(0x80000006UL);
 constexpr ULONG kRestartScan = 0x01;
 constexpr int kFileDirectoryInformation = 1;
@@ -83,9 +84,10 @@ constexpr int kFileDirectoryInformation = 1;
 }  // namespace
 
 struct AsyncCatalog::Impl {
-    explicit Impl(const std::filesystem::path& initial_image, const HWND target)
+    explicit Impl(const std::filesystem::path& initial_image,
+                  const HANDLE completion_port)
         : absolute(std::filesystem::absolute(initial_image)),
-          directory_path(absolute.parent_path()), window(target) {
+          directory_path(absolute.parent_path()) {
         if (!IsPngExtension(absolute)) {
             throw std::invalid_argument("initial image is not a PNG file");
         }
@@ -102,14 +104,14 @@ struct AsyncCatalog::Impl {
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             nullptr);
         if (directory == INVALID_HANDLE_VALUE) ThrowLastError("CreateFileW(directory)");
-        threadpool_io = CreateThreadpoolIo(directory, &Impl::IoCompletion,
-                                           this, nullptr);
-        if (!threadpool_io) {
+        if (CreateIoCompletionPort(directory, completion_port,
+                                   kCatalogIoCompletionKey, 0) !=
+            completion_port) {
             const DWORD error = GetLastError();
             CloseHandle(directory);
             directory = INVALID_HANDLE_VALUE;
             SetLastError(error);
-            ThrowLastError("CreateThreadpoolIo(directory)");
+            ThrowLastError("CreateIoCompletionPort(directory)");
         }
         try {
             if (!Submit()) {
@@ -117,8 +119,6 @@ struct AsyncCatalog::Impl {
                 completed = true;
             }
         } catch (...) {
-            CloseThreadpoolIo(threadpool_io);
-            threadpool_io = nullptr;
             CloseHandle(directory);
             directory = INVALID_HANDLE_VALUE;
             throw;
@@ -126,32 +126,15 @@ struct AsyncCatalog::Impl {
     }
 
     ~Impl() {
-        cancelled.store(true, std::memory_order_release);
         if (in_flight) {
             CancelIoEx(directory, nullptr);
-            WaitForThreadpoolIoCallbacks(threadpool_io, TRUE);
+            WaitForSingleObject(directory, INFINITE);
         }
-        if (threadpool_io) CloseThreadpoolIo(threadpool_io);
         if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
-    }
-
-    static void CALLBACK IoCompletion(PTP_CALLBACK_INSTANCE, void* context,
-                                      void*, const ULONG io_result,
-                                      const ULONG_PTR transferred, PTP_IO) {
-        auto* impl = static_cast<Impl*>(context);
-        impl->transferred.store(transferred, std::memory_order_relaxed);
-        impl->io_result.store(io_result, std::memory_order_release);
-        if (!impl->cancelled.load(std::memory_order_acquire)) {
-            PostMessageW(impl->window, kMessageCatalogComplete,
-                         reinterpret_cast<WPARAM>(impl), 0);
-        }
     }
 
     [[nodiscard]] bool Submit() {
         io_status = {};
-        transferred.store(0, std::memory_order_relaxed);
-        io_result.store(ERROR_IO_PENDING, std::memory_order_relaxed);
-        StartThreadpoolIo(threadpool_io);
         in_flight = true;
         const LONG status = query(
             directory, nullptr, nullptr, &io_status, &io_status,
@@ -160,12 +143,10 @@ struct AsyncCatalog::Impl {
             nullptr);
         restart_scan = false;
         if (status == kStatusNoMoreFiles) {
-            CancelThreadpoolIo(threadpool_io);
             in_flight = false;
             return false;
         }
         if (status < 0 && status != kStatusPending) {
-            CancelThreadpoolIo(threadpool_io);
             in_flight = false;
             throw std::runtime_error("NtQueryDirectoryFileEx failed (NTSTATUS " +
                                      std::to_string(static_cast<unsigned long>(status)) +
@@ -206,17 +187,16 @@ struct AsyncCatalog::Impl {
     [[nodiscard]] bool Advance() {
         if (completed) return true;
         if (!in_flight) throw std::logic_error("catalog query is not active");
-        WaitForThreadpoolIoCallbacks(threadpool_io, FALSE);
         in_flight = false;
-        const ULONG result = io_result.load(std::memory_order_acquire);
-        const std::size_t bytes = transferred.load(std::memory_order_relaxed);
-        if (result == ERROR_SUCCESS || result == ERROR_MORE_DATA) {
+        const LONG result = io_status.value.status;
+        const std::size_t bytes = io_status.information;
+        if (result == 0 || result == kStatusBufferOverflow) {
             Parse(bytes);
             if (Submit()) return false;
-        } else if (result != ERROR_NO_MORE_FILES &&
-                   result != static_cast<ULONG>(kStatusNoMoreFiles)) {
-            throw std::runtime_error("asynchronous directory query failed (Win32 " +
-                                     std::to_string(result) + ")");
+        } else if (result != kStatusNoMoreFiles) {
+            throw std::runtime_error("asynchronous directory query failed (NTSTATUS " +
+                                     std::to_string(static_cast<unsigned long>(result)) +
+                                     ")");
         }
         FinalizeCatalog(catalog, absolute);
         completed = true;
@@ -225,24 +205,19 @@ struct AsyncCatalog::Impl {
 
     std::filesystem::path absolute;
     std::filesystem::path directory_path;
-    HWND window = nullptr;
     HANDLE directory = INVALID_HANDLE_VALUE;
-    PTP_IO threadpool_io = nullptr;
     NtQueryDirectoryFileExFn query = nullptr;
     NativeIoStatusBlock io_status{};
     alignas(8) std::array<std::byte, 64 * 1024> buffer{};
     Catalog catalog;
-    std::atomic<ULONG> io_result{ERROR_IO_PENDING};
-    std::atomic<ULONG_PTR> transferred{0};
-    std::atomic<bool> cancelled{false};
     bool restart_scan = true;
     bool in_flight = false;
     bool completed = false;
 };
 
 AsyncCatalog::AsyncCatalog(const std::filesystem::path& initial_image,
-                           const HWND window)
-    : impl_(std::make_unique<Impl>(initial_image, window)) {}
+                           const HANDLE completion_port)
+    : impl_(std::make_unique<Impl>(initial_image, completion_port)) {}
 
 AsyncCatalog::~AsyncCatalog() = default;
 

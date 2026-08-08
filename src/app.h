@@ -7,6 +7,8 @@
 #include "navigation.h"
 #include "reservation.h"
 
+#include <ioringapi.h>
+
 namespace pv {
 
 struct ImageRecord {
@@ -31,6 +33,8 @@ struct ResourceContext {
     ReservationTable staging_reservations;
     ReservationTable source_reservations;
     std::vector<std::size_t> priority_order;
+    std::vector<std::size_t> source_desired;
+    bool reservation_plan_dirty = true;
 
     std::size_t compressed_bytes = 0;
     std::size_t gpu_bytes = 0;
@@ -52,16 +56,23 @@ public:
     int Run(HINSTANCE instance, int show_command);
 
 private:
+    struct IoRingApi {
+        decltype(&QueryIoRingCapabilities) query_capabilities = nullptr;
+        decltype(&CreateIoRing) create = nullptr;
+        decltype(&SubmitIoRing) submit = nullptr;
+        decltype(&CloseIoRing) close = nullptr;
+        decltype(&PopIoRingCompletion) pop = nullptr;
+        decltype(&SetIoRingCompletionEvent) set_completion_event = nullptr;
+        decltype(&BuildIoRingReadFile) build_read = nullptr;
+        decltype(&BuildIoRingRegisterBuffers) build_register_buffers = nullptr;
+    };
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
                                              WPARAM wparam, LPARAM lparam);
-    static void CALLBACK IoCompletion(PTP_CALLBACK_INSTANCE instance, void* context,
-                                      void* overlapped, ULONG io_result,
-                                      ULONG_PTR transferred, PTP_IO io);
-    static void CALLBACK ValidationTimerCallback(PTP_CALLBACK_INSTANCE instance,
-                                                 void* context, PTP_TIMER timer);
     void InitializeWindow(HINSTANCE instance, int show_command);
     void ProcessStartupCatalogCompletion();
     void ProcessStartupIoCompletion();
+    void DrainIoCompletions();
+    bool TryInitializeIoRing();
     int EventLoop();
     LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
@@ -89,6 +100,7 @@ private:
 
     void PumpPipeline();
     void InitializeReservations();
+    void RebuildReservationPlan();
     void ReconcileReservations();
     void PrepareStagingForImage(std::size_t index);
     void SubmitReads();
@@ -109,6 +121,12 @@ private:
     void ArmOldestFence();
 
     Config config_;
+    HANDLE io_completion_port_ = nullptr;
+    HIORING io_ring_ = nullptr;
+    HANDLE io_ring_event_ = nullptr;
+    IoRingApi io_ring_api_;
+    bool io_ring_buffers_registered_ = false;
+    std::vector<SlotId> io_ring_buffer_slots_;
     HWND window_ = nullptr;
     bool running_ = true;
     bool graphics_device_ready_ = false;
@@ -134,11 +152,29 @@ private:
     std::chrono::steady_clock::time_point validation_graphics_ready_{};
     std::chrono::steady_clock::time_point validation_navigation_started_{};
     std::chrono::steady_clock::time_point validation_navigation_injection_finished_{};
+    std::uint64_t validation_pump_count_ = 0;
+    std::uint64_t validation_pump_nanoseconds_ = 0;
+    std::uint64_t validation_plan_count_ = 0;
+    std::uint64_t validation_plan_nanoseconds_ = 0;
+    std::uint64_t validation_reconcile_count_ = 0;
+    std::uint64_t validation_reconcile_nanoseconds_ = 0;
+    std::uint64_t validation_dispatch_nanoseconds_ = 0;
+    std::uint64_t validation_submit_reads_nanoseconds_ = 0;
+    std::uint64_t validation_acquire_compressed_nanoseconds_ = 0;
+    std::uint64_t validation_open_file_nanoseconds_ = 0;
+    std::uint64_t validation_associate_iocp_nanoseconds_ = 0;
+    std::uint64_t validation_read_file_nanoseconds_ = 0;
+    std::uint64_t validation_read_file_synchronous_count_ = 0;
+    std::uint64_t validation_read_file_pending_count_ = 0;
+    std::uint64_t validation_submit_uploads_nanoseconds_ = 0;
+    std::uint64_t validation_try_present_nanoseconds_ = 0;
+    std::uint64_t validation_main_kernel_started_ = 0;
+    std::uint64_t validation_main_user_started_ = 0;
     std::vector<std::size_t> validation_ready_indices_;
     std::vector<std::uint64_t> validation_ready_nanoseconds_;
     std::vector<std::size_t> validation_presented_indices_;
     std::vector<std::uint64_t> validation_presented_nanoseconds_;
-    PTP_TIMER validation_navigation_timer_ = nullptr;
+    bool validation_navigation_timer_active_ = false;
     std::vector<IoRequest*> deferred_catalog_io_;
     int exit_code_ = 0;
 

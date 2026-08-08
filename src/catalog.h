@@ -27,7 +27,8 @@ Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
 
 class AsyncCatalog {
 public:
-    AsyncCatalog(const std::filesystem::path& initial_image, HWND window);
+    AsyncCatalog(const std::filesystem::path& initial_image,
+                 HANDLE completion_port);
     ~AsyncCatalog();
 
     AsyncCatalog(const AsyncCatalog&) = delete;
