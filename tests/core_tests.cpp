@@ -205,14 +205,14 @@ void ResourceSlotTests() {
     constexpr pv::SlotId gpu0 = 0;
     constexpr pv::SlotId gpu1 = 1;
     Check(slots.ActivateGpuTexture(gpu0) && slots.ActivateGpuTexture(gpu1),
-          "configured SourceTexture slots must be activatable once");
+          "configured GPU Texture slots must be activatable once");
     Check(!slots.ActivateGpuTexture(2),
-          "SourceTexture slot count must be a hard limit");
+          "GPU Texture slot count must be a hard limit");
     Check(slots.GpuTextureAt(gpu0).state ==
               pv::GpuTextureSlotState::Writable,
           "GPU acquisition state must describe its pipeline phase");
     Check(slots.FreeGpuTextureCount() == 0,
-          "fixed SourceTexture slots leave the inactive index when activated");
+          "fixed GPU Texture slots leave the inactive index when activated");
 
     pv::ResourceSlots budget_limited(2, 2, 1, 4096, 4096);
     Check(budget_limited.AcquireCompressed(4096, 0, 1) != pv::kInvalidSlot,

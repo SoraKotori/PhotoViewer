@@ -1,5 +1,7 @@
 # 8K PNG 有序播放的資源排程設計
 
+> 此文件保存早期資源排程思路，不再定義目前執行角色或執行緒模型。現行設計以 [runtime-design.md](../runtime-design.md) 為準。
+
 ## 一、背景
 
 系統需要連續讀取 PNG 圖片，經過解碼、GPU 傳輸與畫面顯示，目標規格如下：
@@ -8,7 +10,7 @@
 * 播放速度：每秒 30 張
 * PNG 壓縮檔：約 45 MiB／張
 * 解碼後格式：32-bit BGRA，約 126.56 MiB／張
-* 約需 12 個解碼 worker 平行解碼
+* 多張圖片可同時解碼
 * 最終顯示順序必須與 frame ID 完全一致
 
 整體資料流程是：
@@ -20,7 +22,7 @@ CompressedBuffer
     ↓ 解碼
 UploadBuffer
     ↓ GPU 傳輸
-SourceTexture
+GPU Texture
     ↓ 畫面繪製
 BackBuffer
     ↓ 畫面提交
@@ -85,7 +87,7 @@ reservation 只代表容量保證，不代表已經占用某一個具體的實�
 
 * CompressedBuffer
 * UploadBuffer
-* SourceTexture
+* GPU Texture
 
 只有當 frame 完成上一階段、真正準備開始工作時，才取得實體 slot。
 
@@ -224,13 +226,13 @@ UploadBuffer 可以依 GPU 傳輸的完成順序亂序重用。
 
 如果較晚的 frame 先完成 GPU 傳輸，其 UploadBuffer 不必等待較早 frame，即可重新供後續 frame 使用。
 
-UploadBuffer 的數量通常要大於 decoder worker 數量，因為部分 buffer 可能已解碼完成，但仍在等待 GPU 傳輸。
+UploadBuffer 的數量需要涵蓋同時解碼與等待 GPU 傳輸的 frame。
 
 ---
 
-### SourceTexture
+### GPU Texture
 
-SourceTexture 位於 GPU，保存已完成傳輸的 frame，供畫面繪製使用。
+GPU Texture 位於 GPU，保存已完成傳輸的 frame，供畫面繪製使用。
 
 生命週期：
 
@@ -241,34 +243,23 @@ GPU 傳輸
 → GPU 不再使用後重用
 ```
 
-SourceTexture 與前兩種資源不同。
+GPU Texture 與前兩種資源不同。
 
-即使 Frame 5 已經完成 GPU 傳輸，只要 Frame 1～4 尚未顯示，Frame 5 就不能先顯示，因此該 SourceTexture 不能重用。
+即使 Frame 5 已經完成 GPU 傳輸，只要 Frame 1～4 尚未顯示，Frame 5 就不能先顯示，因此該 GPU Texture 不能重用。
 
-SourceTexture 的重用順序通常接近顯示順序，這也是整個 pipeline 最容易形成阻塞的位置。
+GPU Texture 的重用順序通常接近顯示順序，這也是整個 pipeline 最容易形成阻塞的位置。
 
 ---
 
-## 八、decoder worker 與 slot 的差別
+## 八、解碼執行容量與 slot 的差別
 
-12 個 decoder worker 是執行單元，不是長期保存 frame 的資源。
-
-decoder worker 的生命週期是：
-
-```text
-取得一個可開始解碼的 frame
-→ 執行解碼
-→ 解碼完成
-→ worker 立即處理其他 frame
-```
-
-不需要預先將特定 decoder worker 指派給每張 frame。
+解碼執行容量負責處理資料，不負責長期保存 frame；執行角色與工作生命週期統一由 [runtime-design.md](../runtime-design.md) 定義。
 
 真正需要 reservation 的，是會跨越非同步階段並長時間被持有的：
 
 * CompressedBuffer
 * UploadBuffer
-* SourceTexture
+* GPU Texture
 
 ---
 
@@ -339,7 +330,7 @@ Frame 5～8 完成後，其 slots 可以立即重用，再依序提供給 Frame 
 
 6. CompressedBuffer 與 UploadBuffer 可以依完成順序亂序重用。
 
-7. SourceTexture 受有序顯示限制，通常較接近顯示順序重用。
+7. GPU Texture 受有序顯示限制，通常較接近顯示順序重用。
 
 8. 畫面繪製與畫面提交必須嚴格依 frame ID 執行。
 ```

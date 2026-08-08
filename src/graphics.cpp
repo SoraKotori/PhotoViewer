@@ -298,7 +298,7 @@ void Graphics::FinishUpload(GpuImage& image) {
         96.0f, 96.0f);
     CheckHr(d2d_context_->CreateBitmapFromDxgiSurface(surface.Get(), &properties,
                                                       &image.bitmap),
-            "Create Direct2D source bitmap");
+            "Create Direct2D GPU Texture bitmap");
 }
 
 UINT64 Graphics::Draw(const GpuImage& image) {
@@ -312,19 +312,20 @@ UINT64 Graphics::Draw(const GpuImage& image) {
     const float left = (static_cast<float>(surface_width_) - width) * 0.5f;
     const float top = (static_cast<float>(surface_height_) - height) * 0.5f;
     const D2D1_RECT_F destination = D2D1::RectF(left, top, left + width, top + height);
-    const D2D1_RECT_F source = D2D1::RectF(0.0f, 0.0f,
-                                           static_cast<float>(image.width),
-                                           static_cast<float>(image.height));
+    const D2D1_RECT_F gpu_texture_rect = D2D1::RectF(
+        0.0f, 0.0f, static_cast<float>(image.width),
+        static_cast<float>(image.height));
     d2d_context_->BeginDraw();
     d2d_context_->SetTransform(D2D1::Matrix3x2F::Identity());
     d2d_context_->Clear(D2D1::ColorF(D2D1::ColorF::Black));
     d2d_context_->DrawBitmap(image.bitmap.Get(), destination, 1.0f,
-                             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, source);
+                             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                             gpu_texture_rect);
     CheckHr(d2d_context_->EndDraw(), "Direct2D EndDraw");
     CheckHr(swap_chain_->Present(1, 0), "DXGI Present");
     const UINT64 completion = next_fence_value_++;
     CheckHr(context_->Signal(fence_.Get(), completion),
-            "Signal presented SourceTexture completion");
+            "Signal presented GPU Texture completion");
     draw_nanoseconds_ += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin).count());

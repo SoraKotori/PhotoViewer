@@ -376,7 +376,7 @@ void TestGraphics(const HINSTANCE instance) {
               "reused D3D11 fence completion");
         graphics.FinishUpload(image);
         Check(image.texture.Get() == first_texture && image.bitmap.Get() == first_bitmap,
-              "same-sized SourceTexture and Direct2D bitmap must be reused");
+              "same-sized GPU Texture and Direct2D bitmap must be reused");
         Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
               "initial frame credit");
         (void)graphics.Draw(image);
