@@ -69,7 +69,7 @@
 * 播放速度：30 FPS
 * PNG 壓縮資料：約 45 MiB／張
 * 解碼後 BGRA 資料：約 126.56 MiB／張
-* 約 12 個解碼 worker 平行解碼
+* CPU 任務執行器在可用的不同實體核心上平行解碼
 * 最終顯示順序必須完全符合播放控制所要求的順序
 
 基本 pipeline 為：
@@ -108,7 +108,7 @@ BackBuffer
 100 → 99 → 100 → 99 → 100 → 99
 ```
 
-方向切換只改變下一張應顯示的 frame，不代表需要重新建立整條 pipeline，也不代表同一個 frame 每次顯示都要重新讀取、解碼與上傳。
+方向切換以新的下一張應顯示 frame 更新 pipeline 需求；既有 pipeline 與仍符合新需求的中間結果繼續沿用。
 
 ---
 
@@ -120,7 +120,7 @@ BackBuffer
 
 Frame 104 可能比 Frame 101 更早完成讀檔、解碼或 GPU 傳輸。
 
-如果強制所有階段都依顯示順序執行，就會失去多 worker 平行處理的效果。
+儲存、CPU 與 GPU 階段依各 frame 的資料就緒狀態獨立推進，使不同 frame 的階段在同一時刻同時執行並形成 pipeline parallelism。
 
 因此中間階段必須允許：
 
@@ -134,19 +134,7 @@ Frame 104 可能比 Frame 101 更早完成讀檔、解碼或 GPU 傳輸。
 
 ### 較早顯示的 frame 必須保有容量
 
-假設 UploadBuffer 有 8 個 slots。
-
-如果較晚顯示的 Frame 105～108 先完成讀檔，並占用了大部分 UploadBuffer，Frame 101～104 隨後完成時可能沒有足夠容量同時進入解碼。
-
-pipeline 可能退化成：
-
-```text
-Frame 101 解碼完成
-→ Frame 102 才能開始
-→ Frame 103 才能開始
-```
-
-所以需要 reservation 先保證容量，避免較晚顯示的 frame 搶走較早顯示的 frame 所需要的 slot。
+UploadBuffer reservation 依顯示需求順序保證容量。較早顯示的 frame 因此能取得同時解碼所需的 slots，不受較晚顯示 frame 的實際完成順序影響。
 
 ---
 
@@ -1219,7 +1207,7 @@ reservation 的指派順序有序
 
 7. 方向切換時沿用同一組 reservation，並逐份改派原有 reservation。
 
-8. 尚未開始工作的舊方向 reservation 可以立即改派。
+8. 未被進行中工作使用的舊方向 reservation 可以改派。
 
 9. 已開始的讀檔、解碼、GPU 傳輸或畫面繪製，
    必須等目前操作安全完成後才可改派 reservation。
