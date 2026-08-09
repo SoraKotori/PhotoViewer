@@ -55,6 +55,16 @@ public:
                          });
     }
 
+    void Remap(const std::size_t from, const std::size_t to,
+               const std::uint64_t generation) {
+        std::lock_guard lock(mutex_);
+        for (DecodeWork& work : queue_) {
+            if (work.index == from && work.generation == generation) {
+                work.index = to;
+            }
+        }
+    }
+
     void Stop() {
         std::lock_guard lock(mutex_);
         stopped_ = true;

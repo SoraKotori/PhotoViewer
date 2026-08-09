@@ -23,6 +23,7 @@ public:
     void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
                           std::size_t decoded_bytes);
     void UnmapDecodeStaging(DecodeStaging& staging) noexcept;
+    void CopyDecodedToStaging(DecodeStaging& staging);
     UploadTicket SubmitUpload(std::size_t index, std::uint64_t generation,
                               SlotId staging_slot, const DecodeStaging& source,
                               GpuImage& destination);

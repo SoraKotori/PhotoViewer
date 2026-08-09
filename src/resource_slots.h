@@ -15,7 +15,7 @@ enum class CompressedSlotState : std::uint8_t {
 enum class StagingSlotState : std::uint8_t {
     Free,
     Prepared,
-    DecodeOutputMapped,
+    DecodeOutputActive,
     DecodedPixelsAvailable,
     GpuCopySource,
     CancellationPending,
@@ -31,10 +31,7 @@ enum class GpuTextureSlotState : std::uint8_t {
 
 struct IoRequest {
     void Reset() noexcept {
-        header_overlapped = {};
-        content_overlapped = {};
         file = INVALID_HANDLE_VALUE;
-        window = nullptr;
         index = 0;
         generation = 0;
         compressed_slot = kInvalidSlot;
@@ -46,17 +43,14 @@ struct IoRequest {
         header_completed = false;
         content_submitted = false;
         content_completed = false;
-        using_io_ring = false;
+        io_ring_submitted = false;
         header_result = ERROR_IO_PENDING;
         header_transferred = 0;
         result = ERROR_IO_PENDING;
         transferred = 0;
     }
 
-    OVERLAPPED header_overlapped{};
-    OVERLAPPED content_overlapped{};
     HANDLE file = INVALID_HANDLE_VALUE;
-    HWND window = nullptr;
     std::size_t index = 0;
     std::uint64_t generation = 0;
     SlotId compressed_slot = kInvalidSlot;
@@ -68,7 +62,7 @@ struct IoRequest {
     bool header_completed = false;
     bool content_submitted = false;
     bool content_completed = false;
-    bool using_io_ring = false;
+    bool io_ring_submitted = false;
     DWORD header_result = ERROR_IO_PENDING;
     ULONG_PTR header_transferred = 0;
     DWORD result = ERROR_IO_PENDING;
@@ -120,7 +114,8 @@ public:
     ResourceSlots& operator=(const ResourceSlots&) = delete;
 
     [[nodiscard]] SlotId AcquireCompressed(std::size_t bytes, std::size_t image,
-                                           std::uint64_t generation) {
+                                           std::uint64_t generation,
+                                           std::vector<std::byte*>* retired = nullptr) {
         const auto required = CompressedAllocationSize(bytes);
         if (!required || *required > compressed_budget_ || free_compressed_.empty()) {
             return kInvalidSlot;
@@ -129,14 +124,13 @@ public:
         CompressedSlot& slot = Compressed(id);
         const std::size_t before = slot.resource.allocation_size;
         if (before < *required) {
-            TrimCompressed(*required, id);
+            TrimCompressed(*required, id, retired);
             if (compressed_committed_bytes_ - before >
                 compressed_budget_ - *required) {
                 return kInvalidSlot;
             }
         }
-        if (!slot.resource.Allocate(bytes)) {
-            compressed_committed_bytes_ -= before;
+        if (!slot.resource.Allocate(bytes, retired)) {
             return kInvalidSlot;
         }
         compressed_committed_bytes_ = compressed_committed_bytes_ - before +
@@ -146,32 +140,6 @@ public:
         slot.image = image;
         slot.generation = generation;
         return id;
-    }
-
-    [[nodiscard]] bool PreallocateCompressed(const std::size_t count,
-                                             const std::size_t bytes) {
-        if (count > compressed_count_) return false;
-        const auto required = CompressedAllocationSize(bytes);
-        if (!required) return false;
-        std::size_t projected = compressed_committed_bytes_;
-        for (SlotId id = 0; id < count; ++id) {
-            const std::size_t before = Compressed(id).resource.allocation_size;
-            if (before < *required) {
-                if (projected - before > compressed_budget_ - *required) {
-                    return false;
-                }
-                projected = projected - before + *required;
-            }
-        }
-        for (SlotId id = 0; id < count; ++id) {
-            CompressedBuffer& buffer = Compressed(id).resource;
-            const std::size_t before = buffer.allocation_size;
-            if (!buffer.Allocate(bytes)) return false;
-            buffer.size = 0;
-            compressed_committed_bytes_ = compressed_committed_bytes_ - before +
-                                          buffer.allocation_size;
-        }
-        return true;
     }
 
     [[nodiscard]] SlotId AcquireStaging(std::size_t bytes, std::size_t image,
@@ -350,7 +318,8 @@ private:
         return best;
     }
 
-    void TrimCompressed(std::size_t bytes, SlotId protected_id) {
+    void TrimCompressed(std::size_t bytes, SlotId protected_id,
+                        std::vector<std::byte*>* retired) {
         while (compressed_committed_bytes_ - Compressed(protected_id).resource.allocation_size >
                compressed_budget_ - bytes) {
             SlotId victim = kInvalidSlot;
@@ -364,7 +333,7 @@ private:
             }
             if (victim == kInvalidSlot) break;
             compressed_committed_bytes_ -= Compressed(victim).resource.allocation_size;
-            Compressed(victim).resource.ReleaseAllocation();
+            Compressed(victim).resource.ReleaseAllocation(retired);
         }
     }
 

@@ -84,8 +84,7 @@ constexpr int kFileDirectoryInformation = 1;
 }  // namespace
 
 struct AsyncCatalog::Impl {
-    explicit Impl(const std::filesystem::path& initial_image,
-                  const HANDLE completion_port)
+    explicit Impl(const std::filesystem::path& initial_image)
         : absolute(std::filesystem::absolute(initial_image)),
           directory_path(absolute.parent_path()) {
         if (!IsPngExtension(absolute)) {
@@ -98,20 +97,20 @@ struct AsyncCatalog::Impl {
         static_assert(sizeof(query) == sizeof(address));
         std::memcpy(&query, &address, sizeof(query));
 
+        completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!completion_event) ThrowLastError("CreateEventW(catalog)");
+
         directory = CreateFileW(
             directory_path.c_str(), FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             nullptr);
-        if (directory == INVALID_HANDLE_VALUE) ThrowLastError("CreateFileW(directory)");
-        if (CreateIoCompletionPort(directory, completion_port,
-                                   kCatalogIoCompletionKey, 0) !=
-            completion_port) {
+        if (directory == INVALID_HANDLE_VALUE) {
             const DWORD error = GetLastError();
-            CloseHandle(directory);
-            directory = INVALID_HANDLE_VALUE;
+            CloseHandle(completion_event);
+            completion_event = nullptr;
             SetLastError(error);
-            ThrowLastError("CreateIoCompletionPort(directory)");
+            ThrowLastError("CreateFileW(directory)");
         }
         try {
             if (!Submit()) {
@@ -121,6 +120,8 @@ struct AsyncCatalog::Impl {
         } catch (...) {
             CloseHandle(directory);
             directory = INVALID_HANDLE_VALUE;
+            CloseHandle(completion_event);
+            completion_event = nullptr;
             throw;
         }
     }
@@ -128,16 +129,17 @@ struct AsyncCatalog::Impl {
     ~Impl() {
         if (in_flight) {
             CancelIoEx(directory, nullptr);
-            WaitForSingleObject(directory, INFINITE);
+            WaitForSingleObject(completion_event, INFINITE);
         }
         if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
+        if (completion_event) CloseHandle(completion_event);
     }
 
     [[nodiscard]] bool Submit() {
         io_status = {};
         in_flight = true;
         const LONG status = query(
-            directory, nullptr, nullptr, &io_status, &io_status,
+            directory, completion_event, nullptr, nullptr, &io_status,
             buffer.data(), static_cast<ULONG>(buffer.size()),
             kFileDirectoryInformation, restart_scan ? kRestartScan : 0,
             nullptr);
@@ -206,6 +208,7 @@ struct AsyncCatalog::Impl {
     std::filesystem::path absolute;
     std::filesystem::path directory_path;
     HANDLE directory = INVALID_HANDLE_VALUE;
+    HANDLE completion_event = nullptr;
     NtQueryDirectoryFileExFn query = nullptr;
     NativeIoStatusBlock io_status{};
     alignas(8) std::array<std::byte, 64 * 1024> buffer{};
@@ -215,13 +218,16 @@ struct AsyncCatalog::Impl {
     bool completed = false;
 };
 
-AsyncCatalog::AsyncCatalog(const std::filesystem::path& initial_image,
-                           const HANDLE completion_port)
-    : impl_(std::make_unique<Impl>(initial_image, completion_port)) {}
+AsyncCatalog::AsyncCatalog(const std::filesystem::path& initial_image)
+    : impl_(std::make_unique<Impl>(initial_image)) {}
 
 AsyncCatalog::~AsyncCatalog() = default;
 
 bool AsyncCatalog::Advance() { return impl_->Advance(); }
+
+HANDLE AsyncCatalog::CompletionEvent() const noexcept {
+    return impl_->completion_event;
+}
 
 Catalog AsyncCatalog::TakeCatalog() {
     if (!impl_->completed) throw std::logic_error("catalog is incomplete");

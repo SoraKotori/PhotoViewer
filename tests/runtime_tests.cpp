@@ -350,7 +350,12 @@ void TestGraphics(const HINSTANCE instance) {
         pv::Graphics graphics;
         graphics.Initialize(window);
         pv::DecodeStaging staging;
-        graphics.MapDecodeStaging(staging, 64, 64, 64 * 64 * 4);
+        constexpr std::size_t decoded_bytes = 64 * 64 * 4;
+        staging.committed_bytes = decoded_bytes + 64;
+        Check(staging.AllocateCpu(decoded_bytes + 64),
+              "allocate CPU decode surface");
+        Check(staging.PrepareCpuSurface(64, 64, decoded_bytes),
+              "prepare CPU decode surface");
         for (UINT row = 0; row < staging.surface.height; ++row) {
             std::byte* const pixels = staging.surface.pixels +
                 static_cast<std::size_t>(row) * staging.surface.stride;
@@ -361,7 +366,7 @@ void TestGraphics(const HINSTANCE instance) {
                 pixels[column * 4 + 3] = std::byte{0xFF};
             }
         }
-        graphics.UnmapDecodeStaging(staging);
+        graphics.CopyDecodedToStaging(staging);
         pv::GpuImage image;
         pv::UploadTicket ticket = graphics.SubmitUpload(0, 1, 0, staging, image);
         graphics.ArmFence(ticket.fence_value);
