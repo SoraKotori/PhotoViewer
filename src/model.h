@@ -34,7 +34,9 @@ struct CompressedBuffer {
     CompressedBuffer(const CompressedBuffer&) = delete;
     CompressedBuffer& operator=(const CompressedBuffer&) = delete;
 
-    [[nodiscard]] bool Allocate(const std::size_t requested) noexcept {
+    [[nodiscard]] bool Allocate(
+        const std::size_t requested,
+        std::vector<std::byte*>* const retired = nullptr) {
         constexpr std::size_t alignment = 4096;
         if (requested > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
             return false;
@@ -44,22 +46,22 @@ struct CompressedBuffer {
             size = requested;
             return true;
         }
-        if (data) {
-            VirtualFree(data, 0, MEM_RELEASE);
-            data = nullptr;
-            allocation_size = 0;
-            size = 0;
-        }
-        data = static_cast<std::byte*>(VirtualAlloc(
+        std::byte* const replacement = static_cast<std::byte*>(VirtualAlloc(
             nullptr, required, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!data) return false;
+        if (!replacement) return false;
+        ReleaseAllocation(retired);
+        data = replacement;
         allocation_size = required;
         size = requested;
         return true;
     }
 
-    void ReleaseAllocation() noexcept {
-        if (data) VirtualFree(data, 0, MEM_RELEASE);
+    void ReleaseAllocation(
+        std::vector<std::byte*>* const retired = nullptr) {
+        if (data) {
+            if (retired) retired->push_back(data);
+            else VirtualFree(data, 0, MEM_RELEASE);
+        }
         data = nullptr;
         size = 0;
         allocation_size = 0;
@@ -82,7 +84,51 @@ struct DecodeSurface {
 };
 
 struct DecodeStaging {
+    ~DecodeStaging() { ReleaseAllocation(); }
+
+    DecodeStaging() = default;
+    DecodeStaging(const DecodeStaging&) = delete;
+    DecodeStaging& operator=(const DecodeStaging&) = delete;
+
+    [[nodiscard]] bool AllocateCpu(const std::size_t bytes) noexcept {
+        if (bytes == 0) return false;
+        if (cpu_data && cpu_capacity >= bytes) return true;
+        if (cpu_data) VirtualFree(cpu_data, 0, MEM_RELEASE);
+        cpu_data = static_cast<std::byte*>(VirtualAlloc(
+            nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!cpu_data) {
+            cpu_capacity = 0;
+            return false;
+        }
+        cpu_capacity = bytes;
+        return true;
+    }
+
+    [[nodiscard]] bool PrepareCpuSurface(const UINT width, const UINT height,
+                                         const std::size_t decoded_bytes) noexcept {
+        const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
+        if (width == 0 || height == 0 ||
+            decoded_bytes > committed_bytes ||
+            height > committed_bytes - decoded_bytes ||
+            !AllocateCpu(committed_bytes)) {
+            return false;
+        }
+        surface = DecodeSurface{cpu_data, cpu_capacity, decoded_bytes,
+                                width, height, static_cast<UINT>(row_bytes)};
+        cpu_surface = true;
+        return true;
+    }
+
+    void ReleaseCpuAllocation() noexcept {
+        if (cpu_data) VirtualFree(cpu_data, 0, MEM_RELEASE);
+        cpu_data = nullptr;
+        cpu_capacity = 0;
+        if (cpu_surface) surface = {};
+        cpu_surface = false;
+    }
+
     void ReleaseAllocation() noexcept {
+        ReleaseCpuAllocation();
         texture.Reset();
         texture_width = 0;
         texture_height = 0;
@@ -92,14 +138,18 @@ struct DecodeStaging {
     }
 
     void ResetView() noexcept {
+        ReleaseCpuAllocation();
         surface = {};
         mapped = false;
     }
 
+    std::byte* cpu_data = nullptr;
+    std::size_t cpu_capacity = 0;
     ComPtr<ID3D11Texture2D> texture;
     UINT texture_width = 0;
     UINT texture_height = 0;
     std::size_t committed_bytes = 0;
+    bool cpu_surface = false;
     bool mapped = false;
     DecodeSurface surface;
 };

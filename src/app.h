@@ -50,29 +50,36 @@ struct ResourceContext {
 
 class App {
 public:
-    explicit App(Config config);
+    App(Config config, std::chrono::steady_clock::time_point process_started);
     ~App();
 
     int Run(HINSTANCE instance, int show_command);
 
 private:
+    struct ComApartment {
+        ComApartment();
+        ~ComApartment();
+
+        ComApartment(const ComApartment&) = delete;
+        ComApartment& operator=(const ComApartment&) = delete;
+    };
+
     struct IoRingApi {
         decltype(&QueryIoRingCapabilities) query_capabilities = nullptr;
+        decltype(&IsIoRingOpSupported) is_op_supported = nullptr;
         decltype(&CreateIoRing) create = nullptr;
         decltype(&SubmitIoRing) submit = nullptr;
         decltype(&CloseIoRing) close = nullptr;
         decltype(&PopIoRingCompletion) pop = nullptr;
         decltype(&SetIoRingCompletionEvent) set_completion_event = nullptr;
         decltype(&BuildIoRingReadFile) build_read = nullptr;
+        decltype(&BuildIoRingRegisterFileHandles) build_register_files = nullptr;
         decltype(&BuildIoRingRegisterBuffers) build_register_buffers = nullptr;
     };
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
                                              WPARAM wparam, LPARAM lparam);
     void InitializeWindow(HINSTANCE instance, int show_command);
-    void ProcessStartupCatalogCompletion();
-    void ProcessStartupIoCompletion();
-    void DrainIoCompletions();
-    bool TryInitializeIoRing();
+    [[nodiscard]] bool DrainCompletions(bool drain_catalog = true);
     int EventLoop();
     LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
@@ -80,8 +87,10 @@ private:
     void OnDirection(int direction, bool repeat, std::size_t repeat_count);
     void OnDirectionReleased(int direction);
     void OnCatalogComplete();
-    void OnIoHeaderReady(IoRequest* request, LPARAM completion);
-    void OnIoComplete(IoRequest* request, LPARAM completion);
+    void OnIoHeaderReady(IoRequest* request, DWORD result,
+                         ULONG_PTR transferred);
+    void OnIoComplete(IoRequest* request, DWORD result,
+                      ULONG_PTR transferred);
     void CompleteIoRequest(IoRequest* request);
     void OnWorkerComplete();
     void OnGpuComplete();
@@ -108,8 +117,6 @@ private:
     void SubmitUploads();
     bool TryPresent();
 
-    [[nodiscard]] std::vector<std::size_t> PrioritizedCandidates(
-        PipelineStage stage) const;
     [[nodiscard]] PipelineStage StageOf(const ImageRecord& image) const noexcept;
     [[nodiscard]] bool ReservationActive(const ReservationTable& table,
                                          ReservationId id,
@@ -117,16 +124,18 @@ private:
     [[nodiscard]] bool HasReadableGpuTexture(std::size_t frame) const noexcept;
     [[nodiscard]] bool CancelQueuedDecode(std::size_t frame);
     void ReleaseCompressed(ImageRecord& image);
+    void ReleaseRetiredIoBuffers() noexcept;
     void CancelAllIo();
     void ArmOldestFence();
 
     Config config_;
-    HANDLE io_completion_port_ = nullptr;
     HIORING io_ring_ = nullptr;
     HANDLE io_ring_event_ = nullptr;
     IoRingApi io_ring_api_;
-    bool io_ring_buffers_registered_ = false;
-    std::vector<SlotId> io_ring_buffer_slots_;
+    std::unique_ptr<HANDLE[]> io_ring_file_table_;
+    std::unique_ptr<IORING_BUFFER_INFO[]> io_ring_buffer_table_;
+    std::vector<std::byte*> retired_io_buffers_;
+    UINT32 io_ring_registrations_pending_ = 0;
     HWND window_ = nullptr;
     bool running_ = true;
     bool graphics_device_ready_ = false;
@@ -150,6 +159,12 @@ private:
     std::chrono::steady_clock::time_point validation_decoders_ready_{};
     std::chrono::steady_clock::time_point validation_graphics_device_ready_{};
     std::chrono::steady_clock::time_point validation_graphics_ready_{};
+    std::chrono::steady_clock::time_point validation_catalog_ready_{};
+    std::chrono::steady_clock::time_point validation_initial_header_ready_{};
+    std::chrono::steady_clock::time_point validation_initial_content_cqe_observed_{};
+    std::chrono::steady_clock::time_point validation_initial_content_ready_{};
+    std::chrono::steady_clock::time_point validation_initial_decode_submitted_{};
+    std::chrono::steady_clock::time_point validation_initial_decode_completed_{};
     std::chrono::steady_clock::time_point validation_navigation_started_{};
     std::chrono::steady_clock::time_point validation_navigation_injection_finished_{};
     std::uint64_t validation_pump_count_ = 0;
@@ -162,10 +177,7 @@ private:
     std::uint64_t validation_submit_reads_nanoseconds_ = 0;
     std::uint64_t validation_acquire_compressed_nanoseconds_ = 0;
     std::uint64_t validation_open_file_nanoseconds_ = 0;
-    std::uint64_t validation_associate_iocp_nanoseconds_ = 0;
     std::uint64_t validation_read_file_nanoseconds_ = 0;
-    std::uint64_t validation_read_file_synchronous_count_ = 0;
-    std::uint64_t validation_read_file_pending_count_ = 0;
     std::uint64_t validation_submit_uploads_nanoseconds_ = 0;
     std::uint64_t validation_try_present_nanoseconds_ = 0;
     std::uint64_t validation_main_kernel_started_ = 0;
@@ -175,9 +187,9 @@ private:
     std::vector<std::size_t> validation_presented_indices_;
     std::vector<std::uint64_t> validation_presented_nanoseconds_;
     bool validation_navigation_timer_active_ = false;
-    std::vector<IoRequest*> deferred_catalog_io_;
     int exit_code_ = 0;
 
+    std::optional<ComApartment> com_apartment_;
     Graphics graphics_;
     WorkQueue work_queue_;
     CompletionQueue completion_queue_;

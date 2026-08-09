@@ -180,6 +180,21 @@ void ResourceSlotTests() {
           "compressed slot must retain an inline stable I/O request");
     slots.ReleaseCompressed(recycled_compressed);
 
+    pv::ResourceSlots registered_slots(1, 1, 1, 8192, 4096);
+    const pv::SlotId registered = registered_slots.AcquireCompressed(4096, 0, 1);
+    Check(registered != pv::kInvalidSlot,
+          "registered compressed slot must allocate initial storage");
+    std::byte* const registered_address =
+        registered_slots.Compressed(registered).resource.data;
+    registered_slots.ReleaseCompressed(registered);
+    std::vector<std::byte*> retired;
+    retired.reserve(1);
+    Check(registered_slots.AcquireCompressed(8192, 1, 2, &retired) == registered &&
+              retired.size() == 1 && retired.front() == registered_address,
+          "registered buffer replacement must defer the old allocation");
+    registered_slots.ReleaseCompressed(registered);
+    VirtualFree(retired.front(), 0, MEM_RELEASE);
+
     const pv::SlotId staging0 = slots.AcquireStaging(4096, 3, 7);
     const pv::SlotId staging1 = slots.AcquireStaging(4096, 4, 7);
     Check(staging0 != pv::kInvalidSlot && staging1 != pv::kInvalidSlot,
@@ -272,6 +287,14 @@ void ReservationTests() {
     pv::DecodeWork popped;
     Check(queue.Pop(popped, std::stop_token{}) && popped.index == 4,
           "queued decode work must follow the latest navigation priority");
+
+    pv::WorkQueue remap_queue;
+    pv::WorkToken remapped_token;
+    pv::DecodeWork remapped{0, 11, &remapped_token, 0, 0};
+    Check(remap_queue.TryPush(remapped), "catalog remap test work must enter queue");
+    remap_queue.Remap(0, 84, 11);
+    Check(remap_queue.Pop(popped, std::stop_token{}) && popped.index == 84,
+          "queued decode work must follow the catalog frame remap");
 
     pv::WorkQueue naturally_bounded_queue;
     std::array<pv::WorkToken, 32> natural_tokens;

@@ -50,11 +50,7 @@ constexpr std::size_t MiB(const std::size_t value) noexcept {
     return value * 1024ULL * 1024ULL;
 }
 
-constexpr UINT kMessageIoComplete = WM_APP + 1;
 constexpr UINT kMessageWorkerComplete = WM_APP + 2;
 constexpr UINT kMessageValidationStep = WM_APP + 3;
-constexpr UINT kMessageCatalogComplete = WM_APP + 4;
-constexpr UINT kMessageIoHeaderReady = WM_APP + 5;
-constexpr ULONG_PTR kCatalogIoCompletionKey = 1;
 
 }  // namespace pv

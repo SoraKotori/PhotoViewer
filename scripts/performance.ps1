@@ -124,8 +124,6 @@ if ($Direction -eq 'R') {
 
 $resultDirectory = Join-Path $projectRoot 'test-results'
 [System.IO.Directory]::CreateDirectory($resultDirectory) | Out-Null
-$fileList = Join-Path $resultDirectory 'performance-files.txt'
-$usedFiles.FullName | Set-Content -LiteralPath $fileList -Encoding utf8NoBOM
 $before = @{}
 foreach ($file in $usedFiles) {
     $before[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
@@ -154,7 +152,6 @@ for ($run = 1; $run -le $Runs; ++$run) {
         "--gpu-forward-slot-count=$GpuForwardSlots",
         "--gpu-reverse-slot-count=$GpuReverseSlots",
         "--compressed-slot-count=$CompressedSlots",
-        "--validation-file-list=$fileList",
         "--validation-navigation=$navigation",
         "--validation-report=$report",
         '--validation-elapsed-exit-code',

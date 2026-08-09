@@ -207,6 +207,7 @@ void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
     if (staging.mapped || decoded_bytes == 0) {
         throw std::invalid_argument("invalid decode staging map");
     }
+    staging.ReleaseCpuAllocation();
     PrepareDecodeStaging(staging, width, height);
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -237,13 +238,44 @@ void Graphics::UnmapDecodeStaging(DecodeStaging& staging) noexcept {
     staging.surface.allocation_bytes = 0;
 }
 
+void Graphics::CopyDecodedToStaging(DecodeStaging& staging) {
+    const DecodeSurface source = staging.surface;
+    if (!staging.cpu_surface || !source.pixels || source.ByteSize() == 0) {
+        throw std::invalid_argument("invalid decoded CPU source");
+    }
+    PrepareDecodeStaging(staging, source.width, source.height);
+    const std::size_t row_bytes = static_cast<std::size_t>(source.width) * 4;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_WRITE, 0, &mapped),
+            "Map staging texture for decoded copy");
+    if (!mapped.pData || mapped.RowPitch < row_bytes) {
+        context_->Unmap(staging.texture.Get(), 0);
+        throw std::runtime_error("decode staging row pitch is too small");
+    }
+    auto* const destination = static_cast<std::byte*>(mapped.pData);
+    if (mapped.RowPitch == source.stride) {
+        std::memcpy(destination, source.pixels, source.ByteSize());
+    } else {
+        for (UINT row = 0; row < source.height; ++row) {
+            std::memcpy(destination + static_cast<std::size_t>(row) * mapped.RowPitch,
+                        source.pixels + static_cast<std::size_t>(row) * source.stride,
+                        row_bytes);
+        }
+    }
+    context_->Unmap(staging.texture.Get(), 0);
+    staging.ReleaseCpuAllocation();
+    staging.surface = source;
+    staging.surface.pixels = nullptr;
+    staging.surface.allocation_bytes = 0;
+}
+
 UploadTicket Graphics::SubmitUpload(const std::size_t index,
                                     const std::uint64_t generation,
                                     const SlotId staging_slot,
                                     const DecodeStaging& source,
                                     GpuImage& destination) {
     const auto begin = std::chrono::steady_clock::now();
-    if (!source.texture || source.mapped || source.surface.ByteSize() == 0) {
+    if (!source.texture || source.surface.ByteSize() == 0) {
         throw std::invalid_argument("invalid decoded staging source");
     }
     D3D11_TEXTURE2D_DESC description{};

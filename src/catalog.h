@@ -27,14 +27,14 @@ Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
 
 class AsyncCatalog {
 public:
-    AsyncCatalog(const std::filesystem::path& initial_image,
-                 HANDLE completion_port);
+    explicit AsyncCatalog(const std::filesystem::path& initial_image);
     ~AsyncCatalog();
 
     AsyncCatalog(const AsyncCatalog&) = delete;
     AsyncCatalog& operator=(const AsyncCatalog&) = delete;
 
     [[nodiscard]] bool Advance();
+    [[nodiscard]] HANDLE CompletionEvent() const noexcept;
     [[nodiscard]] Catalog TakeCatalog();
 
 private:

@@ -1,6 +1,7 @@
 #include "app.h"
 
 #include "common.h"
+#include "processor_topology.h"
 
 #include <array>
 #include <cmath>
@@ -13,6 +14,8 @@ namespace pv {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"PhotoViewer.Window";
+constexpr UINT_PTR kIoRingRegisterFilesUserData = 1;
+constexpr UINT_PTR kIoRingRegisterBuffersUserData = 2;
 
 void SetWindowStyleChecked(const HWND window, const LONG_PTR style) {
     SetLastError(ERROR_SUCCESS);
@@ -62,22 +65,6 @@ std::optional<std::size_t> DecodeStagingBytes(const PngInfo& png) noexcept {
     return filtered_bytes + row_bytes;
 }
 
-LPARAM PackIoCompletion(const ULONG result,
-                        const ULONG_PTR transferred) noexcept {
-    const std::uint64_t packed =
-        (static_cast<std::uint64_t>(result) << 32) |
-        static_cast<std::uint32_t>(transferred);
-    return static_cast<LPARAM>(packed);
-}
-
-DWORD IoCompletionResult(const LPARAM completion) noexcept {
-    return static_cast<DWORD>(static_cast<std::uint64_t>(completion) >> 32);
-}
-
-DWORD IoCompletionTransferred(const LPARAM completion) noexcept {
-    return static_cast<DWORD>(static_cast<std::uint64_t>(completion));
-}
-
 DWORD IoRingResult(const HRESULT result) noexcept {
     if (SUCCEEDED(result)) return ERROR_SUCCESS;
     if (HRESULT_FACILITY(result) == FACILITY_WIN32) {
@@ -104,16 +91,26 @@ Function LoadKernelFunction(const HMODULE module, const char* name) noexcept {
 
 }  // namespace
 
-App::App(Config config)
+App::ComApartment::ComApartment() {
+    CheckHr(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED), "CoInitializeEx");
+}
+
+App::ComApartment::~ComApartment() { CoUninitialize(); }
+
+App::App(Config config,
+         const std::chrono::steady_clock::time_point process_started)
     : config_(std::move(config)) {
-    io_completion_port_ = CreateIoCompletionPort(
-        INVALID_HANDLE_VALUE, nullptr, 0, 1);
-    if (!io_completion_port_) ThrowLastError("CreateIoCompletionPort");
+    if (!config_.validation_navigation.empty()) {
+        validation_cold_started_ = process_started;
+    }
     const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
     if (kernelbase) {
         io_ring_api_.query_capabilities = LoadKernelFunction<
             decltype(io_ring_api_.query_capabilities)>(
                 kernelbase, "QueryIoRingCapabilities");
+        io_ring_api_.is_op_supported = LoadKernelFunction<
+            decltype(io_ring_api_.is_op_supported)>(
+                kernelbase, "IsIoRingOpSupported");
         io_ring_api_.create = LoadKernelFunction<decltype(io_ring_api_.create)>(
             kernelbase, "CreateIoRing");
         io_ring_api_.submit = LoadKernelFunction<decltype(io_ring_api_.submit)>(
@@ -127,13 +124,18 @@ App::App(Config config)
                 kernelbase, "SetIoRingCompletionEvent");
         io_ring_api_.build_read = LoadKernelFunction<
             decltype(io_ring_api_.build_read)>(kernelbase, "BuildIoRingReadFile");
+        io_ring_api_.build_register_files = LoadKernelFunction<
+            decltype(io_ring_api_.build_register_files)>(
+                kernelbase, "BuildIoRingRegisterFileHandles");
         io_ring_api_.build_register_buffers = LoadKernelFunction<
             decltype(io_ring_api_.build_register_buffers)>(
                 kernelbase, "BuildIoRingRegisterBuffers");
         const bool complete_api = io_ring_api_.query_capabilities &&
+            io_ring_api_.is_op_supported &&
             io_ring_api_.create && io_ring_api_.submit && io_ring_api_.close &&
             io_ring_api_.pop && io_ring_api_.set_completion_event &&
-            io_ring_api_.build_read && io_ring_api_.build_register_buffers;
+            io_ring_api_.build_read && io_ring_api_.build_register_files &&
+            io_ring_api_.build_register_buffers;
         if (complete_api) {
             IORING_CAPABILITIES capabilities{};
             if (SUCCEEDED(io_ring_api_.query_capabilities(&capabilities))) {
@@ -147,7 +149,16 @@ App::App(Config config)
                         capabilities.MaxVersion, flags, queue_size,
                         std::min(queue_size, capabilities.MaxCompletionQueueSize),
                         &io_ring_))) {
-                    io_ring_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    const bool operations_supported =
+                        io_ring_api_.is_op_supported(
+                            io_ring_, IORING_OP_REGISTER_FILES) &&
+                        io_ring_api_.is_op_supported(
+                            io_ring_, IORING_OP_REGISTER_BUFFERS) &&
+                        io_ring_api_.is_op_supported(io_ring_, IORING_OP_READ);
+                    if (operations_supported) {
+                        io_ring_event_ = CreateEventW(
+                            nullptr, FALSE, FALSE, nullptr);
+                    }
                     if (!io_ring_event_ || FAILED(io_ring_api_.set_completion_event(
                             io_ring_, io_ring_event_))) {
                         if (io_ring_event_) CloseHandle(io_ring_event_);
@@ -159,10 +170,19 @@ App::App(Config config)
             }
         }
     }
+    if (!io_ring_) {
+        throw std::runtime_error(
+            "Windows I/O Ring support is required");
+    }
     resources_.slots.emplace(
         config_.compressed_slot_count, config_.staging_slot_count,
         config_.GpuSlotCount(), config_.compressed_budget_bytes,
         config_.staging_cache_bytes);
+    io_ring_file_table_ = std::make_unique<HANDLE[]>(
+        config_.compressed_slot_count);
+    io_ring_buffer_table_ = std::make_unique<IORING_BUFFER_INFO[]>(
+        config_.compressed_slot_count);
+    retired_io_buffers_.reserve(config_.compressed_slot_count);
 }
 
 App::~App() {
@@ -171,54 +191,70 @@ App::~App() {
     decoders_.reset();
     if (graphics_device_ready_ && resources_.slots) {
         for (SlotId id = 0; id < resources_.slots->StagingCount(); ++id) {
-            DecodeStaging& staging = resources_.slots->StagingAt(id).resource;
-            if (staging.mapped) graphics_.UnmapDecodeStaging(staging);
+            graphics_.UnmapDecodeStaging(
+                resources_.slots->StagingAt(id).resource);
         }
     }
     CancelAllIo();
+    ReleaseRetiredIoBuffers();
     if (io_ring_event_) {
         CloseHandle(io_ring_event_);
         io_ring_event_ = nullptr;
     }
-    if (io_completion_port_) {
-        CloseHandle(io_completion_port_);
-        io_completion_port_ = nullptr;
-    }
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
-    if (!config_.validation_navigation.empty()) {
-        validation_cold_started_ = std::chrono::steady_clock::now();
-    }
     if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
         ThrowLastError("Set main thread priority");
     }
+    if (!config_.initial_image.empty()) OpenInitialImage();
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
+        GetLastError() != ERROR_ACCESS_DENIED) {
+        ThrowLastError("SetProcessDpiAwarenessContext");
+    }
+    com_apartment_.emplace();
     InitializeWindow(instance, show_command);
     validation_window_ready_ = std::chrono::steady_clock::now();
-    if (!config_.initial_image.empty()) OpenInitialImage();
-    validation_initial_io_submitted_ = std::chrono::steady_clock::now();
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    if (config_.worker_count == 0) config_.worker_count = DefaultWorkerCount();
     decoders_.emplace(config_.worker_count, work_queue_, completion_queue_,
                       *resources_.slots, window_);
     validation_decoders_ready_ = std::chrono::steady_clock::now();
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    while ((!config_.initial_image.empty() &&
+            validation_initial_content_ready_ ==
+                std::chrono::steady_clock::time_point{}) ||
+           catalog_loading_) {
+        HANDLE handles[2]{io_ring_event_, nullptr};
+        DWORD handle_count = 1;
+        if (catalog_loading_ && catalog_io_) {
+            handles[handle_count++] = catalog_io_->CompletionEvent();
+        }
+        const DWORD result = WaitForMultipleObjects(
+            handle_count, handles, FALSE, INFINITE);
+        if (result == WAIT_FAILED) ThrowLastError("Wait for startup completion");
+        if (result == WAIT_OBJECT_0) {
+            if (DrainCompletions(false)) PumpPipeline();
+        } else if (handle_count == 2 && result == WAIT_OBJECT_0 + 1) {
+            const bool was_loading = catalog_loading_;
+            OnCatalogComplete();
+            if (was_loading && !catalog_loading_) PumpPipeline();
+        }
+    }
     graphics_.InitializeDirect3D(window_);
     graphics_device_ready_ = true;
     validation_graphics_device_ready_ = std::chrono::steady_clock::now();
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    (void)DrainCompletions();
+    // Storage I/O continues in the kernel while main performs the synchronous
+    // D3D device call. Drain queued completions before making the newly
+    // available device usable.
+    PumpPipeline();
     graphics_.InitializeDirect2D();
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    if (DrainCompletions()) PumpPipeline();
     graphics_.InitializeSwapChain();
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    if (DrainCompletions()) PumpPipeline();
     graphics_.InitializeBackBufferTarget();
     graphics_ready_ = true;
-    ProcessStartupCatalogCompletion();
-    ProcessStartupIoCompletion();
+    (void)DrainCompletions();
+    PumpPipeline();
     validation_graphics_ready_ = std::chrono::steady_clock::now();
     ShowWindow(window_, config_.validation_exit_after_present ? SW_HIDE : show_command);
     if (!config_.validation_exit_after_present) UpdateWindow(window_);
@@ -245,80 +281,6 @@ void App::InitializeWindow(const HINSTANCE instance, const int show_command) {
                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                               nullptr, nullptr, instance, this);
     if (!window_) ThrowLastError("CreateWindowExW");
-}
-
-void App::ProcessStartupIoCompletion() {
-    DrainIoCompletions();
-}
-
-bool App::TryInitializeIoRing() {
-    if (!io_ring_ || io_ring_buffers_registered_) {
-        return io_ring_ && io_ring_buffers_registered_;
-    }
-    if (resources_.compressed_reservations.Capacity() == 0) return false;
-    for (const ImageRecord& image : resources_.images) {
-        if (image.io) return false;
-    }
-    std::size_t largest = 0;
-    for (const CatalogItem& item : resources_.catalog.items) {
-        if (!item.file_size_known || item.file_bytes == 0 ||
-            item.file_bytes > std::numeric_limits<DWORD>::max()) {
-            return false;
-        }
-        largest = std::max(largest, static_cast<std::size_t>(item.file_bytes));
-    }
-    constexpr std::size_t registration_alignment = 64 * 1024;
-    if (largest > std::numeric_limits<DWORD>::max() -
-                      (registration_alignment - 1)) {
-        return false;
-    }
-    const std::size_t registered_bytes =
-        ((largest + registration_alignment - 1) / registration_alignment) *
-        registration_alignment;
-    // Register every physical compressed slot.  Restricting registration to
-    // the current reservation capacity would let a previously allocated but
-    // unregistered free slot win the best-fit search after a catalog merge.
-    const std::size_t count = resources_.slots->CompressedCount();
-    if (!resources_.slots->PreallocateCompressed(count, registered_bytes)) {
-        return false;
-    }
-    std::vector<IORING_BUFFER_INFO> buffers;
-    buffers.reserve(count);
-    io_ring_buffer_slots_.clear();
-    io_ring_buffer_slots_.reserve(count);
-    for (SlotId id = 0; id < count; ++id) {
-        const CompressedBuffer& buffer = resources_.slots->Compressed(id).resource;
-        if (!buffer.data || buffer.allocation_size >
-                                std::numeric_limits<UINT32>::max()) {
-            io_ring_buffer_slots_.clear();
-            return false;
-        }
-        buffers.push_back(IORING_BUFFER_INFO{
-            buffer.data, static_cast<UINT32>(buffer.allocation_size)});
-        io_ring_buffer_slots_.push_back(id);
-    }
-    constexpr UINT_PTR registration_user_data = 1;
-    HRESULT result = io_ring_api_.build_register_buffers(
-        io_ring_, static_cast<UINT32>(buffers.size()), buffers.data(),
-        registration_user_data);
-    if (SUCCEEDED(result)) {
-        result = io_ring_api_.submit(io_ring_, 1, INFINITE, nullptr);
-    }
-    IORING_CQE completion{};
-    if (SUCCEEDED(result)) result = io_ring_api_.pop(io_ring_, &completion);
-    if (FAILED(result) || completion.UserData != registration_user_data ||
-        FAILED(completion.ResultCode)) {
-        io_ring_buffer_slots_.clear();
-        io_ring_api_.close(io_ring_);
-        io_ring_ = nullptr;
-        return false;
-    }
-    io_ring_buffers_registered_ = true;
-    return true;
-}
-
-void App::ProcessStartupCatalogCompletion() {
-    DrainIoCompletions();
 }
 
 LRESULT CALLBACK App::WindowProcedure(const HWND window, const UINT message,
@@ -408,13 +370,13 @@ int App::EventLoop() {
     int exit_code = 0;
     while (running_) {
         HANDLE handles[4]{};
-        enum class Kind { Frame, Fence, Io } kinds[4]{};
+        enum class Kind { Frame, Fence, Io, Catalog } kinds[4]{};
         DWORD count = 0;
-        handles[count] = io_completion_port_;
+        handles[count] = io_ring_event_;
         kinds[count++] = Kind::Io;
-        if (io_ring_event_) {
-            handles[count] = io_ring_event_;
-            kinds[count++] = Kind::Io;
+        if (catalog_loading_ && catalog_io_) {
+            handles[count] = catalog_io_->CompletionEvent();
+            kinds[count++] = Kind::Catalog;
         }
         if (!resources_.frame_credit && graphics_.FrameWaitableObject()) {
             handles[count] = graphics_.FrameWaitableObject();
@@ -432,7 +394,11 @@ int App::EventLoop() {
             const DWORD index = result - WAIT_OBJECT_0;
             if (kinds[index] == Kind::Frame) OnFrameCredit();
             else if (kinds[index] == Kind::Fence) OnGpuComplete();
-            else DrainIoCompletions();
+            else if (kinds[index] == Kind::Catalog) {
+                const bool was_loading = catalog_loading_;
+                OnCatalogComplete();
+                if (was_loading && !catalog_loading_) PumpPipeline();
+            } else if (DrainCompletions(false)) PumpPipeline();
         }
 
         MSG message{};
@@ -473,9 +439,10 @@ void App::OpenInitialImage() {
     InitializeReservations();
     resources_.redraw_pending = true;
     PumpPipeline();
+    validation_initial_io_submitted_ = std::chrono::steady_clock::now();
     if (asynchronous_catalog) {
         catalog_loading_ = true;
-        catalog_io_.emplace(config_.initial_image, io_completion_port_);
+        catalog_io_.emplace(config_.initial_image);
     }
 }
 
@@ -501,6 +468,7 @@ void App::OnDirectionReleased(const int direction) {
 
 void App::OnCatalogComplete() {
     if (!catalog_loading_ || !catalog_io_ || !catalog_io_->Advance()) return;
+    validation_catalog_ready_ = std::chrono::steady_clock::now();
     Catalog catalog = catalog_io_->TakeCatalog();
     catalog_io_.reset();
     catalog_loading_ = false;
@@ -522,6 +490,7 @@ void App::OnCatalogComplete() {
                                catalog.items[index].file_bytes == 0;
     }
     images[initial] = std::move(initial_image);
+    work_queue_.Remap(0, initial, resources_.generation);
     if (images[initial].io) images[initial].io->index = initial;
     if (images[initial].compressed_slot != kInvalidSlot) {
         resources_.slots->Compressed(images[initial].compressed_slot).image = initial;
@@ -536,67 +505,71 @@ void App::OnCatalogComplete() {
     InitializeReservations();
     resources_.redraw_pending = true;
 
-    for (IoRequest* const io : deferred_catalog_io_) CompleteIoRequest(io);
-    deferred_catalog_io_.clear();
-    PumpPipeline();
 }
 
-void App::DrainIoCompletions() {
+bool App::DrainCompletions(const bool drain_catalog) {
     bool drained = false;
-    if (io_ring_) {
-        IORING_CQE completion{};
-        while (io_ring_api_.pop(io_ring_, &completion) == S_OK) {
-            drained = true;
-            constexpr UINT_PTR tag_mask = 3;
-            const UINT_PTR tag = completion.UserData & tag_mask;
-            auto* request = reinterpret_cast<IoRequest*>(
-                completion.UserData & ~tag_mask);
-            const LPARAM packed = PackIoCompletion(
-                IoRingResult(completion.ResultCode), completion.Information);
-            if (tag == 1) OnIoHeaderReady(request, packed);
-            else if (tag == 2) OnIoComplete(request, packed);
-        }
-    }
-    for (;;) {
-        DWORD transferred = 0;
-        ULONG_PTR key = 0;
-        OVERLAPPED* overlapped = nullptr;
-        const BOOL success = GetQueuedCompletionStatus(
-            io_completion_port_, &transferred, &key, &overlapped, 0);
-        if (!overlapped) {
-            if (!success && GetLastError() == WAIT_TIMEOUT) break;
-            if (!success) ThrowLastError("GetQueuedCompletionStatus");
-            continue;
-        }
+    IORING_CQE completion{};
+    while (io_ring_api_.pop(io_ring_, &completion) == S_OK) {
         drained = true;
-        if (key == kCatalogIoCompletionKey) {
-            OnCatalogComplete();
+        if (completion.UserData == kIoRingRegisterFilesUserData ||
+            completion.UserData == kIoRingRegisterBuffersUserData) {
+            if (FAILED(completion.ResultCode)) {
+                throw std::runtime_error(
+                    "I/O Ring registration failed (HRESULT " +
+                    std::to_string(static_cast<unsigned long>(
+                        completion.ResultCode)) + ")");
+            }
+            if (completion.UserData == kIoRingRegisterBuffersUserData) {
+                ReleaseRetiredIoBuffers();
+            }
+            if (io_ring_registrations_pending_ != 0) {
+                --io_ring_registrations_pending_;
+            }
             continue;
         }
-        auto* request = reinterpret_cast<IoRequest*>(key);
-        const DWORD result = success ? ERROR_SUCCESS : GetLastError();
-        const LPARAM completion = PackIoCompletion(result, transferred);
-        if (overlapped == &request->header_overlapped) {
-            OnIoHeaderReady(request, completion);
-        } else {
-            OnIoComplete(request, completion);
+        constexpr UINT_PTR tag_mask = 3;
+        const UINT_PTR tag = completion.UserData & tag_mask;
+        auto* request = reinterpret_cast<IoRequest*>(
+            completion.UserData & ~tag_mask);
+        const DWORD result = IoRingResult(completion.ResultCode);
+        if (tag == 1) {
+            OnIoHeaderReady(request, result, completion.Information);
+        } else if (tag == 2) {
+            OnIoComplete(request, result, completion.Information);
         }
     }
-    if (drained && !catalog_loading_) PumpPipeline();
+    while (drain_catalog && catalog_loading_ && catalog_io_) {
+        const DWORD result = WaitForSingleObject(
+            catalog_io_->CompletionEvent(), 0);
+        if (result == WAIT_TIMEOUT) break;
+        if (result != WAIT_OBJECT_0) {
+            ThrowLastError("Wait for catalog completion");
+        }
+        const bool was_loading = catalog_loading_;
+        OnCatalogComplete();
+        drained = drained || (was_loading && !catalog_loading_);
+    }
+    return drained;
 }
 
 void App::OnIoHeaderReady(IoRequest* request,
-                          const LPARAM completion) {
+                          const DWORD result,
+                          const ULONG_PTR transferred) {
     if (!request || request->index >= resources_.images.size()) return;
     ImageRecord& image = resources_.images[request->index];
     if (!image.io || image.io != request ||
         request->generation != image.generation || request->header_completed) {
         return;
     }
-    const DWORD transferred = IoCompletionTransferred(completion);
-    request->header_result = IoCompletionResult(completion);
+    request->header_result = result;
     request->header_transferred = transferred;
     request->header_completed = true;
+    if (request->index == resources_.navigation.CurrentIndex() &&
+        resources_.navigation.InitialPending() &&
+        validation_initial_header_ready_ == std::chrono::steady_clock::time_point{}) {
+        validation_initial_header_ready_ = std::chrono::steady_clock::now();
+    }
     if (request->header_result == ERROR_SUCCESS && transferred >= 24) {
         const auto header = ParsePngHeader(std::span<const std::byte>(
             request->destination, 24));
@@ -605,6 +578,15 @@ void App::OnIoHeaderReady(IoRequest* request,
             item.png = *header;
             item.header_valid = true;
             PrepareStagingForImage(request->index);
+            if (!graphics_device_ready_ &&
+                resources_.navigation.InitialPending() &&
+                request->index == resources_.navigation.CurrentIndex() &&
+                image.staging_slot != kInvalidSlot) {
+                DecodeStaging& staging = resources_.slots->StagingAt(
+                    image.staging_slot).resource;
+                (void)staging.PrepareCpuSurface(
+                    item.png.width, item.png.height, item.png.decoded_bytes);
+            }
         }
     }
     if (!request->content_submitted || request->content_completed) {
@@ -612,33 +594,31 @@ void App::OnIoHeaderReady(IoRequest* request,
             request->result = ERROR_SUCCESS;
             request->transferred = 0;
         }
-        if (catalog_loading_) {
-            if (std::ranges::find(deferred_catalog_io_, request) ==
-                deferred_catalog_io_.end()) {
-                deferred_catalog_io_.push_back(request);
-            }
-        } else {
-            CompleteIoRequest(request);
-        }
+        CompleteIoRequest(request);
     }
 }
 
-void App::OnIoComplete(IoRequest* request, LPARAM completion) {
+void App::OnIoComplete(IoRequest* request, const DWORD result,
+                       const ULONG_PTR transferred) {
     if (request && request->index < resources_.images.size()) {
         ImageRecord& image = resources_.images[request->index];
         if (image.io == request && !request->content_completed) {
-            request->result = IoCompletionResult(completion);
-            request->transferred = IoCompletionTransferred(completion);
+            if (request->result == ERROR_IO_PENDING || result != ERROR_SUCCESS) {
+                request->result = result;
+            }
+            request->transferred += transferred;
             request->content_completed = true;
+            if (request->index == resources_.navigation.CurrentIndex() &&
+                resources_.navigation.InitialPending() &&
+                validation_initial_content_cqe_observed_ ==
+                    std::chrono::steady_clock::time_point{}) {
+                // IORING_CQE has no kernel completion timestamp.  This records
+                // when main popped the CQE, which may be later than the I/O.
+                validation_initial_content_cqe_observed_ =
+                    std::chrono::steady_clock::now();
+            }
             if (!request->split_header || request->header_completed) {
-                if (catalog_loading_) {
-                    if (std::ranges::find(deferred_catalog_io_, request) ==
-                        deferred_catalog_io_.end()) {
-                        deferred_catalog_io_.push_back(request);
-                    }
-                } else {
-                    CompleteIoRequest(request);
-                }
+                CompleteIoRequest(request);
             }
         }
     }
@@ -667,6 +647,11 @@ void App::CompleteIoRequest(IoRequest* const request) {
                          transferred == expected_content;
     const bool current = request->generation == image.generation;
     image.io = nullptr;
+    if (request->index == resources_.navigation.CurrentIndex() &&
+        resources_.navigation.InitialPending() &&
+        validation_initial_content_ready_ == std::chrono::steady_clock::time_point{}) {
+        validation_initial_content_ready_ = std::chrono::steady_clock::now();
+    }
 
     const bool reserved = current && ReservationActive(
         resources_.compressed_reservations, image.compressed_reservation,
@@ -699,14 +684,16 @@ void App::CompleteIoRequest(IoRequest* const request) {
 
 void App::OnWorkerComplete() {
     CompletionQueue::Batch batch = completion_queue_.DrainAll();
+    if (batch.results.empty() && batch.released_inputs.empty()) return;
     for (ReleasedInput& input : batch.released_inputs) {
         if (input.compressed_slot == kInvalidSlot) continue;
         CompressedSlot& slot = resources_.slots->Compressed(input.compressed_slot);
         if (resources_.compressed_bytes >= slot.resource.size) {
             resources_.compressed_bytes -= slot.resource.size;
         }
-        if (input.index < resources_.images.size()) {
-            ImageRecord& image = resources_.images[input.index];
+        const std::size_t frame = slot.image;
+        if (frame < resources_.images.size()) {
+            ImageRecord& image = resources_.images[frame];
             if (image.generation == input.generation &&
                 image.compressed_slot == input.compressed_slot) {
                 image.compressed_slot = kInvalidSlot;
@@ -717,12 +704,20 @@ void App::OnWorkerComplete() {
     for (DecodeResult& result : batch.results) {
         if (result.staging_slot == kInvalidSlot) continue;
         StagingSlot& slot = resources_.slots->StagingAt(result.staging_slot);
-        graphics_.UnmapDecodeStaging(slot.resource);
-        if (result.index >= resources_.images.size()) {
+        const bool cpu_decode = slot.resource.cpu_surface;
+        if (!cpu_decode) graphics_.UnmapDecodeStaging(slot.resource);
+        const std::size_t frame = slot.image;
+        if (frame >= resources_.images.size()) {
             resources_.slots->ReleaseStaging(result.staging_slot);
             continue;
         }
-        ImageRecord& image = resources_.images[result.index];
+        ImageRecord& image = resources_.images[frame];
+        if (frame == resources_.navigation.CurrentIndex() &&
+            resources_.navigation.InitialPending() &&
+            validation_initial_decode_completed_ ==
+                std::chrono::steady_clock::time_point{}) {
+            validation_initial_decode_completed_ = std::chrono::steady_clock::now();
+        }
         if (result.generation != image.generation) {
             resources_.slots->ReleaseStaging(result.staging_slot);
             continue;
@@ -730,8 +725,9 @@ void App::OnWorkerComplete() {
         image.work_active = false;
         const bool reserved = ReservationActive(
             resources_.staging_reservations, image.staging_reservation,
-            result.index);
+            frame);
         if (result.success && reserved) {
+            if (cpu_decode) graphics_.CopyDecodedToStaging(slot.resource);
             slot.state = StagingSlotState::DecodedPixelsAvailable;
         } else {
             resources_.slots->ReleaseStaging(result.staging_slot);
@@ -923,10 +919,7 @@ void App::InjectValidationNavigation() {
     validation_submit_reads_nanoseconds_ = 0;
     validation_acquire_compressed_nanoseconds_ = 0;
     validation_open_file_nanoseconds_ = 0;
-    validation_associate_iocp_nanoseconds_ = 0;
     validation_read_file_nanoseconds_ = 0;
-    validation_read_file_synchronous_count_ = 0;
-    validation_read_file_pending_count_ = 0;
     validation_submit_uploads_nanoseconds_ = 0;
     validation_try_present_nanoseconds_ = 0;
     FILETIME created{};
@@ -1066,6 +1059,20 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
            << startup_nanoseconds(validation_graphics_device_ready_) << '\n'
            << "startup_graphics_ready_nanoseconds="
            << startup_nanoseconds(validation_graphics_ready_) << '\n'
+           << "startup_catalog_ready_nanoseconds="
+           << startup_nanoseconds(validation_catalog_ready_) << '\n'
+           << "startup_initial_header_ready_nanoseconds="
+           << startup_nanoseconds(validation_initial_header_ready_) << '\n'
+           << "startup_initial_content_cqe_observed_nanoseconds="
+           << startup_nanoseconds(validation_initial_content_cqe_observed_) << '\n'
+           << "startup_initial_content_ready_nanoseconds="
+           << startup_nanoseconds(validation_initial_content_ready_) << '\n'
+           << "startup_initial_decode_submitted_nanoseconds="
+           << startup_nanoseconds(validation_initial_decode_submitted_) << '\n'
+           << "startup_initial_decode_completed_nanoseconds="
+           << startup_nanoseconds(validation_initial_decode_completed_) << '\n'
+           << "io_ring_registered_references_enabled=" << (io_ring_ ? 1 : 0)
+           << '\n'
            << "io_prefix_granularity=" << io_prefix_granularity_ << '\n';
     for (std::size_t index = 0; index < names.size(); ++index) {
         output << names[index] << '=' << counts[index] << '\n';
@@ -1222,14 +1229,8 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
            << validation_acquire_compressed_nanoseconds_ << '\n'
            << "open_file_nanoseconds="
            << validation_open_file_nanoseconds_ << '\n'
-           << "associate_iocp_nanoseconds="
-           << validation_associate_iocp_nanoseconds_ << '\n'
-           << "read_file_nanoseconds="
+           << "build_io_ring_nanoseconds="
            << validation_read_file_nanoseconds_ << '\n'
-           << "read_file_synchronous_count="
-           << validation_read_file_synchronous_count_ << '\n'
-           << "read_file_pending_count="
-           << validation_read_file_pending_count_ << '\n'
            << "submit_uploads_nanoseconds="
            << validation_submit_uploads_nanoseconds_ << '\n'
            << "try_present_nanoseconds="
@@ -1318,7 +1319,7 @@ PipelineStage App::StageOf(const ImageRecord& image) const noexcept {
         switch (resources_.slots->StagingAt(image.staging_slot).state) {
             case StagingSlotState::Prepared:
                 break;
-            case StagingSlotState::DecodeOutputMapped:
+            case StagingSlotState::DecodeOutputActive:
                 return PipelineStage::DecodeQueued;
             case StagingSlotState::DecodedPixelsAvailable:
                 return PipelineStage::DecodedStagingAvailable;
@@ -1422,8 +1423,8 @@ bool App::CancelQueuedDecode(const std::size_t frame) {
     }
 
     if (cancelled.staging_slot != kInvalidSlot) {
-        StagingSlot& staging = resources_.slots->StagingAt(cancelled.staging_slot);
-        graphics_.UnmapDecodeStaging(staging.resource);
+        graphics_.UnmapDecodeStaging(
+            resources_.slots->StagingAt(cancelled.staging_slot).resource);
         resources_.slots->ReleaseStaging(cancelled.staging_slot);
         if (image.staging_slot == cancelled.staging_slot) {
             image.staging_slot = kInvalidSlot;
@@ -1606,7 +1607,7 @@ void App::ReconcileReservations() {
                 slot.state == StagingSlotState::DecodedPixelsAvailable) {
                 return true;
             }
-            if (slot.state == StagingSlotState::DecodeOutputMapped ||
+            if (slot.state == StagingSlotState::DecodeOutputActive ||
                 slot.state == StagingSlotState::CancellationPending) {
                 if (CancelQueuedDecode(frame)) return true;
                 if (image.work_active) {
@@ -1691,20 +1692,8 @@ void App::ReconcileReservations() {
     }
 }
 
-std::vector<std::size_t> App::PrioritizedCandidates(
-    const PipelineStage stage) const {
-    std::vector<std::size_t> candidates;
-    candidates.reserve(resources_.priority_order.size());
-    for (const std::size_t index : resources_.priority_order) {
-        if (StageOf(resources_.images[index]) == stage) {
-            candidates.push_back(index);
-        }
-    }
-    return candidates;
-}
-
 void App::PrepareStagingForImage(const std::size_t index) {
-    if (!graphics_device_ready_ || index >= resources_.images.size()) return;
+    if (index >= resources_.images.size()) return;
     ImageRecord& image = resources_.images[index];
     if (image.failed || image.staging_slot != kInvalidSlot ||
         !ReservationActive(resources_.staging_reservations,
@@ -1722,13 +1711,9 @@ void App::PrepareStagingForImage(const std::size_t index) {
     const SlotId staging_slot = resources_.slots->AcquireStaging(
         *staging_bytes, index, image.generation);
     if (staging_slot == kInvalidSlot) return;
-    try {
-        graphics_.PrepareDecodeStaging(
-            resources_.slots->StagingAt(staging_slot).resource,
-            item.png.width, item.png.height);
-    } catch (...) {
-        resources_.slots->ReleaseStaging(staging_slot);
-        throw;
+    DecodeStaging& staging = resources_.slots->StagingAt(staging_slot).resource;
+    if (graphics_device_ready_) {
+        graphics_.PrepareDecodeStaging(staging, item.png.width, item.png.height);
     }
     image.staging_slot = staging_slot;
 }
@@ -1745,20 +1730,18 @@ void App::SubmitReads() {
                 std::chrono::steady_clock::now() - begin).count());
         return result;
     };
-    if (io_ring_ && !io_ring_buffers_registered_) {
-        bool active = false;
-        for (const ImageRecord& image : resources_.images) {
-            active = active || image.io != nullptr;
+    if (io_ring_registrations_pending_ != 0) return;
+    const bool initial_content_pending =
+        resources_.navigation.InitialPending() &&
+        validation_initial_content_ready_ ==
+            std::chrono::steady_clock::time_point{};
+    const std::size_t initial_index = resources_.navigation.CurrentIndex();
+    bool prepared_reads = false;
+    for (const std::size_t index : resources_.priority_order) {
+        if (initial_content_pending && index != initial_index) continue;
+        if (StageOf(resources_.images[index]) != PipelineStage::WaitingIo) {
+            continue;
         }
-        if (active) return;
-        if (!TryInitializeIoRing() && io_ring_) {
-            io_ring_api_.close(io_ring_);
-            io_ring_ = nullptr;
-        }
-    }
-    const bool use_io_ring = io_ring_ && io_ring_buffers_registered_;
-    UINT32 io_ring_entries = 0;
-    for (const std::size_t index : PrioritizedCandidates(PipelineStage::WaitingIo)) {
         ImageRecord& image = resources_.images[index];
         CatalogItem& item = resources_.catalog.items[index];
         HANDLE opened_file = measured(
@@ -1768,7 +1751,7 @@ void App::SubmitReads() {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
-                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+                        FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING,
                     nullptr);
             },
             validation_open_file_nanoseconds_);
@@ -1821,7 +1804,8 @@ void App::SubmitReads() {
         const SlotId compressed_slot = measured(
             [&] {
                 return resources_.slots->AcquireCompressed(
-                    transfer_bytes, index, image.generation);
+                    transfer_bytes, index, image.generation,
+                    &retired_io_buffers_);
             },
             validation_acquire_compressed_nanoseconds_);
         if (compressed_slot == kInvalidSlot) {
@@ -1833,43 +1817,10 @@ void App::SubmitReads() {
             resources_.slots->Compressed(compressed_slot);
         IoRequest& request = compressed_state.io;
         request.Reset();
-        request.window = window_;
         request.index = index;
         request.generation = image.generation;
         request.compressed_slot = compressed_slot;
         request.file = opened_file;
-        UINT32 registered_buffer = 0;
-        if (use_io_ring) {
-            const auto found = std::find(io_ring_buffer_slots_.begin(),
-                                         io_ring_buffer_slots_.end(),
-                                         compressed_slot);
-            if (found == io_ring_buffer_slots_.end()) {
-                CloseHandle(request.file);
-                request.file = INVALID_HANDLE_VALUE;
-                resources_.slots->ReleaseCompressed(compressed_slot);
-                image.compressed_slot = kInvalidSlot;
-                continue;
-            }
-            registered_buffer = static_cast<UINT32>(
-                std::distance(io_ring_buffer_slots_.begin(), found));
-            request.using_io_ring = true;
-        } else {
-            const HANDLE associated_port = measured(
-                [&] {
-                    return CreateIoCompletionPort(
-                        request.file, io_completion_port_,
-                        reinterpret_cast<ULONG_PTR>(&request), 0);
-                },
-                validation_associate_iocp_nanoseconds_);
-            if (associated_port != io_completion_port_) {
-                CloseHandle(request.file);
-                request.file = INVALID_HANDLE_VALUE;
-                resources_.slots->ReleaseCompressed(compressed_slot);
-                image.compressed_slot = kInvalidSlot;
-                image.failed = true;
-                continue;
-            }
-        }
 
         resources_.compressed_bytes += compressed;
         image.io = &request;
@@ -1879,92 +1830,127 @@ void App::SubmitReads() {
         image.io->byte_count = static_cast<DWORD>(compressed);
         image.io->transfer_count = static_cast<DWORD>(transfer_bytes);
         image.io->split_header = !item.header_valid;
+        prepared_reads = true;
+    }
+    if (!prepared_reads) return;
+
+    const UINT32 table_count = static_cast<UINT32>(
+        resources_.slots->CompressedCount());
+    for (UINT32 id = 0; id < table_count; ++id) {
+        io_ring_file_table_[id] = INVALID_HANDLE_VALUE;
+    }
+    for (const ImageRecord& image : resources_.images) {
+        if (!image.io || image.io->compressed_slot == kInvalidSlot) continue;
+        const SlotId slot = image.io->compressed_slot;
+        io_ring_file_table_[slot] = image.io->file;
+    }
+    bool register_buffers = false;
+    for (UINT32 id = 0; id < table_count; ++id) {
+        const CompressedBuffer& buffer =
+            resources_.slots->Compressed(id).resource;
+        const IORING_BUFFER_INFO desired{
+            buffer.data, static_cast<UINT32>(buffer.allocation_size)};
+        if (io_ring_buffer_table_[id].Address != desired.Address ||
+            io_ring_buffer_table_[id].Length != desired.Length) {
+            io_ring_buffer_table_[id] = desired;
+            register_buffers = true;
+        }
+    }
+    HRESULT result = measured(
+        [&] {
+            return io_ring_api_.build_register_files(
+                io_ring_, table_count, io_ring_file_table_.get(),
+                kIoRingRegisterFilesUserData);
+        },
+        validation_read_file_nanoseconds_);
+    if (SUCCEEDED(result) && register_buffers) {
+        result = measured(
+            [&] {
+                return io_ring_api_.build_register_buffers(
+                    io_ring_, table_count, io_ring_buffer_table_.get(),
+                    kIoRingRegisterBuffersUserData);
+            },
+            validation_read_file_nanoseconds_);
+    }
+    if (FAILED(result)) {
+        throw std::runtime_error("Build I/O Ring registration failed (HRESULT " +
+                                 std::to_string(static_cast<unsigned long>(result)) +
+                                 ")");
+    }
+    if (!register_buffers && !retired_io_buffers_.empty()) {
+        throw std::logic_error("retired I/O buffer without table replacement");
+    }
+
+    UINT32 io_ring_entries = register_buffers ? 2 : 1;
+    for (const std::size_t index : resources_.priority_order) {
+        ImageRecord& image = resources_.images[index];
+        if (!image.io || image.io->io_ring_submitted) continue;
         const auto submit_read = [&](const DWORD buffer_offset,
                                      const DWORD bytes,
                                      const std::uint64_t file_offset,
-                                     const UINT_PTR tag,
-                                     OVERLAPPED* overlapped) {
-            if (!use_io_ring) {
-                return ReadFile(image.io->file, buffer.data + buffer_offset,
-                                bytes, nullptr, overlapped);
-            }
+                                     const UINT_PTR tag) {
             const UINT_PTR user_data =
                 reinterpret_cast<UINT_PTR>(image.io) | tag;
             const HRESULT result = io_ring_api_.build_read(
-                io_ring_, IoRingHandleRefFromHandle(image.io->file),
-                IoRingBufferRefFromIndexAndOffset(registered_buffer,
-                                                  buffer_offset),
+                io_ring_, IoRingHandleRefFromIndex(image.io->compressed_slot),
+                IoRingBufferRefFromIndexAndOffset(
+                    image.io->compressed_slot, buffer_offset),
                 bytes, file_offset, user_data, IOSQE_FLAGS_NONE);
             if (FAILED(result)) {
-                SetLastError(IoRingResult(result));
-                return FALSE;
+                image.io->result = IoRingResult(result);
+                return false;
             }
             ++io_ring_entries;
-            SetLastError(ERROR_IO_PENDING);
-            return FALSE;
+            return true;
         };
         bool initial_submission_failed = false;
+        const auto submit_content = [&](const DWORD buffer_offset,
+                                        const DWORD bytes,
+                                        const std::uint64_t file_offset) {
+            const bool submitted = measured(
+                [&] {
+                    return submit_read(buffer_offset, bytes, file_offset, 2);
+                },
+                validation_read_file_nanoseconds_);
+            if (!submitted) return false;
+            image.io->content_submitted = true;
+            return true;
+        };
+        const auto submit_content_range = [&](const DWORD first_offset) {
+            if (first_offset >= image.io->transfer_count) return true;
+            return submit_content(first_offset,
+                                  image.io->transfer_count - first_offset,
+                                  first_offset);
+        };
         if (image.io->split_header) {
             image.io->prefix_bytes = std::min(
                 image.io->byte_count, io_prefix_granularity_);
             const DWORD prefix_transfer = std::min(
                 image.io->transfer_count, io_prefix_granularity_);
-            const BOOL prefix_submitted = measured(
+            const bool prefix_submitted = measured(
                 [&] {
-                    return submit_read(0, prefix_transfer, 0, 1,
-                                       &image.io->header_overlapped);
+                    return submit_read(0, prefix_transfer, 0, 1);
                 },
                 validation_read_file_nanoseconds_);
-            ++(prefix_submitted ? validation_read_file_synchronous_count_
-                                : validation_read_file_pending_count_);
-            if (!prefix_submitted && GetLastError() != ERROR_IO_PENDING) {
+            if (!prefix_submitted) {
                 initial_submission_failed = true;
             } else if (prefix_transfer < image.io->transfer_count) {
-                image.io->content_submitted = true;
-                image.io->content_overlapped.Offset = prefix_transfer;
-                const BOOL content_submitted = measured(
-                    [&] {
-                        return submit_read(
-                            prefix_transfer,
-                            image.io->transfer_count - prefix_transfer,
-                            prefix_transfer, 2,
-                            &image.io->content_overlapped);
-                    },
-                    validation_read_file_nanoseconds_);
-                ++(content_submitted ? validation_read_file_synchronous_count_
-                                     : validation_read_file_pending_count_);
-                if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
-                    const DWORD error = GetLastError();
-                    image.io->result = error;
-                    image.io->transferred = 0;
-                    image.io->content_completed = true;
-                }
+                image.io->result = ERROR_SUCCESS;
+                (void)submit_content_range(prefix_transfer);
+                image.io->content_completed = !image.io->content_submitted;
             }
         } else {
-            image.io->content_submitted = true;
-            const BOOL content_submitted = measured(
-                [&] {
-                    return submit_read(0, image.io->transfer_count, 0, 2,
-                                       &image.io->content_overlapped);
-                },
-                validation_read_file_nanoseconds_);
-            ++(content_submitted ? validation_read_file_synchronous_count_
-                                 : validation_read_file_pending_count_);
-            if (!content_submitted && GetLastError() != ERROR_IO_PENDING) {
+            image.io->result = ERROR_SUCCESS;
+            if (!submit_content_range(0) && !image.io->content_submitted) {
                 initial_submission_failed = true;
             }
         }
         if (initial_submission_failed) {
-            CloseHandle(image.io->file);
-            resources_.slots->ReleaseCompressed(image.io->compressed_slot);
-            image.io = nullptr;
-            image.compressed_slot = kInvalidSlot;
-            resources_.compressed_bytes -= compressed;
-            image.failed = true;
+            throw std::runtime_error("BuildIoRingReadFile failed");
         }
     }
-    if (use_io_ring && io_ring_entries != 0) {
-        const HRESULT result = measured(
+    if (io_ring_entries != 0) {
+        result = measured(
             [&] { return io_ring_api_.submit(io_ring_, 0, 0, nullptr); },
             validation_read_file_nanoseconds_);
         if (FAILED(result)) {
@@ -1973,12 +1959,20 @@ void App::SubmitReads() {
                                          static_cast<unsigned long>(result)) +
                                      ")");
         }
+        io_ring_registrations_pending_ = register_buffers ? 2 : 1;
+        for (ImageRecord& image : resources_.images) {
+            if (image.io && !image.io->io_ring_submitted) {
+                image.io->io_ring_submitted = true;
+            }
+        }
     }
 }
 
 void App::DispatchDecodes() {
-    for (const std::size_t index : PrioritizedCandidates(
-             PipelineStage::CompressedReady)) {
+    for (const std::size_t index : resources_.priority_order) {
+        if (StageOf(resources_.images[index]) != PipelineStage::CompressedReady) {
+            continue;
+        }
         ImageRecord& image = resources_.images[index];
         if (!ReservationActive(resources_.staging_reservations,
                                image.staging_reservation, index)) {
@@ -2007,10 +2001,19 @@ void App::DispatchDecodes() {
             staging_state.generation != image.generation) {
             throw std::logic_error("invalid prepared staging slot");
         }
-        graphics_.MapDecodeStaging(staging_state.resource,
-                                   item.png.width, item.png.height,
-                                   item.png.decoded_bytes);
-        staging_state.state = StagingSlotState::DecodeOutputMapped;
+        if (graphics_device_ready_) {
+            graphics_.MapDecodeStaging(staging_state.resource,
+                                       item.png.width, item.png.height,
+                                       item.png.decoded_bytes);
+        } else if (!staging_state.resource.cpu_surface &&
+                   !staging_state.resource.PrepareCpuSurface(
+                       item.png.width, item.png.height,
+                       item.png.decoded_bytes)) {
+            resources_.slots->ReleaseStaging(staging_slot);
+            image.staging_slot = kInvalidSlot;
+            continue;
+        }
+        staging_state.state = StagingSlotState::DecodeOutputActive;
         WorkToken& work_token = resources_.slots->WorkTokenAt(staging_slot);
         work_token.claim.store(WorkClaim::Queued, std::memory_order_relaxed);
         DecodeWork work{index, image.generation, &work_token,
@@ -2026,12 +2029,22 @@ void App::DispatchDecodes() {
             break;
         }
         image.work_active = true;
+        if (resources_.navigation.InitialPending() &&
+            index == resources_.navigation.CurrentIndex() &&
+            validation_initial_decode_submitted_ ==
+                std::chrono::steady_clock::time_point{}) {
+            validation_initial_decode_submitted_ = std::chrono::steady_clock::now();
+        }
     }
 }
 
 void App::SubmitUploads() {
-    for (const std::size_t index : PrioritizedCandidates(
-             PipelineStage::DecodedStagingAvailable)) {
+    if (catalog_loading_) return;
+    for (const std::size_t index : resources_.priority_order) {
+        if (StageOf(resources_.images[index]) !=
+            PipelineStage::DecodedStagingAvailable) {
+            continue;
+        }
         ImageRecord& image = resources_.images[index];
         if (!ReservationActive(resources_.gpu_texture_reservations,
                                image.gpu_texture_reservation, index)) {
@@ -2171,46 +2184,57 @@ void App::ArmOldestFence() {
     }
 }
 
+void App::ReleaseRetiredIoBuffers() noexcept {
+    for (std::byte* const buffer : retired_io_buffers_) {
+        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+    }
+    retired_io_buffers_.clear();
+}
+
 void App::CancelAllIo() {
+    std::size_t pending_ring_operations = 0;
+    for (ImageRecord& image : resources_.images) {
+        if (image.io && image.io->file != INVALID_HANDLE_VALUE) {
+            CancelIoEx(image.io->file, nullptr);
+            if (!image.io->io_ring_submitted) continue;
+            if (image.io->split_header && !image.io->header_completed) {
+                ++pending_ring_operations;
+            }
+            if (image.io->content_submitted && !image.io->content_completed) {
+                ++pending_ring_operations;
+            }
+        }
+    }
+    while (pending_ring_operations != 0) {
+        IORING_CQE completion{};
+        bool drained = false;
+        while (io_ring_api_.pop(io_ring_, &completion) == S_OK) {
+            drained = true;
+            constexpr UINT_PTR tag_mask = 3;
+            const UINT_PTR tag = completion.UserData & tag_mask;
+            auto* request = reinterpret_cast<IoRequest*>(
+                completion.UserData & ~tag_mask);
+            if (!request) continue;
+            if (tag == 1 && request->split_header &&
+                !request->header_completed) {
+                request->header_completed = true;
+                --pending_ring_operations;
+            } else if (tag == 2 && request->content_submitted &&
+                       !request->content_completed) {
+                request->content_completed = true;
+                --pending_ring_operations;
+            }
+        }
+        if (pending_ring_operations != 0 && !drained) {
+            const DWORD wait = WaitForSingleObject(io_ring_event_, INFINITE);
+            if (wait != WAIT_OBJECT_0) {
+                ThrowLastError("Wait for I/O ring shutdown completion");
+            }
+        }
+    }
     if (io_ring_) {
         io_ring_api_.close(io_ring_);
         io_ring_ = nullptr;
-        io_ring_buffers_registered_ = false;
-    }
-    std::size_t pending_operations = 0;
-    for (ImageRecord& image : resources_.images) {
-        if (image.io && !image.io->using_io_ring &&
-            image.io->file != INVALID_HANDLE_VALUE) {
-            CancelIoEx(image.io->file, nullptr);
-            if (image.io->split_header && !image.io->header_completed) {
-                ++pending_operations;
-            }
-            if (image.io->content_submitted && !image.io->content_completed) {
-                ++pending_operations;
-            }
-        }
-    }
-    while (pending_operations != 0) {
-        DWORD transferred = 0;
-        ULONG_PTR key = 0;
-        OVERLAPPED* overlapped = nullptr;
-        const BOOL success = GetQueuedCompletionStatus(
-            io_completion_port_, &transferred, &key, &overlapped, INFINITE);
-        if (!overlapped) {
-            if (!success) ThrowLastError("GetQueuedCompletionStatus shutdown");
-            continue;
-        }
-        auto* request = reinterpret_cast<IoRequest*>(key);
-        if (overlapped == &request->header_overlapped) {
-            if (!request->header_completed) {
-                request->header_completed = true;
-                --pending_operations;
-            }
-        } else if (overlapped == &request->content_overlapped &&
-                   !request->content_completed) {
-            request->content_completed = true;
-            --pending_operations;
-        }
     }
     for (ImageRecord& image : resources_.images) {
         if (!image.io) continue;
