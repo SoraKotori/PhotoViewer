@@ -162,6 +162,9 @@ void Graphics::Resize(const UINT width, const UINT height) {
 
 void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
                                     const UINT height) {
+    if (!device_) {
+        throw std::logic_error("Direct3D device is not initialized");
+    }
     if (staging.mapped || width == 0 || height == 0) {
         throw std::invalid_argument("invalid decode staging preparation");
     }

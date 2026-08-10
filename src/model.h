@@ -2,8 +2,6 @@
 
 #include "common.h"
 
-#include <array>
-
 namespace pv {
 
 using SlotId = std::uint32_t;
@@ -23,8 +21,6 @@ enum class PipelineStage {
     Failed,
 };
 
-enum class WorkClaim : std::uint8_t { Queued, Claimed, Cancelled };
-
 struct CompressedBuffer {
     CompressedBuffer() = default;
     ~CompressedBuffer() {
@@ -34,9 +30,7 @@ struct CompressedBuffer {
     CompressedBuffer(const CompressedBuffer&) = delete;
     CompressedBuffer& operator=(const CompressedBuffer&) = delete;
 
-    [[nodiscard]] bool Allocate(
-        const std::size_t requested,
-        std::vector<std::byte*>* const retired = nullptr) {
+    [[nodiscard]] bool Allocate(const std::size_t requested) {
         constexpr std::size_t alignment = 4096;
         if (requested > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
             return false;
@@ -49,19 +43,15 @@ struct CompressedBuffer {
         std::byte* const replacement = static_cast<std::byte*>(VirtualAlloc(
             nullptr, required, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!replacement) return false;
-        ReleaseAllocation(retired);
+        ReleaseAllocation();
         data = replacement;
         allocation_size = required;
         size = requested;
         return true;
     }
 
-    void ReleaseAllocation(
-        std::vector<std::byte*>* const retired = nullptr) {
-        if (data) {
-            if (retired) retired->push_back(data);
-            else VirtualFree(data, 0, MEM_RELEASE);
-        }
+    void ReleaseAllocation() {
+        if (data) VirtualFree(data, 0, MEM_RELEASE);
         data = nullptr;
         size = 0;
         allocation_size = 0;
@@ -93,13 +83,11 @@ struct DecodeStaging {
     [[nodiscard]] bool AllocateCpu(const std::size_t bytes) noexcept {
         if (bytes == 0) return false;
         if (cpu_data && cpu_capacity >= bytes) return true;
-        if (cpu_data) VirtualFree(cpu_data, 0, MEM_RELEASE);
-        cpu_data = static_cast<std::byte*>(VirtualAlloc(
+        std::byte* const replacement = static_cast<std::byte*>(VirtualAlloc(
             nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!cpu_data) {
-            cpu_capacity = 0;
-            return false;
-        }
+        if (!replacement) return false;
+        if (cpu_data) VirtualFree(cpu_data, 0, MEM_RELEASE);
+        cpu_data = replacement;
         cpu_capacity = bytes;
         return true;
     }
@@ -108,6 +96,7 @@ struct DecodeStaging {
                                          const std::size_t decoded_bytes) noexcept {
         const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
         if (width == 0 || height == 0 ||
+            row_bytes > std::numeric_limits<UINT>::max() ||
             decoded_bytes > committed_bytes ||
             height > committed_bytes - decoded_bytes ||
             !AllocateCpu(committed_bytes)) {
@@ -154,16 +143,9 @@ struct DecodeStaging {
     DecodeSurface surface;
 };
 
-struct alignas(64) WorkToken {
-    std::atomic<WorkClaim> claim{WorkClaim::Queued};
-    std::array<std::byte, 64 - sizeof(claim)> cache_line_padding{};
-};
-static_assert(sizeof(WorkToken) == 64);
-
 struct DecodeWork {
     std::size_t index = 0;
     std::uint64_t generation = 0;
-    WorkToken* token = nullptr;
     SlotId compressed_slot = kInvalidSlot;
     SlotId staging_slot = kInvalidSlot;
 };
@@ -172,7 +154,6 @@ struct DecodeResult {
     std::size_t index = 0;
     std::uint64_t generation = 0;
     bool success = false;
-    bool cancelled = false;
     HRESULT error = S_OK;
     SlotId staging_slot = kInvalidSlot;
 };

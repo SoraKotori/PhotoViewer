@@ -50,7 +50,7 @@
 
 | 項目 | 最低需求 |
 |---|---|
-| 作業系統 | Windows 10 version 1703（build 15063）或更新版本，64-bit |
+| 作業系統 | Windows 10 version 1709（build 16299）或更新版本，64-bit |
 | 處理器 | x86-64-v3 相容處理器 |
 | 顯示卡與驅動程式 | 硬體 Direct3D 裝置，Feature Level 11_1 以上並支援 D3D11 fence |
 | 執行階段 | Microsoft Visual C++ v14 Redistributable x64，version 14.51.36247 以上 |

@@ -2,7 +2,8 @@
 #include "common.h"
 #include "config.h"
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
+int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
+                    _In_ PWSTR, _In_ int show_command) {
     const auto process_started = std::chrono::steady_clock::now();
     try {
         return pv::App(pv::ParseConfig(), process_started)

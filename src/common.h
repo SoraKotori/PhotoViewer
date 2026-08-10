@@ -50,7 +50,7 @@ constexpr std::size_t MiB(const std::size_t value) noexcept {
     return value * 1024ULL * 1024ULL;
 }
 
-constexpr UINT kMessageWorkerComplete = WM_APP + 2;
 constexpr UINT kMessageValidationStep = WM_APP + 3;
+constexpr std::size_t kMaxDecoderWorkers = 256;
 
 }  // namespace pv
