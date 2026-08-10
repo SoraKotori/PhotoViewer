@@ -206,7 +206,24 @@ enum libdeflate_result {
 	/* The data would have decompressed to more than 'out_nbytes_avail'
 	 * bytes.  */
 	LIBDEFLATE_INSUFFICIENT_SPACE = 3,
+
+	/* A callback installed by a callback-enabled decompression function
+	 * returned a nonzero value. */
+	LIBDEFLATE_CALLBACK_ERROR = 4,
 };
+
+/*
+ * Callback for cache-local processing of decompressed data.  'safe_out_nbytes'
+ * is a monotonically increasing prefix length.  Except on the final call,
+ * bytes in [0, safe_out_nbytes) are outside DEFLATE's 32768-byte history
+ * window and may therefore be modified in-place without affecting continued
+ * decompression.  On the final call, 'final' is nonzero and the whole valid
+ * output is safe.  Returning nonzero aborts decompression with
+ * LIBDEFLATE_CALLBACK_ERROR.
+ */
+typedef int (*libdeflate_decompress_callback)(void *opaque, void *out,
+					       size_t safe_out_nbytes,
+					       int final);
 
 /*
  * libdeflate_deflate_decompress() decompresses a DEFLATE stream from the buffer
@@ -257,6 +274,33 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *decompressor,
 				 void *out, size_t out_nbytes_avail,
 				 size_t *actual_in_nbytes_ret,
 				 size_t *actual_out_nbytes_ret);
+
+/*
+ * Like libdeflate_deflate_decompress_ex(), but periodically calls 'callback'
+ * while decompression is in progress so the caller can consume or transform
+ * output while it is still cache-hot.  Non-final callbacks are made at DEFLATE
+ * block boundaries after the safe prefix has advanced by at least
+ * 'callback_interval' bytes.  The interval must be nonzero.  A final callback
+ * is made after the DEFLATE stream and output size have been fully validated,
+ * even when the remaining prefix is shorter than the interval.
+ *
+ * The callback may modify only bytes before 'safe_out_nbytes'.  In particular,
+ * it must not modify bytes at or after a non-final callback's safe frontier;
+ * these include the most recent 32768 bytes, which can still be referenced by
+ * a later DEFLATE match.
+ * Callback side effects from non-final calls cannot be rolled back if invalid
+ * compressed data is detected later.
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_ex_callback(
+			 struct libdeflate_decompressor *decompressor,
+			 const void *in, size_t in_nbytes,
+			 void *out, size_t out_nbytes_avail,
+			 size_t callback_interval,
+			 libdeflate_decompress_callback callback,
+			 void *callback_opaque,
+			 size_t *actual_in_nbytes_ret,
+			 size_t *actual_out_nbytes_ret);
 
 /*
  * Like libdeflate_deflate_decompress(), but assumes the zlib wrapper format

@@ -12,12 +12,15 @@
 #include <fstream>
 #include <iostream>
 #include <latch>
+#include <numeric>
 
 namespace {
 
 void Check(const bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+std::uint32_t ReadBigEndian(const std::byte* data);
 
 std::uint8_t ReferencePaeth(const std::uint8_t left, const std::uint8_t up,
                             const std::uint8_t upper_left) {
@@ -60,10 +63,11 @@ struct SyntheticPng {
     std::uint32_t height = 0;
 };
 
-SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
-    constexpr std::array<std::uint8_t, 24> filters{
-        0, 4, 4, 4, 4, 4, 4, 4, 4, 1, 2, 3,
-        4, 4, 4, 4, 4, 4, 4, 4, 2, 4, 4, 4};
+SyntheticPng BuildFilterPng(const std::uint32_t width,
+                            const std::span<const std::uint8_t> filters,
+                            const std::size_t deflate_block_bytes = 0) {
+    Check(width != 0 && !filters.empty() && filters.size() <= UINT32_MAX,
+          "valid synthetic PNG dimensions");
     const std::uint32_t height = static_cast<std::uint32_t>(filters.size());
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     std::vector<std::byte> pixels(row_bytes * height);
@@ -108,7 +112,7 @@ SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
                             (static_cast<unsigned int>(left) + up) / 2U);
                         break;
                 case 4: prediction = ReferencePaeth(left, up, upper_left); break;
-                default: Check(false, "known synthetic PNG filter");
+                default: break;
             }
             filtered[filtered_row + 1 + column] = std::byte{
                 static_cast<std::uint8_t>(current - prediction)};
@@ -116,12 +120,41 @@ SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
     }
 
     uLongf compressed_size = compressBound(static_cast<uLong>(filtered.size()));
+    if (deflate_block_bytes != 0) {
+        compressed_size += static_cast<uLongf>(
+            (filtered.size() / deflate_block_bytes + 1) * 16);
+    }
     std::vector<std::byte> compressed(compressed_size);
-    const int compressed_result = compress2(
-        reinterpret_cast<Bytef*>(compressed.data()), &compressed_size,
-        reinterpret_cast<const Bytef*>(filtered.data()),
-        static_cast<uLong>(filtered.size()), Z_BEST_SPEED);
-    Check(compressed_result == Z_OK, "compress synthetic PNG scanlines");
+    if (deflate_block_bytes == 0) {
+        const int compressed_result = compress2(
+            reinterpret_cast<Bytef*>(compressed.data()), &compressed_size,
+            reinterpret_cast<const Bytef*>(filtered.data()),
+            static_cast<uLong>(filtered.size()), Z_BEST_SPEED);
+        Check(compressed_result == Z_OK, "compress synthetic PNG scanlines");
+    } else {
+        z_stream stream{};
+        Check(deflateInit(&stream, Z_BEST_SPEED) == Z_OK,
+              "initialize blocked synthetic PNG compression");
+        for (std::size_t offset = 0; offset < filtered.size();) {
+            const std::size_t bytes = std::min(
+                deflate_block_bytes, filtered.size() - offset);
+            stream.next_in = reinterpret_cast<Bytef*>(filtered.data() + offset);
+            stream.avail_in = static_cast<uInt>(bytes);
+            stream.next_out = reinterpret_cast<Bytef*>(compressed.data()) +
+                              stream.total_out;
+            stream.avail_out = static_cast<uInt>(compressed.size() -
+                                                 stream.total_out);
+            offset += bytes;
+            const int flush = offset == filtered.size() ? Z_FINISH : Z_FULL_FLUSH;
+            const int result = deflate(&stream, flush);
+            Check(result == (flush == Z_FINISH ? Z_STREAM_END : Z_OK) &&
+                      stream.avail_in == 0,
+                  "compress blocked synthetic PNG scanlines");
+        }
+        compressed_size = stream.total_out;
+        Check(deflateEnd(&stream) == Z_OK,
+              "finish blocked synthetic PNG compression");
+    }
     compressed.resize(compressed_size);
 
     std::vector<std::byte> png{
@@ -132,6 +165,9 @@ SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
     ihdr[1] = std::byte{static_cast<std::uint8_t>(width >> 16)};
     ihdr[2] = std::byte{static_cast<std::uint8_t>(width >> 8)};
     ihdr[3] = std::byte{static_cast<std::uint8_t>(width)};
+    ihdr[4] = std::byte{static_cast<std::uint8_t>(height >> 24)};
+    ihdr[5] = std::byte{static_cast<std::uint8_t>(height >> 16)};
+    ihdr[6] = std::byte{static_cast<std::uint8_t>(height >> 8)};
     ihdr[7] = std::byte{static_cast<std::uint8_t>(height)};
     ihdr[8] = std::byte{8};
     ihdr[9] = std::byte{6};
@@ -146,31 +182,230 @@ SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
     return {std::move(png), std::move(pixels), width, height};
 }
 
-void CheckSyntheticDecode(const std::uint32_t width) {
-    SyntheticPng sample = BuildMixedFilterPng(width);
+SyntheticPng BuildMixedFilterPng(const std::uint32_t width) {
+    constexpr std::array<std::uint8_t, 24> filters{
+        0, 4, 4, 4, 4, 4, 4, 4, 4, 1, 2, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 2, 4, 4, 4};
+    return BuildFilterPng(width, filters);
+}
+
+void CheckGuardBytes(const std::span<const std::byte> storage,
+                     const std::size_t guard_bytes, const std::byte canary,
+                     const char* const leading_message,
+                     const char* const trailing_message) {
+    Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
+                      [canary](const std::byte value) { return value == canary; }),
+          leading_message);
+    Check(std::all_of(storage.end() - guard_bytes, storage.end(),
+                      [canary](const std::byte value) { return value == canary; }),
+          trailing_message);
+}
+
+void CheckSyntheticDecode(const SyntheticPng& sample,
+                          const std::uint32_t stride = 0,
+                          pv::PngDecodeTimings* const timings = nullptr) {
     constexpr std::size_t guard_bytes = 64;
     const std::size_t decoded_bytes = sample.pixels.size();
-    const std::size_t allocation_bytes = decoded_bytes + sample.height;
+    const std::uint32_t actual_stride = stride == 0 ? sample.width * 4 : stride;
+    const std::size_t allocation_bytes = std::max(
+        decoded_bytes + sample.height,
+        static_cast<std::size_t>(actual_stride) * sample.height);
     std::vector<std::byte> storage(guard_bytes + allocation_bytes + guard_bytes,
                                    std::byte{0xA5});
     pv::DecodeSurface surface{storage.data() + guard_bytes, allocation_bytes,
                               decoded_bytes, sample.width, sample.height,
-                              sample.width * 4};
-    pv::CheckHr(pv::DecodePngSpng(sample.encoded, surface),
+                              actual_stride};
+    std::vector<std::byte> encoded = sample.encoded;
+    pv::CheckHr(pv::DecodePngSpng(encoded, surface, nullptr, nullptr, timings),
                 "decode mixed-filter synthetic PNG");
-    Check(std::equal(sample.pixels.begin(), sample.pixels.end(), surface.pixels),
-          "mixed-filter synthetic PNG full pixel equality");
-    Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
-                      [](const std::byte value) { return value == std::byte{0xA5}; }),
-          "synthetic PNG leading canary");
-    Check(std::all_of(storage.end() - guard_bytes, storage.end(),
-                      [](const std::byte value) { return value == std::byte{0xA5}; }),
-          "synthetic PNG trailing canary");
+    const std::size_t row_bytes = static_cast<std::size_t>(sample.width) * 4;
+    for (std::uint32_t row = 0; row < sample.height; ++row) {
+        Check(std::equal(sample.pixels.begin() + static_cast<std::size_t>(row) * row_bytes,
+                         sample.pixels.begin() + static_cast<std::size_t>(row + 1) * row_bytes,
+                         surface.pixels + static_cast<std::size_t>(row) * actual_stride),
+              "mixed-filter synthetic PNG full pixel equality");
+    }
+    CheckGuardBytes(storage, guard_bytes, std::byte{0xA5},
+                    "synthetic PNG leading canary",
+                    "synthetic PNG trailing canary");
 }
 
 void TestMixedFiltersAndBounds() {
-    CheckSyntheticDecode(17);
-    CheckSyntheticDecode(2);
+    constexpr std::array<std::uint8_t, 10> all_filters{
+        0, 1, 2, 3, 4, 4, 3, 2, 1, 0};
+    for (const std::uint32_t width : {1U, 2U, 3U, 17U, 257U}) {
+        const SyntheticPng sample = BuildFilterPng(width, all_filters);
+        pv::PngDecodeTimings timings;
+        CheckSyntheticDecode(sample, 0, &timings);
+        for (std::size_t filter = 0; filter < timings.filter_rows.size(); ++filter) {
+            Check(timings.filter_rows[filter] == 2,
+                  "all PNG filters accounted for exactly once per row");
+        }
+    }
+
+    const SyntheticPng mixed = BuildMixedFilterPng(17);
+    CheckSyntheticDecode(mixed, mixed.width * 4 + 28);
+}
+
+void CheckSyntheticDecodeFails(const SyntheticPng& sample,
+                               const std::size_t allocation_bytes,
+                               const char* const message) {
+    constexpr std::size_t guard_bytes = 64;
+    std::vector<std::byte> storage(guard_bytes + allocation_bytes + guard_bytes,
+                                   std::byte{0xC7});
+    pv::DecodeSurface surface{
+        storage.data() + guard_bytes, allocation_bytes, sample.pixels.size(),
+        sample.width, sample.height, sample.width * 4};
+    std::vector<std::byte> encoded = sample.encoded;
+    Check(FAILED(pv::DecodePngSpng(encoded, surface)), message);
+    CheckGuardBytes(storage, guard_bytes, std::byte{0xC7},
+                    "failed decode leading canary",
+                    "failed decode trailing canary");
+}
+
+void TestMalformedDeflateAndOutputBounds() {
+    constexpr std::array<std::uint8_t, 3> valid_filters{0, 2, 4};
+    const SyntheticPng valid = BuildFilterPng(31, valid_filters);
+    const std::size_t required_bytes = valid.pixels.size() + valid.height;
+    CheckSyntheticDecodeFails(valid, required_bytes - 1,
+                              "reject undersized filtered/output allocation");
+
+    constexpr std::array<std::uint8_t, 1> invalid_filter{5};
+    const SyntheticPng bad_filter = BuildFilterPng(31, invalid_filter);
+    CheckSyntheticDecodeFails(bad_filter,
+                              bad_filter.pixels.size() + bad_filter.height,
+                              "reject unknown PNG row filter");
+
+    SyntheticPng truncated = valid;
+    truncated.encoded.resize(truncated.encoded.size() - 7);
+    CheckSyntheticDecodeFails(truncated, required_bytes,
+                              "reject truncated PNG chunk stream");
+
+    SyntheticPng corrupt_deflate = valid;
+    bool corrupted = false;
+    for (std::size_t offset = 8; offset + 12 <= corrupt_deflate.encoded.size();) {
+        const std::uint32_t length = ReadBigEndian(
+            corrupt_deflate.encoded.data() + offset);
+        Check(length <= corrupt_deflate.encoded.size() - offset - 12,
+              "synthetic PNG chunks remain in bounds");
+        if (std::memcmp(corrupt_deflate.encoded.data() + offset + 4,
+                        "IDAT", 4) == 0 && length >= 2) {
+            corrupt_deflate.encoded[offset + 8] = std::byte{0};
+            corrupted = true;
+            break;
+        }
+        offset += static_cast<std::size_t>(length) + 12;
+    }
+    Check(corrupted, "find synthetic IDAT to corrupt");
+    CheckSyntheticDecodeFails(corrupt_deflate, required_bytes,
+                              "reject corrupt zlib/DEFLATE stream");
+
+    constexpr std::size_t guard_bytes = 64;
+    std::vector<std::byte> storage(
+        guard_bytes + required_bytes + guard_bytes, std::byte{0xD3});
+    pv::DecodeSurface bad_stride{
+        storage.data() + guard_bytes, required_bytes, valid.pixels.size(),
+        valid.width, valid.height, valid.width * 4 - 1};
+    std::vector<std::byte> encoded = valid.encoded;
+    Check(pv::DecodePngSpng(encoded, bad_stride) == E_INVALIDARG,
+          "reject output stride narrower than a decoded row");
+    CheckGuardBytes(storage, guard_bytes, std::byte{0xD3},
+                    "bad stride leading canary",
+                    "bad stride trailing canary");
+}
+
+void TestFusedDeflateUnfilterObservability() {
+    constexpr std::array<std::uint8_t, 24> filter_pattern{
+        0, 1, 2, 3, 4, 4, 4, 4, 4, 2, 3, 1,
+        4, 4, 4, 4, 4, 4, 4, 4, 2, 3, 1, 0};
+    std::vector<std::uint8_t> filters(1100);
+    for (std::size_t row = 0; row < filters.size(); ++row) {
+        filters[row] = filter_pattern[row % filter_pattern.size()];
+    }
+    constexpr std::size_t workers = 4;
+    constexpr std::size_t guard_bytes = 64;
+    std::array<SyntheticPng, workers> samples{
+        BuildFilterPng(2048, filters, 1024 * 1024),
+        BuildFilterPng(2051, filters, 1024 * 1024),
+        BuildFilterPng(2053, filters, 1024 * 1024),
+        BuildFilterPng(2057, filters, 1024 * 1024)};
+    std::array<std::vector<std::byte>, workers> encoded_images;
+    std::array<std::vector<std::byte>, workers> storage;
+    std::array<pv::DecodeSurface, workers> surfaces;
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        encoded_images[worker] = samples[worker].encoded;
+        const std::size_t allocation_bytes =
+            samples[worker].pixels.size() + samples[worker].height;
+        storage[worker].assign(guard_bytes + allocation_bytes + guard_bytes,
+                               std::byte{0x9B});
+        surfaces[worker] = {
+            storage[worker].data() + guard_bytes, allocation_bytes,
+            samples[worker].pixels.size(), samples[worker].width,
+            samples[worker].height, samples[worker].width * 4};
+    }
+
+    std::latch ready(workers);
+    std::latch start(1);
+    std::array<HRESULT, workers> results;
+    results.fill(E_PENDING);
+    std::array<pv::PngDecodeTimings, workers> timings;
+    std::vector<std::jthread> threads;
+    threads.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        threads.emplace_back([&, worker] {
+            ready.count_down();
+            start.wait();
+            results[worker] = pv::DecodePngSpng(
+                encoded_images[worker], surfaces[worker], nullptr, nullptr,
+                &timings[worker]);
+        });
+    }
+    ready.wait();
+    start.count_down();
+    threads.clear();
+
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        Check(SUCCEEDED(results[worker]),
+              "four-worker fused PNG decode succeeds");
+        Check(std::equal(samples[worker].pixels.begin(),
+                         samples[worker].pixels.end(),
+                         surfaces[worker].pixels),
+              "four-worker fused PNG pixels are exact");
+        CheckGuardBytes(storage[worker], guard_bytes, std::byte{0x9B},
+                        "four-worker fused leading canary",
+                        "four-worker fused trailing canary");
+        const std::size_t row_bytes =
+            static_cast<std::size_t>(samples[worker].width) * 4;
+        Check(timings[worker].fused_rows > 0 &&
+                  timings[worker].fused_rows <= samples[worker].height,
+              "large PNG must exercise fused DEFLATE/unfilter callbacks");
+        Check(timings[worker].fused_output_bytes ==
+                  static_cast<std::uint64_t>(timings[worker].fused_rows) *
+                      row_bytes,
+              "fused output byte counter matches completed RGBA rows");
+        Check(timings[worker].unfilter_nanoseconds > 0 &&
+                  timings[worker].unfilter_nanoseconds <=
+                      timings[worker].deflate_nanoseconds,
+              "fused unfilter time is measured inside DEFLATE time");
+        Check(std::accumulate(timings[worker].filter_rows.begin(),
+                              timings[worker].filter_rows.end(),
+                              std::uint32_t{0}) == samples[worker].height,
+              "fused and deferred rows are each unfiltered exactly once");
+    }
+    const std::uint64_t fused_rows = std::accumulate(
+        timings.begin(), timings.end(), std::uint64_t{0},
+        [](const std::uint64_t total, const pv::PngDecodeTimings& timing) {
+            return total + timing.fused_rows;
+        });
+    const std::uint64_t fused_output_bytes = std::accumulate(
+        timings.begin(), timings.end(), std::uint64_t{0},
+        [](const std::uint64_t total, const pv::PngDecodeTimings& timing) {
+            return total + timing.fused_output_bytes;
+        });
+    std::cout << "FusedAcceptance workers=" << workers
+              << " fused_rows=" << fused_rows
+              << " fused_output_bytes=" << fused_output_bytes
+              << " result=exact canaries=intact\n";
 }
 
 void TestSpng() {
@@ -609,6 +844,9 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
         total_timings.idat_compaction_nanoseconds += timing.idat_compaction_nanoseconds;
         total_timings.deflate_nanoseconds += timing.deflate_nanoseconds;
         total_timings.unfilter_nanoseconds += timing.unfilter_nanoseconds;
+        total_timings.fused_output_bytes += timing.fused_output_bytes;
+        total_timings.fused_rows += timing.fused_rows;
+        total_timings.deferred_rows += timing.deferred_rows;
         for (std::size_t filter = 0; filter < total_timings.filter_rows.size(); ++filter) {
             total_timings.filter_rows[filter] += timing.filter_rows[filter];
         }
@@ -634,6 +872,12 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
               << average_ms(total_timings.idat_compaction_nanoseconds)
               << " deflate_ms=" << average_ms(total_timings.deflate_nanoseconds)
               << " unfilter_ms=" << average_ms(total_timings.unfilter_nanoseconds)
+              << " unfilter_inside_deflate=1"
+              << " fused_rows=" << total_timings.fused_rows
+              << " deferred_rows=" << total_timings.deferred_rows
+              << " fused_output_mib="
+              << (static_cast<double>(total_timings.fused_output_bytes) /
+                  1048576.0)
               << " filter_none=" << total_timings.filter_rows[0]
               << " filter_sub=" << total_timings.filter_rows[1]
               << " filter_up=" << total_timings.filter_rows[2]
@@ -716,10 +960,12 @@ int wmain(const int argc, wchar_t** const argv) {
         }
         TestSpng();
         TestMixedFiltersAndBounds();
+        TestMalformedDeflateAndOutputBounds();
+        TestFusedDeflateUnfilterObservability();
         TestCancelledWorkReleasesInput();
         TestManagedStagingUpload();
         TestGraphics(GetModuleHandleW(nullptr));
-        std::cout << "PASS: mixed PNG filters with guarded bounds, pre-claim cancellation slot return, libspng/libdeflate decode with zlib-ng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, malformed input and guarded output bounds, pre-claim cancellation slot return, libspng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

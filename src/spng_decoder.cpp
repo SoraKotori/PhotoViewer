@@ -498,6 +498,15 @@ void AddPaethRows8(std::uint8_t* const destination,
     }
     const std::uint8_t* const previous0 = destinations[0] - row_bytes;
 
+    if (row_bytes >
+        (static_cast<std::size_t>(std::numeric_limits<int>::max()) - 28) / 7) {
+        for (std::size_t row = 0; row < row_count; ++row) {
+            AddPaeth(destinations[row], sources[row],
+                     row == 0 ? previous0 : destinations[row - 1], row_bytes);
+        }
+        return;
+    }
+
     std::array<std::size_t, preserved_row_count> preserved{};
     for (std::size_t row = 0; row < preserved.size(); ++row) {
         preserved[row] = static_cast<std::size_t>(
@@ -588,23 +597,18 @@ void AddPaethRows8(std::uint8_t* const destination,
         left = decoded;
         return decoded;
     };
+    const __m256i gather_offsets = _mm256_setr_epi32(
+        7 * 4, static_cast<int>((row_bytes + 1) + 6 * 4),
+        static_cast<int>(2 * (row_bytes + 1) + 5 * 4),
+        static_cast<int>(3 * (row_bytes + 1) + 4 * 4),
+        static_cast<int>(4 * (row_bytes + 1) + 3 * 4),
+        static_cast<int>(5 * (row_bytes + 1) + 2 * 4),
+        static_cast<int>(6 * (row_bytes + 1) + 1 * 4),
+        static_cast<int>(7 * (row_bytes + 1)));
     const auto load_diagonal = [&](const std::size_t pixel) noexcept {
-        return _mm256_setr_epi32(
-            static_cast<int>(LoadPixelValue(
-                sources[0] + (pixel + 7) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[1] + (pixel + 6) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[2] + (pixel + 5) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[3] + (pixel + 4) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[4] + (pixel + 3) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[5] + (pixel + 2) * 4)),
-            static_cast<int>(LoadPixelValue(
-                sources[6] + (pixel + 1) * 4)),
-            static_cast<int>(LoadPixelValue(sources[7] + pixel * 4)));
+        return _mm256_i32gather_epi32(
+            reinterpret_cast<const int*>(sources[0] + pixel * 4),
+            gather_offsets, 1);
     };
     const auto store_diagonal = [&](const std::size_t first_row,
                                     const std::size_t pixel,
@@ -729,73 +733,175 @@ void AddUp(std::uint8_t* const destination, const std::uint8_t* const source,
 }
 
 template <bool TrackTimings>
-bool Unfilter(std::byte* const bytes, const std::size_t row_bytes,
-              const std::uint32_t height, PngDecodeTimings* const timings) noexcept {
-    constexpr std::uint32_t max_wavefront_height = 16384;
-    std::array<std::uint8_t, max_wavefront_height * 7> scratch;
-    auto* const base = reinterpret_cast<std::uint8_t*>(bytes);
-    for (std::uint32_t row = 0; row < height;) {
-        const std::size_t source_offset = static_cast<std::size_t>(row) * (row_bytes + 1);
-        const std::uint8_t filter = base[source_offset];
-        if (height <= max_wavefront_height && row != 0 && row + 7 < height &&
-            filter == 4 &&
-            base[source_offset + row_bytes + 1] == 4 &&
-            base[source_offset + 2 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 3 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 4 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 5 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 6 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 7 * (row_bytes + 1)] == 4) {
-            AddPaethRows8(base + static_cast<std::size_t>(row) * row_bytes,
-                          base + source_offset + 1, row_bytes, scratch.data());
-            if constexpr (TrackTimings) timings->filter_rows[4] += 8;
-            row += 8;
-            continue;
+bool UnfilterRow(std::uint8_t* const destination,
+                 const std::uint8_t* const source,
+                 const std::uint8_t* const previous,
+                 const std::size_t row_bytes,
+                 const std::uint8_t filter,
+                 PngDecodeTimings* const timings) noexcept {
+    if constexpr (TrackTimings) {
+        if (filter < timings->filter_rows.size()) {
+            ++timings->filter_rows[filter];
         }
-        if (height <= max_wavefront_height && row != 0 && row + 3 < height &&
-            filter == 4 &&
-            base[source_offset + row_bytes + 1] == 4 &&
-            base[source_offset + 2 * (row_bytes + 1)] == 4 &&
-            base[source_offset + 3 * (row_bytes + 1)] == 4) {
-            AddPaethRows4(base + static_cast<std::size_t>(row) * row_bytes,
-                          base + source_offset + 1, row_bytes, scratch.data());
-            if constexpr (TrackTimings) timings->filter_rows[4] += 4;
-            row += 4;
-            continue;
-        }
-        if constexpr (TrackTimings) {
-            if (filter < timings->filter_rows.size()) {
-                ++timings->filter_rows[filter];
-            }
-        }
-        const std::uint8_t* const source = base + source_offset + 1;
-        std::uint8_t* const destination = base + static_cast<std::size_t>(row) * row_bytes;
-        const std::uint8_t* const previous = row == 0 ? nullptr : destination - row_bytes;
-        switch (filter) {
-            case 0:
+    }
+    switch (filter) {
+        case 0:
+            CopyForward(reinterpret_cast<std::byte*>(destination),
+                        reinterpret_cast<const std::byte*>(source), row_bytes);
+            return true;
+        case 1:
+            AddSub(destination, source, row_bytes);
+            return true;
+        case 2:
+            if (previous) {
+                AddUp(destination, source, previous, row_bytes);
+            } else {
                 CopyForward(reinterpret_cast<std::byte*>(destination),
                             reinterpret_cast<const std::byte*>(source), row_bytes);
-                break;
-            case 1:
-                AddSub(destination, source, row_bytes);
-                break;
-            case 2:
-                if (previous) AddUp(destination, source, previous, row_bytes);
-                else CopyForward(reinterpret_cast<std::byte*>(destination),
-                                 reinterpret_cast<const std::byte*>(source), row_bytes);
-                break;
-            case 3:
-                AddAverage(destination, source, previous, row_bytes);
-                break;
-            case 4:
-                AddPaeth(destination, source, previous, row_bytes);
-                break;
-            default:
-                return false;
-        }
-        ++row;
+            }
+            return true;
+        case 3:
+            AddAverage(destination, source, previous, row_bytes);
+            return true;
+        case 4:
+            AddPaeth(destination, source, previous, row_bytes);
+            return true;
+        default:
+            return false;
     }
-    return true;
+}
+
+template <bool TrackTimings>
+class FusedUnfilter final {
+public:
+    FusedUnfilter(std::byte* const bytes, const std::size_t row_bytes,
+                  const std::uint32_t height,
+                  PngDecodeTimings* const timings) noexcept
+        : base_(reinterpret_cast<std::uint8_t*>(bytes)),
+          row_bytes_(row_bytes),
+          scanline_bytes_(row_bytes + 1),
+          height_(height),
+          timings_(timings) {}
+
+    [[nodiscard]] bool ProcessSafePrefix(const std::size_t safe_output_bytes,
+                                         const bool during_deflate) noexcept {
+        const auto begin = TrackTimings
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        const bool success = ProcessSafePrefixImpl(safe_output_bytes,
+                                                   during_deflate);
+        if constexpr (TrackTimings) {
+            timings_->unfilter_nanoseconds += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count());
+        }
+        return success;
+    }
+
+    [[nodiscard]] std::uint32_t RowsProcessed() const noexcept {
+        return next_row_;
+    }
+
+    [[nodiscard]] bool OwnsOutput(const void* const output) const noexcept {
+        return output == base_;
+    }
+
+private:
+    [[nodiscard]] bool ProcessSafePrefixImpl(
+        const std::size_t safe_output_bytes,
+        const bool during_deflate) noexcept {
+        if (failed_ || safe_output_bytes > scanline_bytes_ * height_) {
+            failed_ = true;
+            return false;
+        }
+        const std::uint32_t available_rows = std::min<std::uint32_t>(
+            height_, static_cast<std::uint32_t>(
+                         safe_output_bytes / scanline_bytes_));
+        while (next_row_ < available_rows) {
+            const std::size_t source_offset =
+                static_cast<std::size_t>(next_row_) * scanline_bytes_;
+            const std::uint8_t filter = base_[source_offset];
+            if (height_ <= kMaxWavefrontHeight && next_row_ != 0 &&
+                next_row_ + 7 < available_rows && filter == 4 &&
+                base_[source_offset + scanline_bytes_] == 4 &&
+                base_[source_offset + 2 * scanline_bytes_] == 4 &&
+                base_[source_offset + 3 * scanline_bytes_] == 4 &&
+                base_[source_offset + 4 * scanline_bytes_] == 4 &&
+                base_[source_offset + 5 * scanline_bytes_] == 4 &&
+                base_[source_offset + 6 * scanline_bytes_] == 4 &&
+                base_[source_offset + 7 * scanline_bytes_] == 4) {
+                AddPaethRows8(
+                    base_ + static_cast<std::size_t>(next_row_) * row_bytes_,
+                    base_ + source_offset + 1, row_bytes_, scratch_.data());
+                RecordRows(8, during_deflate, 4);
+                next_row_ += 8;
+                continue;
+            }
+            if (height_ <= kMaxWavefrontHeight && next_row_ != 0 &&
+                next_row_ + 3 < available_rows && filter == 4 &&
+                base_[source_offset + scanline_bytes_] == 4 &&
+                base_[source_offset + 2 * scanline_bytes_] == 4 &&
+                base_[source_offset + 3 * scanline_bytes_] == 4) {
+                AddPaethRows4(
+                    base_ + static_cast<std::size_t>(next_row_) * row_bytes_,
+                    base_ + source_offset + 1, row_bytes_, scratch_.data());
+                RecordRows(4, during_deflate, 4);
+                next_row_ += 4;
+                continue;
+            }
+
+            std::uint8_t* const destination =
+                base_ + static_cast<std::size_t>(next_row_) * row_bytes_;
+            const std::uint8_t* const previous = next_row_ == 0
+                ? nullptr
+                : destination - row_bytes_;
+            if (!UnfilterRow<TrackTimings>(
+                    destination, base_ + source_offset + 1, previous,
+                    row_bytes_, filter, timings_)) {
+                failed_ = true;
+                return false;
+            }
+            RecordRows(1, during_deflate);
+            ++next_row_;
+        }
+        return true;
+    }
+
+    void RecordRows(const std::uint32_t count, const bool during_deflate,
+                    const int batch_filter = -1) noexcept {
+        if constexpr (TrackTimings) {
+            if (batch_filter >= 0) {
+                timings_->filter_rows[static_cast<std::size_t>(batch_filter)] +=
+                    count;
+            }
+            if (during_deflate) {
+                timings_->fused_rows += count;
+                timings_->fused_output_bytes +=
+                    static_cast<std::uint64_t>(row_bytes_) * count;
+            } else {
+                timings_->deferred_rows += count;
+            }
+        }
+    }
+
+    static constexpr std::uint32_t kMaxWavefrontHeight = 16384;
+    std::array<std::uint8_t, kMaxWavefrontHeight * 7> scratch_;
+    std::uint8_t* base_ = nullptr;
+    std::size_t row_bytes_ = 0;
+    std::size_t scanline_bytes_ = 0;
+    std::uint32_t height_ = 0;
+    std::uint32_t next_row_ = 0;
+    PngDecodeTimings* timings_ = nullptr;
+    bool failed_ = false;
+};
+
+template <bool TrackTimings>
+int FusedUnfilterCallback(void* const opaque, void* const output,
+                          const std::size_t safe_output_bytes,
+                          const int final) noexcept {
+    auto* const unfilter = static_cast<FusedUnfilter<TrackTimings>*>(opaque);
+    if (!unfilter || !unfilter->OwnsOutput(output)) return 1;
+    return unfilter->ProcessSafePrefix(safe_output_bytes, final == 0) ? 0 : 1;
 }
 
 bool ExpandRowsToPitch(DecodeSurface& surface) noexcept {
@@ -841,8 +947,8 @@ HRESULT CompactIdat(const std::span<std::byte> compressed, IdatData& idat,
                 write_offset = payload_offset;
             }
             if (write_offset != payload_offset) {
-                CopyForward(compressed.data() + write_offset,
-                            compressed.data() + payload_offset, length);
+                std::memmove(compressed.data() + write_offset,
+                             compressed.data() + payload_offset, length);
             }
             write_offset += length;
             idat.bytes += length;
@@ -872,6 +978,11 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     if (FAILED(compacted)) return compacted;
 
     const std::size_t row_bytes = static_cast<std::size_t>(surface.width) * 4;
+    if (row_bytes == std::numeric_limits<std::size_t>::max() ||
+        surface.height > std::numeric_limits<std::size_t>::max() /
+                             (row_bytes + 1)) {
+        return E_OUTOFMEMORY;
+    }
     const std::size_t filtered_bytes = (row_bytes + 1) * surface.height;
     if (surface.allocation_bytes < filtered_bytes) {
         return E_OUTOFMEMORY;
@@ -892,34 +1003,53 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
     thread_local std::unique_ptr<libdeflate_decompressor, DecompressorDeleter>
         decompressor(libdeflate_alloc_decompressor());
     if (!decompressor) return E_OUTOFMEMORY;
+    constexpr std::size_t minimum_callback_interval = 32 * 1024;
+    constexpr std::size_t cache_local_batch_bytes = 8 * 1024 * 1024;
+    const std::size_t scanline_bytes = row_bytes + 1;
+    const std::size_t cache_local_batch =
+        scanline_bytes <= cache_local_batch_bytes / 256
+            ? scanline_bytes * 256
+            : cache_local_batch_bytes;
+    constexpr std::size_t wide_scanline_bytes = 16 * 1024;
+    constexpr std::size_t wide_batch_bytes = 32 * 1024 * 1024;
+    const std::size_t wide_batch = scanline_bytes >= wide_scanline_bytes
+        ? std::min(wide_batch_bytes, scanline_bytes * 1024)
+        : cache_local_batch;
+    const std::size_t callback_interval = std::max(
+        scanline_bytes,
+        std::max(minimum_callback_interval, wide_batch));
     const auto deflate_begin = timings ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
-    const libdeflate_result result = libdeflate_deflate_decompress(
-        decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
-        filtered_bytes, nullptr);
+    libdeflate_result result = LIBDEFLATE_BAD_DATA;
+    std::uint32_t rows_processed = 0;
+    if (timings) {
+        FusedUnfilter<true> unfilter(surface.pixels, row_bytes, surface.height,
+                                    timings);
+        result = libdeflate_deflate_decompress_ex_callback(
+            decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
+            filtered_bytes, callback_interval, FusedUnfilterCallback<true>,
+            &unfilter, nullptr, nullptr);
+        rows_processed = unfilter.RowsProcessed();
+    } else {
+        FusedUnfilter<false> unfilter(surface.pixels, row_bytes, surface.height,
+                                     nullptr);
+        result = libdeflate_deflate_decompress_ex_callback(
+            decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
+            filtered_bytes, callback_interval, FusedUnfilterCallback<false>,
+            &unfilter, nullptr, nullptr);
+        rows_processed = unfilter.RowsProcessed();
+    }
     if (timings) {
         timings->deflate_nanoseconds = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - deflate_begin).count());
     }
-    if (result != LIBDEFLATE_SUCCESS) {
+    if (result != LIBDEFLATE_SUCCESS || rows_processed != surface.height) {
         return WINCODEC_ERR_BADIMAGE;
     }
 
     if (input_consumed) input_consumed(callback_context);
-    const auto unfilter_begin = timings ? std::chrono::steady_clock::now()
-                                        : std::chrono::steady_clock::time_point{};
-    const bool unfiltered = timings
-        ? Unfilter<true>(surface.pixels, row_bytes, surface.height, timings)
-        : Unfilter<false>(surface.pixels, row_bytes, surface.height, nullptr);
-    if (timings) {
-        timings->unfilter_nanoseconds = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - unfilter_begin).count());
-    }
-    return unfiltered && ExpandRowsToPitch(surface)
-               ? S_OK
-               : WINCODEC_ERR_BADIMAGE;
+    return ExpandRowsToPitch(surface) ? S_OK : WINCODEC_ERR_BADIMAGE;
 }
 
 }  // namespace

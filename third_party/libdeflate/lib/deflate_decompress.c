@@ -639,6 +639,13 @@ static const u32 offset_decode_results[] = {
  * tables for the static codes to be reused whenever two static Huffman blocks
  * are decoded without an intervening dynamic block, even across streams.
  */
+struct libdeflate_decompress_callback_state {
+	size_t interval;
+	libdeflate_decompress_callback function;
+	void *opaque;
+	u8 *frontier;
+};
+
 struct libdeflate_decompressor {
 
 	/*
@@ -675,6 +682,7 @@ struct libdeflate_decompressor {
 	bool static_codes_loaded;
 	bool dynamic_offset_codes_loaded;
 	unsigned litlen_tablebits;
+	struct libdeflate_decompress_callback_state *callback_state;
 
 	/* The free() function for this struct, chosen at allocation time */
 	free_func_t free_func;
@@ -1143,6 +1151,36 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *d,
 {
 	return decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
 			       actual_in_nbytes_ret, actual_out_nbytes_ret);
+}
+
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_ex_callback(
+			 struct libdeflate_decompressor *d,
+			 const void *in, size_t in_nbytes,
+			 void *out, size_t out_nbytes_avail,
+			 size_t callback_interval,
+			 libdeflate_decompress_callback callback,
+			 void *callback_opaque,
+			 size_t *actual_in_nbytes_ret,
+			 size_t *actual_out_nbytes_ret)
+{
+	struct libdeflate_decompress_callback_state callback_state;
+	enum libdeflate_result result;
+
+	if (callback == NULL || callback_interval == 0)
+		return LIBDEFLATE_BAD_DATA;
+	if (d->callback_state != NULL)
+		return LIBDEFLATE_BAD_DATA;
+
+	callback_state.interval = callback_interval;
+	callback_state.function = callback;
+	callback_state.opaque = callback_opaque;
+	callback_state.frontier = out;
+	d->callback_state = &callback_state;
+	result = decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
+			 actual_in_nbytes_ret, actual_out_nbytes_ret);
+	d->callback_state = NULL;
+	return result;
 }
 
 LIBDEFLATEAPI enum libdeflate_result

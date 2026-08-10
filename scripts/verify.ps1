@@ -27,7 +27,7 @@ if ($SamplePng) {
         -ArgumentList @(
             '--validation-fullscreen',
             '--validation-navigation=R',
-            '--workers=5',
+            '--workers=4',
             ('"' + $sample + '"')
         ) `
         -WindowStyle Hidden `
@@ -46,7 +46,7 @@ if ($SamplePng) {
         -FilePath (Join-Path $output 'PhotoViewer.exe') `
         -ArgumentList @(
             $validationMode,
-            '--workers=5',
+            '--workers=4',
             ('"' + $sample + '"')
         ) `
         -WindowStyle Hidden `
