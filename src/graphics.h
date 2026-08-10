@@ -67,6 +67,7 @@ private:
     ComPtr<ID2D1Device2> d2d_device_;
     ComPtr<ID2D1DeviceContext2> d2d_context_;
     ComPtr<ID2D1Bitmap1> back_buffer_target_;
+    bool metrics_enabled_ = false;
     std::uint64_t upload_count_ = 0;
     std::uint64_t upload_nanoseconds_ = 0;
     std::uint64_t draw_count_ = 0;
