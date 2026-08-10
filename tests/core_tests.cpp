@@ -194,20 +194,16 @@ void ResourceSlotTests() {
           "compressed slot must retain an inline stable I/O request");
     slots.ReleaseCompressed(recycled_compressed);
 
-    pv::ResourceSlots registered_slots(1, 1, 1, 8192, 4096);
-    const pv::SlotId registered = registered_slots.AcquireCompressed(4096, 0, 1);
-    Check(registered != pv::kInvalidSlot,
-          "registered compressed slot must allocate initial storage");
-    std::byte* const registered_address =
-        registered_slots.Compressed(registered).resource.data;
-    registered_slots.ReleaseCompressed(registered);
-    std::vector<std::byte*> retired;
-    retired.reserve(1);
-    Check(registered_slots.AcquireCompressed(8192, 1, 2, &retired) == registered &&
-              retired.size() == 1 && retired.front() == registered_address,
-          "registered buffer replacement must defer the old allocation");
-    registered_slots.ReleaseCompressed(registered);
-    VirtualFree(retired.front(), 0, MEM_RELEASE);
+    pv::ResourceSlots growing_slots(1, 1, 1, 8192, 4096);
+    const pv::SlotId growing = growing_slots.AcquireCompressed(4096, 0, 1);
+    Check(growing != pv::kInvalidSlot,
+          "compressed slot must allocate initial storage");
+    growing_slots.ReleaseCompressed(growing);
+    Check(growing_slots.AcquireCompressed(8192, 1, 2) == growing &&
+              growing_slots.Compressed(growing).resource.data != nullptr &&
+              growing_slots.Compressed(growing).resource.allocation_size == 8192,
+          "free compressed slot must grow its allocation immediately");
+    growing_slots.ReleaseCompressed(growing);
 
     const pv::SlotId staging0 = slots.AcquireStaging(4096, 3, 7);
     const pv::SlotId staging1 = slots.AcquireStaging(4096, 4, 7);
@@ -218,7 +214,6 @@ void ResourceSlotTests() {
     Check(slots.StagingAt(staging0).state ==
               pv::StagingSlotState::Prepared,
           "staging acquisition must reserve an unmapped prepared slot");
-    pv::WorkToken* const token_address = &slots.WorkTokenAt(staging0);
     slots.StagingAt(staging0).state =
         pv::StagingSlotState::DecodedPixelsAvailable;
     slots.ReleaseStaging(staging0);
@@ -226,9 +221,8 @@ void ResourceSlotTests() {
               slots.StagingAt(staging0).state == pv::StagingSlotState::Free,
           "staging release must restore state and free index together");
     const pv::SlotId recycled_staging = slots.AcquireStaging(4096, 5, 8);
-    Check(recycled_staging == staging0 &&
-              &slots.WorkTokenAt(recycled_staging) == token_address,
-          "staging slot must retain a stable preallocated work token");
+    Check(recycled_staging == staging0,
+          "staging slot index must be recycled without auxiliary token state");
     slots.ReleaseStaging(recycled_staging);
 
     constexpr pv::SlotId gpu0 = 0;
@@ -281,39 +275,40 @@ void ReservationTests() {
           "safe retired reservation must be reassigned without a second pool");
 
     pv::WorkQueue queue;
-    pv::WorkToken token;
-    pv::DecodeWork work{3, 7, &token, 1, 2};
+    pv::DecodeWork work{3, 7, 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
     pv::DecodeWork cancelled;
-    Check(queue.TryCancel(&token, cancelled) && cancelled.index == 3,
+    Check(queue.TryCancel(2, cancelled) && cancelled.index == 3,
           "unclaimed decode work must be synchronously cancellable");
-    Check(queue.Size() == 0 &&
-              token.claim.load(std::memory_order_acquire) == pv::WorkClaim::Cancelled,
+    Check(queue.Size() == 0,
           "cancelled work must leave the queue exactly once");
 
-    pv::WorkToken low_token;
-    pv::WorkToken high_token;
-    pv::DecodeWork low{9, 1, &low_token, 0, 0};
-    pv::DecodeWork high{4, 1, &high_token, 0, 0};
+    pv::DecodeWork popped;
+    pv::DecodeWork claimed_work{5, 8, 1, 3};
+    Check(queue.TryPush(claimed_work) &&
+              queue.Pop(popped, std::stop_token{}),
+          "worker must be able to claim queued work");
+    Check(!queue.TryCancel(3, cancelled) && popped.index == 5,
+          "claimed work must retain slot ownership until completion");
+
+    pv::DecodeWork low{9, 1, 0, 0};
+    pv::DecodeWork high{4, 1, 0, 1};
     Check(queue.TryPush(low) && queue.TryPush(high),
           "priority reorder test work must enter queue");
     queue.Reorder(std::array<std::size_t, 2>{4, 9});
-    pv::DecodeWork popped;
     Check(queue.Pop(popped, std::stop_token{}) && popped.index == 4,
           "queued decode work must follow the latest navigation priority");
 
     pv::WorkQueue remap_queue;
-    pv::WorkToken remapped_token;
-    pv::DecodeWork remapped{0, 11, &remapped_token, 0, 0};
+    pv::DecodeWork remapped{0, 11, 0, 0};
     Check(remap_queue.TryPush(remapped), "catalog remap test work must enter queue");
     remap_queue.Remap(0, 84, 11);
     Check(remap_queue.Pop(popped, std::stop_token{}) && popped.index == 84,
           "queued decode work must follow the catalog frame remap");
 
     pv::WorkQueue naturally_bounded_queue;
-    std::array<pv::WorkToken, 32> natural_tokens;
     for (std::size_t index = 0; index < 32; ++index) {
-        pv::DecodeWork queued{index, 1, &natural_tokens[index], 0, 0};
+        pv::DecodeWork queued{index, 1, 0, static_cast<pv::SlotId>(index)};
         Check(naturally_bounded_queue.TryPush(queued),
               "work queue must not impose an independent item-count limit");
     }
@@ -322,18 +317,26 @@ void ReservationTests() {
 }
 
 void CompletionQueueTests() {
-    pv::CompletionQueue queue;
-    Check(queue.PushReleasedInput(pv::ReleasedInput{3, 7, 1}),
-          "first completion event must request notification");
-    Check(!queue.Push(pv::DecodeResult{3, 7, true, false, S_OK, 2}),
-          "pending completion events must coalesce notification");
+    pv::CompletionQueue queue(2);
+    Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_TIMEOUT,
+          "completion event must initially be clear");
+    queue.PushReleasedInput(pv::ReleasedInput{3, 7, 1});
+    Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_OBJECT_0,
+          "first completion must signal the event");
+    queue.Push(pv::DecodeResult{3, 7, true, S_OK, 2});
+    Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_OBJECT_0,
+          "coalesced completions must keep the event signaled");
 
-    pv::CompletionQueue::Batch batch = queue.DrainAll();
+    pv::CompletionQueue::Batch batch(2);
+    queue.DrainAll(batch);
     Check(batch.released_inputs.size() == 1 && batch.results.size() == 1,
           "one critical section must drain both completion event classes");
-    Check(queue.Push(pv::DecodeResult{4, 7, true, false, S_OK, 3}),
-          "atomic drain and acknowledgement must re-arm notification");
-    batch = queue.DrainAll();
+    Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_TIMEOUT,
+          "draining must reset the completion event");
+    queue.Push(pv::DecodeResult{4, 7, true, S_OK, 3});
+    Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_OBJECT_0,
+          "a later completion must re-signal the event");
+    queue.DrainAll(batch);
     Check(batch.results.size() == 1 && batch.results.front().index == 4,
           "completion queue must remain reusable after a batch drain");
 }

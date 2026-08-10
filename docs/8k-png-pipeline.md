@@ -66,8 +66,8 @@
 
 * 影像尺寸：7680 × 4320
 * 播放速度：30 FPS
-* PNG 壓縮資料：約 45 MiB／張
-* 解碼後 BGRA 資料：約 126.56 MiB／張
+* PNG 壓縮資料：約 40 MiB／張
+* 解碼後 RGBA 資料：約 126.56 MiB／張
 * 多張圖片可同時解碼
 * 最終顯示順序必須完全符合播放控制所要求的順序
 
@@ -437,10 +437,10 @@ BackBuffer 由畫面提交機制管理，不屬於上述三種 slot 資源。
 
 需要 reservation 的是會跨越非同步階段並持續占用容量的 CompressedBuffer、UploadBuffer 與 GPU Texture。
 
-slot 數量必須與總記憶體容量一起決定。例如 16 個 CompressedBuffer、每張壓縮資料約 45 MiB，最壞情況約需要：
+slot 數量必須與總記憶體容量一起決定。例如 16 個 CompressedBuffer、每張壓縮資料約 40 MiB，最壞情況約需要：
 
 ```text
-16 × 45 MiB = 720 MiB
+16 × 40 MiB = 640 MiB
 ```
 
 UploadBuffer 與 GPU Texture 每個約需 126.56 MiB。容量規劃至少要滿足：
@@ -973,8 +973,8 @@ GPU 傳輸吞吐量 ≥ 30 張／秒
 
 ```text
 PNG 讀取：
-45 MiB × 30
-≈ 1.32 GiB/s
+40 MiB × 30
+≈ 1.17 GiB/s
 
 GPU 傳輸：
 126.56 MiB × 30

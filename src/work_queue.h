@@ -6,6 +6,8 @@ namespace pv {
 
 class WorkQueue {
 public:
+    // The queue lock is also the publication boundary for slot data prepared
+    // by main before a worker acquires the corresponding DecodeWork.
     bool TryPush(DecodeWork& work) {
         std::lock_guard lock(mutex_);
         if (stopped_) return false;
@@ -24,18 +26,15 @@ public:
         return true;
     }
 
-    bool TryCancel(WorkToken* const token, DecodeWork& cancelled) {
-        if (!token) return false;
+    bool TryCancel(const SlotId staging_slot, DecodeWork& cancelled) {
+        if (staging_slot == kInvalidSlot) return false;
         std::lock_guard lock(mutex_);
         const auto found = std::find_if(
             queue_.begin(), queue_.end(),
-            [&](const DecodeWork& work) { return work.token == token; });
+            [&](const DecodeWork& work) {
+                return work.staging_slot == staging_slot;
+            });
         if (found == queue_.end()) return false;
-        WorkClaim expected = WorkClaim::Queued;
-        if (!token->claim.compare_exchange_strong(
-                expected, WorkClaim::Cancelled, std::memory_order_acq_rel)) {
-            return false;
-        }
         cancelled = std::move(*found);
         queue_.erase(found);
         return true;
@@ -85,49 +84,67 @@ private:
 
 class CompletionQueue {
 public:
+    explicit CompletionQueue(const std::size_t capacity) : capacity_(capacity) {
+        queue_.reserve(capacity);
+        released_inputs_.reserve(capacity);
+        event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event_) ThrowLastError("CreateEventW(worker completion)");
+    }
+
+    ~CompletionQueue() { CloseHandle(event_); }
+
+    CompletionQueue(const CompletionQueue&) = delete;
+    CompletionQueue& operator=(const CompletionQueue&) = delete;
+
+    // Draining under the same lock makes all worker writes to completed slot
+    // resources visible before main inspects or recycles those slots.
     struct Batch {
+        explicit Batch(const std::size_t capacity) {
+            results.reserve(capacity);
+            released_inputs.reserve(capacity);
+        }
+
         std::vector<DecodeResult> results;
         std::vector<ReleasedInput> released_inputs;
     };
 
-    [[nodiscard]] bool Push(DecodeResult result) {
+    void Push(DecodeResult result) noexcept {
         std::lock_guard lock(mutex_);
+        if (queue_.size() == capacity_) std::terminate();
         queue_.push_back(std::move(result));
-        if (notification_pending_) return false;
-        notification_pending_ = true;
-        return true;
+        if (!SetEvent(event_)) std::terminate();
     }
 
-    Batch DrainAll() {
+    void DrainAll(Batch& batch) noexcept {
+        batch.results.clear();
+        batch.released_inputs.clear();
+        if (batch.results.capacity() < capacity_ ||
+            batch.released_inputs.capacity() < capacity_) {
+            std::terminate();
+        }
         std::lock_guard lock(mutex_);
-        Batch batch;
-        batch.results.reserve(queue_.size());
-        while (!queue_.empty()) {
-            batch.results.push_back(std::move(queue_.front()));
-            queue_.pop_front();
-        }
-        batch.released_inputs.reserve(released_inputs_.size());
-        while (!released_inputs_.empty()) {
-            batch.released_inputs.push_back(std::move(released_inputs_.front()));
-            released_inputs_.pop_front();
-        }
-        notification_pending_ = false;
-        return batch;
+        if (!ResetEvent(event_)) std::terminate();
+        batch.results.swap(queue_);
+        batch.released_inputs.swap(released_inputs_);
     }
 
-    [[nodiscard]] bool PushReleasedInput(ReleasedInput input) {
+    void PushReleasedInput(ReleasedInput input) noexcept {
         std::lock_guard lock(mutex_);
+        if (released_inputs_.size() == capacity_) {
+            std::terminate();
+        }
         released_inputs_.push_back(std::move(input));
-        if (notification_pending_) return false;
-        notification_pending_ = true;
-        return true;
+        if (!SetEvent(event_)) std::terminate();
     }
+
+    [[nodiscard]] HANDLE CompletionEvent() const noexcept { return event_; }
 
 private:
+    const std::size_t capacity_;
     std::mutex mutex_;
-    std::deque<DecodeResult> queue_;
-    std::deque<ReleasedInput> released_inputs_;
-    bool notification_pending_ = false;
+    std::vector<DecodeResult> queue_;
+    std::vector<ReleasedInput> released_inputs_;
+    HANDLE event_ = nullptr;
 };
 
 }  // namespace pv

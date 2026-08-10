@@ -39,6 +39,8 @@ public:
 
 private:
     struct Impl;
+    // Impl contains a 64 KiB kernel I/O buffer whose address must remain stable
+    // until the outstanding directory request completes.
     std::unique_ptr<Impl> impl_;
 };
 

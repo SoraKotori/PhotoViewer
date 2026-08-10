@@ -31,6 +31,8 @@ enum class GpuTextureSlotState : std::uint8_t {
 
 struct IoRequest {
     void Reset() noexcept {
+        header_overlapped = {};
+        content_overlapped = {};
         file = INVALID_HANDLE_VALUE;
         index = 0;
         generation = 0;
@@ -40,16 +42,18 @@ struct IoRequest {
         transfer_count = 0;
         prefix_bytes = 0;
         split_header = false;
+        header_submitted = false;
         header_completed = false;
         content_submitted = false;
         content_completed = false;
-        io_ring_submitted = false;
         header_result = ERROR_IO_PENDING;
         header_transferred = 0;
         result = ERROR_IO_PENDING;
         transferred = 0;
     }
 
+    OVERLAPPED header_overlapped{};
+    OVERLAPPED content_overlapped{};
     HANDLE file = INVALID_HANDLE_VALUE;
     std::size_t index = 0;
     std::uint64_t generation = 0;
@@ -59,10 +63,10 @@ struct IoRequest {
     DWORD transfer_count = 0;
     DWORD prefix_bytes = 0;
     bool split_header = false;
+    bool header_submitted = false;
     bool header_completed = false;
     bool content_submitted = false;
     bool content_completed = false;
-    bool io_ring_submitted = false;
     DWORD header_result = ERROR_IO_PENDING;
     ULONG_PTR header_transferred = 0;
     DWORD result = ERROR_IO_PENDING;
@@ -97,13 +101,9 @@ public:
     ResourceSlots(std::size_t compressed_count, std::size_t staging_count,
                   std::size_t gpu_texture_count, std::size_t compressed_budget,
                   std::size_t staging_budget)
-        : compressed_(std::make_unique<CompressedSlot[]>(compressed_count)),
-          staging_(std::make_unique<StagingSlot[]>(staging_count)),
-          work_tokens_(std::make_unique<WorkToken[]>(staging_count)),
-          gpu_textures_(std::make_unique<GpuTextureSlot[]>(gpu_texture_count)),
-          compressed_count_(compressed_count),
-          staging_count_(staging_count),
-          gpu_texture_count_(gpu_texture_count),
+        : compressed_(compressed_count),
+          staging_(staging_count),
+          gpu_textures_(gpu_texture_count),
           compressed_budget_(compressed_budget), staging_budget_(staging_budget) {
         InitializeFree(free_compressed_, compressed_count);
         InitializeFree(free_staging_, staging_count);
@@ -114,8 +114,7 @@ public:
     ResourceSlots& operator=(const ResourceSlots&) = delete;
 
     [[nodiscard]] SlotId AcquireCompressed(std::size_t bytes, std::size_t image,
-                                           std::uint64_t generation,
-                                           std::vector<std::byte*>* retired = nullptr) {
+                                           std::uint64_t generation) {
         const auto required = CompressedAllocationSize(bytes);
         if (!required || *required > compressed_budget_ || free_compressed_.empty()) {
             return kInvalidSlot;
@@ -124,13 +123,13 @@ public:
         CompressedSlot& slot = Compressed(id);
         const std::size_t before = slot.resource.allocation_size;
         if (before < *required) {
-            TrimCompressed(*required, id, retired);
+            TrimCompressed(*required, id);
             if (compressed_committed_bytes_ - before >
                 compressed_budget_ - *required) {
                 return kInvalidSlot;
             }
         }
-        if (!slot.resource.Allocate(bytes, retired)) {
+        if (!slot.resource.Allocate(bytes)) {
             return kInvalidSlot;
         }
         compressed_committed_bytes_ = compressed_committed_bytes_ - before +
@@ -167,7 +166,7 @@ public:
     }
 
     [[nodiscard]] bool ActivateGpuTexture(const SlotId id) {
-        if (id == kInvalidSlot || id >= gpu_texture_count_) return false;
+        if (id == kInvalidSlot || id >= gpu_textures_.size()) return false;
         GpuTextureSlot& slot = GpuTextureAt(id);
         if (slot.state != GpuTextureSlotState::Inactive) return true;
         RemoveFree(free_gpu_textures_, id);
@@ -208,31 +207,27 @@ public:
     }
 
     [[nodiscard]] CompressedSlot& Compressed(SlotId id) {
-        if (id >= compressed_count_) throw std::out_of_range("compressed slot");
+        if (id >= compressed_.size()) throw std::out_of_range("compressed slot");
         return compressed_[id];
     }
     [[nodiscard]] const CompressedSlot& Compressed(SlotId id) const {
-        if (id >= compressed_count_) throw std::out_of_range("compressed slot");
+        if (id >= compressed_.size()) throw std::out_of_range("compressed slot");
         return compressed_[id];
     }
     [[nodiscard]] StagingSlot& StagingAt(SlotId id) {
-        if (id >= staging_count_) throw std::out_of_range("staging slot");
+        if (id >= staging_.size()) throw std::out_of_range("staging slot");
         return staging_[id];
     }
     [[nodiscard]] const StagingSlot& StagingAt(SlotId id) const {
-        if (id >= staging_count_) throw std::out_of_range("staging slot");
+        if (id >= staging_.size()) throw std::out_of_range("staging slot");
         return staging_[id];
     }
-    [[nodiscard]] WorkToken& WorkTokenAt(SlotId id) {
-        if (id >= staging_count_) throw std::out_of_range("work token");
-        return work_tokens_[id];
-    }
     [[nodiscard]] GpuTextureSlot& GpuTextureAt(SlotId id) {
-        if (id >= gpu_texture_count_) throw std::out_of_range("GPU Texture slot");
+        if (id >= gpu_textures_.size()) throw std::out_of_range("GPU Texture slot");
         return gpu_textures_[id];
     }
     [[nodiscard]] const GpuTextureSlot& GpuTextureAt(SlotId id) const {
-        if (id >= gpu_texture_count_) throw std::out_of_range("GPU Texture slot");
+        if (id >= gpu_textures_.size()) throw std::out_of_range("GPU Texture slot");
         return gpu_textures_[id];
     }
 
@@ -252,13 +247,13 @@ public:
         return free_gpu_textures_.size();
     }
     [[nodiscard]] std::size_t StagingCount() const noexcept {
-        return staging_count_;
+        return staging_.size();
     }
     [[nodiscard]] std::size_t CompressedCount() const noexcept {
-        return compressed_count_;
+        return compressed_.size();
     }
     [[nodiscard]] std::size_t GpuTextureCount() const noexcept {
-        return gpu_texture_count_;
+        return gpu_textures_.size();
     }
 
 private:
@@ -295,7 +290,7 @@ private:
                 (!adequate || capacity < Compressed(best).resource.allocation_size)) {
                 best = id;
                 adequate = true;
-            } else if (!adequate && capacity < Compressed(best).resource.allocation_size) {
+            } else if (!adequate && capacity > Compressed(best).resource.allocation_size) {
                 best = id;
             }
         }
@@ -311,15 +306,14 @@ private:
                 (!adequate || capacity < StagingAt(best).resource.committed_bytes)) {
                 best = id;
                 adequate = true;
-            } else if (!adequate && capacity < StagingAt(best).resource.committed_bytes) {
+            } else if (!adequate && capacity > StagingAt(best).resource.committed_bytes) {
                 best = id;
             }
         }
         return best;
     }
 
-    void TrimCompressed(std::size_t bytes, SlotId protected_id,
-                        std::vector<std::byte*>* retired) {
+    void TrimCompressed(std::size_t bytes, SlotId protected_id) {
         while (compressed_committed_bytes_ - Compressed(protected_id).resource.allocation_size >
                compressed_budget_ - bytes) {
             SlotId victim = kInvalidSlot;
@@ -333,7 +327,7 @@ private:
             }
             if (victim == kInvalidSlot) break;
             compressed_committed_bytes_ -= Compressed(victim).resource.allocation_size;
-            Compressed(victim).resource.ReleaseAllocation(retired);
+            Compressed(victim).resource.ReleaseAllocation();
         }
     }
 
@@ -355,13 +349,11 @@ private:
         }
     }
 
-    std::unique_ptr<CompressedSlot[]> compressed_;
-    std::unique_ptr<StagingSlot[]> staging_;
-    std::unique_ptr<WorkToken[]> work_tokens_;
-    std::unique_ptr<GpuTextureSlot[]> gpu_textures_;
-    std::size_t compressed_count_ = 0;
-    std::size_t staging_count_ = 0;
-    std::size_t gpu_texture_count_ = 0;
+    // Constructed at their final sizes and never resized, so embedded
+    // OVERLAPPED/completion-key addresses remain stable for the session.
+    std::vector<CompressedSlot> compressed_;
+    std::vector<StagingSlot> staging_;
+    std::vector<GpuTextureSlot> gpu_textures_;
     std::vector<SlotId> free_compressed_;
     std::vector<SlotId> free_staging_;
     std::vector<SlotId> free_gpu_textures_;

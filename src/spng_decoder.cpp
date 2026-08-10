@@ -771,17 +771,21 @@ bool UnfilterRow(std::uint8_t* const destination,
     }
 }
 
+constexpr std::uint32_t kMaxWavefrontHeight = 16384;
+
 template <bool TrackTimings>
 class FusedUnfilter final {
 public:
     FusedUnfilter(std::byte* const bytes, const std::size_t row_bytes,
-                  const std::uint32_t height,
-                  PngDecodeTimings* const timings) noexcept
+                   const std::uint32_t height,
+                   PngDecodeTimings* const timings,
+                   const std::span<std::uint8_t> scratch) noexcept
         : base_(reinterpret_cast<std::uint8_t*>(bytes)),
           row_bytes_(row_bytes),
           scanline_bytes_(row_bytes + 1),
           height_(height),
-          timings_(timings) {}
+          timings_(timings),
+          scratch_(scratch) {}
 
     [[nodiscard]] bool ProcessSafePrefix(const std::size_t safe_output_bytes,
                                          const bool during_deflate) noexcept {
@@ -884,14 +888,13 @@ private:
         }
     }
 
-    static constexpr std::uint32_t kMaxWavefrontHeight = 16384;
-    std::array<std::uint8_t, kMaxWavefrontHeight * 7> scratch_;
     std::uint8_t* base_ = nullptr;
     std::size_t row_bytes_ = 0;
     std::size_t scanline_bytes_ = 0;
     std::uint32_t height_ = 0;
     std::uint32_t next_row_ = 0;
     PngDecodeTimings* timings_ = nullptr;
+    std::span<std::uint8_t> scratch_;
     bool failed_ = false;
 };
 
@@ -1019,20 +1022,32 @@ HRESULT DecodeRgba8Fast(const std::span<std::byte> compressed,
         scanline_bytes,
         std::max(minimum_callback_interval, wide_batch));
     const auto deflate_begin = timings ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
+                                        : std::chrono::steady_clock::time_point{};
+    thread_local std::vector<std::uint8_t> wavefront_scratch;
+    if (surface.height <= kMaxWavefrontHeight) {
+        const std::size_t required_scratch =
+            static_cast<std::size_t>(surface.height) * 7;
+        try {
+            wavefront_scratch.resize(required_scratch);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+    }
     libdeflate_result result = LIBDEFLATE_BAD_DATA;
     std::uint32_t rows_processed = 0;
     if (timings) {
-        FusedUnfilter<true> unfilter(surface.pixels, row_bytes, surface.height,
-                                    timings);
+        FusedUnfilter<true> unfilter(
+            surface.pixels, row_bytes, surface.height, timings,
+            std::span<std::uint8_t>(wavefront_scratch));
         result = libdeflate_deflate_decompress_ex_callback(
             decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
             filtered_bytes, callback_interval, FusedUnfilterCallback<true>,
             &unfilter, nullptr, nullptr);
         rows_processed = unfilter.RowsProcessed();
     } else {
-        FusedUnfilter<false> unfilter(surface.pixels, row_bytes, surface.height,
-                                     nullptr);
+        FusedUnfilter<false> unfilter(
+            surface.pixels, row_bytes, surface.height, nullptr,
+            std::span<std::uint8_t>(wavefront_scratch));
         result = libdeflate_deflate_decompress_ex_callback(
             decompressor.get(), zlib + 2, idat.bytes - 6, surface.pixels,
             filtered_bytes, callback_interval, FusedUnfilterCallback<false>,

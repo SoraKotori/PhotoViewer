@@ -445,7 +445,7 @@ void TestSpng() {
                 "Decode grayscale-alpha PNG with libspng/zlib-ng fallback");
 }
 
-void TestCancelledWorkReleasesInput() {
+void TestRejectedWorkReleasesInput() {
     pv::ResourceSlots slots(1, 1, 1, pv::MiB(1), pv::MiB(1));
     const pv::SlotId compressed_slot = slots.AcquireCompressed(4096, 0, 1);
     const pv::SlotId staging_slot = slots.AcquireStaging(4096, 0, 1);
@@ -453,46 +453,33 @@ void TestCancelledWorkReleasesInput() {
               staging_slot != pv::kInvalidSlot,
           "allocate cancellation test slots");
 
-    pv::WorkToken token;
-    token.claim.store(pv::WorkClaim::Cancelled, std::memory_order_release);
     pv::WorkQueue work_queue;
-    pv::CompletionQueue completion_queue;
-    HWND notification_window = CreateWindowExW(
-        0, L"STATIC", L"decoder-test-notification", 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
-    Check(notification_window != nullptr,
-          "create decoder completion notification window");
+    pv::CompletionQueue completion_queue(1);
     {
-        pv::DecoderPool pool(1, work_queue, completion_queue, slots,
-                             notification_window);
-        pv::DecodeWork work{0, 1, &token, compressed_slot, staging_slot};
-        Check(work_queue.TryPush(work), "queue pre-claim cancellation test work");
+        pv::DecoderPool pool(1, work_queue, completion_queue, slots);
+        pv::DecodeWork work{0, 1, compressed_slot, staging_slot};
+        Check(work_queue.TryPush(work), "queue rejected decode test work");
 
-        pv::CompletionQueue::Batch batch;
-        const DWORD wait = MsgWaitForMultipleObjectsEx(
-            0, nullptr, 5000, QS_POSTMESSAGE, MWMO_INPUTAVAILABLE);
+        const DWORD wait = WaitForSingleObject(
+            completion_queue.CompletionEvent(), 5000);
         Check(wait == WAIT_OBJECT_0,
               "worker completion notification timed out");
-        MSG message{};
-        while (PeekMessageW(&message, notification_window,
-                            pv::kMessageWorkerComplete,
-                            pv::kMessageWorkerComplete, PM_REMOVE)) {
-            batch = completion_queue.DrainAll();
-        }
-        Check(batch.results.size() == 1 && batch.results.front().cancelled,
-              "worker must report work cancelled before claim");
+        pv::CompletionQueue::Batch batch(1);
+        completion_queue.DrainAll(batch);
+        Check(batch.results.size() == 1 && !batch.results.front().success &&
+                  batch.results.front().error == E_INVALIDARG,
+              "worker must report invalid decode resources");
 
         Check(batch.released_inputs.size() == 1 &&
                   batch.released_inputs.front().compressed_slot == compressed_slot,
-              "cancelled work must release its compressed input exactly once");
+              "rejected work must release its compressed input exactly once");
     }
-    DestroyWindow(notification_window);
 
     slots.ReleaseCompressed(compressed_slot);
     slots.ReleaseStaging(staging_slot);
     Check(slots.FreeCompressedCount() == 1 &&
               slots.FreeStagingCount() == 1,
-          "cancelled work slots must return to their free indexes");
+          "rejected work slots must return to their free indexes");
 }
 
 void TestManagedStagingUpload() {
@@ -625,7 +612,7 @@ void TestGraphics(const HINSTANCE instance) {
               "resized frame credit");
         (void)graphics.Draw(image);
     }
-    DestroyWindow(window);
+    if (window) DestroyWindow(window);
 }
 
 std::uint32_t ReadBigEndian(const std::byte* const data) {
@@ -787,7 +774,7 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
                                   pixel_storage.back().size(), decoded_bytes,
                                   width, height, width * 4};
         compressed_images.push_back(std::move(compressed));
-        surfaces.push_back(std::move(surface));
+        surfaces.push_back(surface);
     }
     const auto load_elapsed = std::chrono::steady_clock::now() - load_begin;
 
@@ -937,7 +924,7 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     std::cout << "Graphics8K frames=" << frames
               << " elapsed_ms=" << (seconds * 1000.0)
               << " frames_per_second=" << (frames / seconds) << '\n';
-    DestroyWindow(window);
+    if (window) DestroyWindow(window);
     return 0;
 }
 
@@ -962,10 +949,10 @@ int wmain(const int argc, wchar_t** const argv) {
         TestMixedFiltersAndBounds();
         TestMalformedDeflateAndOutputBounds();
         TestFusedDeflateUnfilterObservability();
-        TestCancelledWorkReleasesInput();
+        TestRejectedWorkReleasesInput();
         TestManagedStagingUpload();
         TestGraphics(GetModuleHandleW(nullptr));
-        std::cout << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, malformed input and guarded output bounds, pre-claim cancellation slot return, libspng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
+        std::cout << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, malformed input and guarded output bounds, rejected-work input release, libspng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

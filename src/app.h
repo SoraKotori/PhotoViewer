@@ -7,8 +7,6 @@
 #include "navigation.h"
 #include "reservation.h"
 
-#include <ioringapi.h>
-
 namespace pv {
 
 struct ImageRecord {
@@ -24,6 +22,11 @@ struct ImageRecord {
 };
 
 struct ResourceContext {
+    explicit ResourceContext(const Config& config)
+        : slots(config.compressed_slot_count, config.staging_slot_count,
+                config.GpuSlotCount(), config.compressed_budget_bytes,
+                config.staging_cache_bytes) {}
+
     Catalog catalog;
     NavigationState navigation;
     std::vector<ImageRecord> images;
@@ -38,7 +41,7 @@ struct ResourceContext {
 
     std::size_t compressed_bytes = 0;
     std::size_t gpu_bytes = 0;
-    std::optional<ResourceSlots> slots;
+    ResourceSlots slots;
     std::deque<UploadTicket> uploads;
 
     bool frame_credit = false;
@@ -56,6 +59,11 @@ public:
     int Run(HINSTANCE instance, int show_command);
 
 private:
+    struct ValidationSample {
+        std::size_t image_index = 0;
+        std::uint64_t nanoseconds = 0;
+    };
+
     struct ComApartment {
         ComApartment();
         ~ComApartment();
@@ -64,18 +72,6 @@ private:
         ComApartment& operator=(const ComApartment&) = delete;
     };
 
-    struct IoRingApi {
-        decltype(&QueryIoRingCapabilities) query_capabilities = nullptr;
-        decltype(&IsIoRingOpSupported) is_op_supported = nullptr;
-        decltype(&CreateIoRing) create = nullptr;
-        decltype(&SubmitIoRing) submit = nullptr;
-        decltype(&CloseIoRing) close = nullptr;
-        decltype(&PopIoRingCompletion) pop = nullptr;
-        decltype(&SetIoRingCompletionEvent) set_completion_event = nullptr;
-        decltype(&BuildIoRingReadFile) build_read = nullptr;
-        decltype(&BuildIoRingRegisterFileHandles) build_register_files = nullptr;
-        decltype(&BuildIoRingRegisterBuffers) build_register_buffers = nullptr;
-    };
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
                                              WPARAM wparam, LPARAM lparam);
     void InitializeWindow(HINSTANCE instance, int show_command);
@@ -87,6 +83,8 @@ private:
     void OnDirection(int direction, bool repeat, std::size_t repeat_count);
     void OnDirectionReleased(int direction);
     void OnCatalogComplete();
+    void OnIoCompletion(IoRequest* request, OVERLAPPED* overlapped,
+                        DWORD result, ULONG_PTR transferred);
     void OnIoHeaderReady(IoRequest* request, DWORD result,
                          ULONG_PTR transferred);
     void OnIoComplete(IoRequest* request, DWORD result,
@@ -124,18 +122,13 @@ private:
     [[nodiscard]] bool HasReadableGpuTexture(std::size_t frame) const noexcept;
     [[nodiscard]] bool CancelQueuedDecode(std::size_t frame);
     void ReleaseCompressed(ImageRecord& image);
-    void ReleaseRetiredIoBuffers() noexcept;
     void CancelAllIo();
     void ArmOldestFence();
 
     Config config_;
-    HIORING io_ring_ = nullptr;
-    HANDLE io_ring_event_ = nullptr;
-    IoRingApi io_ring_api_;
-    std::unique_ptr<HANDLE[]> io_ring_file_table_;
-    std::unique_ptr<IORING_BUFFER_INFO[]> io_ring_buffer_table_;
-    std::vector<std::byte*> retired_io_buffers_;
-    UINT32 io_ring_registrations_pending_ = 0;
+    // All App state and IOCP consumption remain main-thread-owned.
+    HANDLE io_completion_port_ = nullptr;
+    HANDLE io_completion_event_ = nullptr;
     HWND window_ = nullptr;
     bool running_ = true;
     bool graphics_device_ready_ = false;
@@ -161,7 +154,7 @@ private:
     std::chrono::steady_clock::time_point validation_graphics_ready_{};
     std::chrono::steady_clock::time_point validation_catalog_ready_{};
     std::chrono::steady_clock::time_point validation_initial_header_ready_{};
-    std::chrono::steady_clock::time_point validation_initial_content_cqe_observed_{};
+    std::chrono::steady_clock::time_point validation_initial_content_completion_observed_{};
     std::chrono::steady_clock::time_point validation_initial_content_ready_{};
     std::chrono::steady_clock::time_point validation_initial_decode_submitted_{};
     std::chrono::steady_clock::time_point validation_initial_decode_completed_{};
@@ -182,10 +175,8 @@ private:
     std::uint64_t validation_try_present_nanoseconds_ = 0;
     std::uint64_t validation_main_kernel_started_ = 0;
     std::uint64_t validation_main_user_started_ = 0;
-    std::vector<std::size_t> validation_ready_indices_;
-    std::vector<std::uint64_t> validation_ready_nanoseconds_;
-    std::vector<std::size_t> validation_presented_indices_;
-    std::vector<std::uint64_t> validation_presented_nanoseconds_;
+    std::vector<ValidationSample> validation_ready_samples_;
+    std::vector<ValidationSample> validation_presented_samples_;
     bool validation_navigation_timer_active_ = false;
     int exit_code_ = 0;
 
@@ -193,6 +184,7 @@ private:
     Graphics graphics_;
     WorkQueue work_queue_;
     CompletionQueue completion_queue_;
+    CompletionQueue::Batch completion_batch_;
     std::optional<DecoderPool> decoders_;
     std::optional<AsyncCatalog> catalog_io_;
     ResourceContext resources_;

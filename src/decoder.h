@@ -3,13 +3,14 @@
 #include "resource_slots.h"
 #include "work_queue.h"
 
+#include <array>
+
 namespace pv {
 
 class DecoderPool {
 public:
     DecoderPool(std::size_t worker_count, WorkQueue& work_queue,
-                CompletionQueue& completion_queue, ResourceSlots& slots,
-                HWND event_window);
+                CompletionQueue& completion_queue, ResourceSlots& slots);
     ~DecoderPool();
 
     void ResetMetrics() noexcept;
@@ -48,10 +49,12 @@ private:
     WorkQueue& work_queue_;
     CompletionQueue& completion_queue_;
     ResourceSlots& slots_;
-    HWND event_window_ = nullptr;
+    // Constructed once at the configured size and never resized. This keeps
+    // the runtime-sized, cache-line-aligned sequence off the main stack.
+    std::vector<WorkerMetrics> worker_metrics_;
+    // Declared after worker_metrics_ so partial-construction unwinding joins
+    // every worker before releasing the metrics captured by those threads.
     std::vector<std::jthread> workers_;
-    std::unique_ptr<WorkerMetrics[]> worker_metrics_;
-    std::size_t worker_count_ = 0;
     std::uint64_t decode_count_base_ = 0;
     std::uint64_t decode_nanoseconds_base_ = 0;
 };
