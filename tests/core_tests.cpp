@@ -1,3 +1,4 @@
+#include "config.h"
 #include "navigation.h"
 #include "png.h"
 #include "processor_topology.h"
@@ -18,6 +19,19 @@ void Check(const bool condition, const char* message) {
     }
 }
 
+void ConfigDefaultTests() {
+    const pv::Config config;
+    Check(config.worker_count == 0,
+          "application default must select workers from physical cores");
+    Check(config.compressed_slot_count == 10,
+          "application default must retain two compressed read-ahead slots");
+    Check(config.staging_slot_count == 12,
+          "application default must retain four decoded-output pipeline slots");
+    Check(config.gpu_forward_slot_count == 3 &&
+              config.gpu_reverse_slot_count == 1,
+          "application default must use the measured GPU slot minimum");
+}
+
 std::size_t ProcessorTopologyTests() {
     Check(pv::DefaultWorkerCountForPhysicalCores(0) == 1,
           "missing topology must retain one worker");
@@ -25,9 +39,9 @@ std::size_t ProcessorTopologyTests() {
           "one physical core must select one worker");
     Check(pv::DefaultWorkerCountForPhysicalCores(8) == 8,
           "worker default must follow physical cores below the cap");
-    Check(pv::DefaultWorkerCountForPhysicalCores(16) == 16,
-          "worker default must include the cap");
-    Check(pv::DefaultWorkerCountForPhysicalCores(32) == 16,
+    Check(pv::DefaultWorkerCountForPhysicalCores(16) == 8,
+          "worker default must stop at the eight-worker cap");
+    Check(pv::DefaultWorkerCountForPhysicalCores(32) == 8,
           "worker default must not exceed the cap");
 
     const std::size_t detected = pv::DetectPhysicalCoreCount();
@@ -327,6 +341,7 @@ void CompletionQueueTests() {
 }  // namespace
 
 int main() {
+    ConfigDefaultTests();
     const std::size_t physical_core_count = ProcessorTopologyTests();
     NavigationTests();
     PngTests();
