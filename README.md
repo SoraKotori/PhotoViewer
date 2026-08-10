@@ -81,7 +81,7 @@
 
 | 參數 | 驗收值 |
 |---|---:|
-| `--workers=` | 5 |
+| `--workers=` | 4 |
 | `--compressed-slot-count=` | 8 |
 | `--staging-slot-count=` | 8 |
 | `--gpu-reverse-slot-count=` | 1 |

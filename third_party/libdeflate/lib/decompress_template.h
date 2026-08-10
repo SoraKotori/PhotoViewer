@@ -84,6 +84,20 @@ FUNCNAME(struct libdeflate_decompressor * restrict d,
 	bitbuf_t litlen_tablemask;
 	u32 entry;
 
+#define NOTIFY_CALLBACK_IF_NEEDED() do { \
+	struct libdeflate_decompress_callback_state *callback_state = \
+		d->callback_state; \
+	if (callback_state != NULL && callback_state->function != NULL && \
+	    (size_t)(out_next - (u8 *)out) >= DEFLATE_MAX_MATCH_OFFSET && \
+	    (size_t)(out_next - DEFLATE_MAX_MATCH_OFFSET - \
+		     callback_state->frontier) >= callback_state->interval) { \
+		callback_state->frontier = out_next - DEFLATE_MAX_MATCH_OFFSET; \
+		if (callback_state->function(callback_state->opaque, out, \
+			     (size_t)(callback_state->frontier - (u8 *)out), 0) != 0) \
+			return LIBDEFLATE_CALLBACK_ERROR; \
+	} \
+} while (0)
+
 next_block:
 	/* Starting to read the next block */
 	;
@@ -385,7 +399,7 @@ have_decode_tables:
 	REFILL_BITS_IN_FASTLOOP();
 	entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
 	do {
-		u32 length, offset, lit;
+		u32 length, length_entry, offset, offset_entry, lit;
 		const u8 *src;
 		u8 *dst;
 
@@ -522,27 +536,26 @@ have_decode_tables:
 		}
 
 		/*
-		 * Decode the match length: the length base value associated
-		 * with the litlen symbol (which we extract from the decode
-		 * table entry), plus the extra length bits.  We don't need to
-		 * consume the extra length bits here, as they were included in
-		 * the bits consumed by the entry earlier.  We also don't need
-		 * to check for too-long matches here, as this is inside the
-		 * fastloop where it's already been verified that the output
-		 * buffer has enough space remaining to copy a max-length match.
-		 */
-		length = entry >> 16;
-		length += SHIFT_VARBITS(EXTRACT_VARBITS8(saved_bitbuf, entry),
-					 entry >> 8);
-
-		/*
 		 * Decode the match offset.  There are enough "preloadable" bits
 		 * remaining to preload the offset decode table entry, but a
-		 * refill might be needed before consuming it.
+		 * refill might be needed before consuming it.  Start this independent
+		 * table load before resolving the match length so its L1 latency can
+		 * overlap the length extra-bit calculations.
 		 */
 		STATIC_ASSERT(CAN_CONSUME_AND_THEN_PRELOAD(LENGTH_MAXFASTBITS,
 							   OFFSET_TABLEBITS));
+		length_entry = entry;
 		entry = d->offset_decode_table[bitbuf & BITMASK(OFFSET_TABLEBITS)];
+
+		/*
+		 * Decode the match length: the length base value associated with the
+		 * litlen symbol, plus its extra length bits.  The entry already
+		 * consumed those bits from the bitstream above.
+		 */
+		length = length_entry >> 16;
+		length += SHIFT_VARBITS(
+			EXTRACT_VARBITS8(saved_bitbuf, length_entry),
+			length_entry >> 8);
 		if (CAN_CONSUME_AND_THEN_PRELOAD(OFFSET_MAXBITS,
 						 LITLEN_TABLEBITS)) {
 			/*
@@ -580,12 +593,28 @@ have_decode_tables:
 				STATIC_ASSERT(CAN_CONSUME(OFFSET_MAXFASTBITS));
 			}
 		}
+		offset_entry = entry;
 		saved_bitbuf = bitbuf;
-		SHIFT_BITBUF(bitbuf, entry);
-		bitsleft -= entry; /* optimization: subtract full entry */
-		offset = entry >> 16;
-		offset += SHIFT_VARBITS(EXTRACT_VARBITS8(saved_bitbuf, entry),
-					 entry >> 8);
+		SHIFT_BITBUF(bitbuf, offset_entry);
+		bitsleft -= offset_entry; /* optimization: subtract full entry */
+
+		/*
+		 * Begin the next litlen table load while resolving this offset.  At
+		 * this point the decompressor table base is still live from the offset
+		 * lookup, and bitbuf already points at the next litlen codeword.
+		 */
+		if (!CAN_CONSUME_AND_THEN_PRELOAD(
+			MAX(OFFSET_MAXBITS - OFFSET_TABLEBITS,
+			    OFFSET_MAXFASTBITS),
+			LITLEN_TABLEBITS) &&
+		    unlikely((u8)bitsleft < LITLEN_TABLEBITS - PRELOAD_SLACK))
+			REFILL_BITS_IN_FASTLOOP();
+		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
+
+		offset = offset_entry >> 16;
+		offset += SHIFT_VARBITS(
+			EXTRACT_VARBITS8(saved_bitbuf, offset_entry),
+			offset_entry >> 8);
 
 		/* Every DEFLATE offset is valid after a full window was produced. */
 		if (unlikely(out_next < out_offset_safe))
@@ -604,13 +633,6 @@ have_decode_tables:
 		 * to do the table preload independently of the refill, except
 		 * on 32-bit platforms using the byte-at-a-time refill method.
 		 */
-		if (!CAN_CONSUME_AND_THEN_PRELOAD(
-			MAX(OFFSET_MAXBITS - OFFSET_TABLEBITS,
-			    OFFSET_MAXFASTBITS),
-			LITLEN_TABLEBITS) &&
-		    unlikely((u8)bitsleft < LITLEN_TABLEBITS - PRELOAD_SLACK))
-			REFILL_BITS_IN_FASTLOOP();
-		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
 		REFILL_BITS_IN_FASTLOOP();
 
 		/*
@@ -755,8 +777,10 @@ generic_loop:
 block_done:
 	/* Finished decoding a block */
 
-	if (!is_final_block)
+	if (!is_final_block) {
+		NOTIFY_CALLBACK_IF_NEEDED();
 		goto next_block;
+	}
 
 	/* That was the last block. */
 
@@ -783,9 +807,18 @@ block_done:
 		if (out_next != out_end)
 			return LIBDEFLATE_SHORT_OUTPUT;
 	}
+	{
+		struct libdeflate_decompress_callback_state *callback_state =
+			d->callback_state;
+		if (callback_state != NULL && callback_state->function != NULL &&
+		    callback_state->function(callback_state->opaque, out,
+					     (size_t)(out_next - (u8 *)out), 1) != 0)
+			return LIBDEFLATE_CALLBACK_ERROR;
+	}
 	return LIBDEFLATE_SUCCESS;
 }
 
+#undef NOTIFY_CALLBACK_IF_NEEDED
 #undef SHIFT_BITBUF
 #undef SHIFT_VARBITS
 

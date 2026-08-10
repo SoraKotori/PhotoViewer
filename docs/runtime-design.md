@@ -699,6 +699,8 @@ GPU 完成會釋放複製來源 staging slot，讓等待解碼或等待讀取的
 
 工作佇列只包含 PNG 解碼：輸入為 Windows 非同步檔案 I/O 填入的壓縮 PNG slot，輸出為工作描述指定的解碼輸出 slot。圖形裝置完成前，首圖輸出由暫時 CPU 解碼記憶體承載；其後輸出由已映射的 staging texture 承載。所有 Workers 從同一條工作佇列領取這些 CPU 密集工作。
 
+8-bit RGBA、non-interlaced PNG 的快速路徑在同一個 worker、同一條同步呼叫鏈內依序執行 DEFLATE 與 PNG unfilter。DEFLATE 直接寫入既有輸出 slot，不配置另一份完整 filtered buffer；到達既有 DEFLATE block boundary 時，解壓器將單調遞增的安全前綴交給 unfilter 立即處理，待處理完成後才繼續解壓，因此不涉及背景工作或非同步事件，也不在 symbol fast loop 增加 watermark 分支。串流完成前只處理已離開 DEFLATE 32768-byte history window 的完整 scanlines，使 unfilter 能原位壓縮資料而不改寫後續 match 仍可能引用的 bytes。每批至少 32 KiB 且不小於一個 scanline；一般圖片以 256 個 scanlines、最多 8 MiB 為 shared-cache-local 批次目標，16 KiB 以上的寬 scanline 則放寬到 1024 個 scanlines、最多 32 MiB，以減少大型 8K PNG 在 block boundary 暫停解壓的次數，同時保留 Paeth 4/8-row wavefront。DEFLATE 完整驗證成功後，再以同樣的同步方式處理尾端 rows。篩選還原耗時包含在解壓階段內；驗收分別記錄解壓進行中已完成的資料，以及串流驗證後才收尾的資料。
+
 ```text
 [外部非同步執行器] Windows 非同步檔案 I/O
 │
