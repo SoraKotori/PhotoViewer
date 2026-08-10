@@ -277,7 +277,8 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
                                     const SlotId staging_slot,
                                     const DecodeStaging& source,
                                     GpuImage& destination) {
-    const auto begin = std::chrono::steady_clock::now();
+    const auto begin = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     if (!source.texture || source.surface.ByteSize() == 0) {
         throw std::invalid_argument("invalid decoded staging source");
     }
@@ -315,10 +316,12 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     ticket.fence_value = next_fence_value_++;
     CheckHr(context_->Signal(fence_.Get(), ticket.fence_value),
             "ID3D11DeviceContext4::Signal");
-    upload_nanoseconds_ += static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - begin).count());
-    ++upload_count_;
+    if (metrics_enabled_) {
+        upload_nanoseconds_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        ++upload_count_;
+    }
     return ticket;
 }
 
@@ -338,7 +341,8 @@ void Graphics::FinishUpload(GpuImage& image) {
 
 UINT64 Graphics::Draw(const GpuImage& image) {
     if (!image.bitmap || surface_width_ == 0 || surface_height_ == 0) return 0;
-    const auto begin = std::chrono::steady_clock::now();
+    const auto begin = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     const float sx = static_cast<float>(surface_width_) / static_cast<float>(image.width);
     const float sy = static_cast<float>(surface_height_) / static_cast<float>(image.height);
     const float scale = std::min(sx, sy);
@@ -361,10 +365,12 @@ UINT64 Graphics::Draw(const GpuImage& image) {
     const UINT64 completion = next_fence_value_++;
     CheckHr(context_->Signal(fence_.Get(), completion),
             "Signal presented GPU Texture completion");
-    draw_nanoseconds_ += static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - begin).count());
-    ++draw_count_;
+    if (metrics_enabled_) {
+        draw_nanoseconds_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        ++draw_count_;
+    }
     return completion;
 }
 
@@ -373,6 +379,7 @@ void Graphics::ResetMetrics() noexcept {
     upload_nanoseconds_ = 0;
     draw_count_ = 0;
     draw_nanoseconds_ = 0;
+    metrics_enabled_ = true;
 }
 
 std::uint64_t Graphics::UploadCount() const noexcept { return upload_count_; }

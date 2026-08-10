@@ -122,9 +122,6 @@ App::~App() {
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
-        ThrowLastError("Set main thread priority");
-    }
     if (!config_.initial_image.empty()) OpenInitialImage();
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
         GetLastError() != ERROR_ACCESS_DENIED) {
@@ -1199,9 +1196,6 @@ void App::WriteValidationReport(const std::string_view phase, const bool truncat
                    ? (FileTimeTicks(main_user) - validation_main_user_started_) * 100ULL
                    : 0ULL)
            << '\n'
-           << "selected_cpu_set_count=" << decoders_->SelectedCpuSetCount() << '\n'
-           << "unthrottled_worker_count=" << decoders_->UnthrottledWorkerCount() << '\n'
-           << "elevated_worker_count=" << decoders_->ElevatedWorkerCount() << '\n'
            << "upload_count=" << graphics_.UploadCount() << '\n'
            << "upload_nanoseconds=" << graphics_.UploadNanoseconds() << '\n'
            << "draw_count=" << graphics_.DrawCount() << '\n'

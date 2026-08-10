@@ -16,9 +16,6 @@ public:
     void ResetMetrics() noexcept;
     [[nodiscard]] std::uint64_t DecodeCount() const noexcept;
     [[nodiscard]] std::uint64_t DecodeNanoseconds() const noexcept;
-    [[nodiscard]] std::size_t SelectedCpuSetCount() const noexcept;
-    [[nodiscard]] std::size_t UnthrottledWorkerCount() const noexcept;
-    [[nodiscard]] std::size_t ElevatedWorkerCount() const noexcept;
 
     DecoderPool(const DecoderPool&) = delete;
     DecoderPool& operator=(const DecoderPool&) = delete;
@@ -27,12 +24,8 @@ private:
     struct alignas(64) WorkerMetrics {
         std::atomic<std::uint64_t> decode_count{0};
         std::atomic<std::uint64_t> decode_nanoseconds{0};
-        std::atomic<bool> selected_cpu_set{false};
-        std::atomic<bool> unthrottled{false};
-        std::atomic<bool> elevated{false};
         std::array<std::byte,
-                   64 - 2 * sizeof(std::atomic<std::uint64_t>) -
-                       3 * sizeof(std::atomic<bool>)> cache_line_padding{};
+                   64 - 2 * sizeof(std::atomic<std::uint64_t>)> cache_line_padding{};
     };
     static_assert(sizeof(WorkerMetrics) == 64);
 
@@ -55,6 +48,7 @@ private:
     // Declared after worker_metrics_ so partial-construction unwinding joins
     // every worker before releasing the metrics captured by those threads.
     std::vector<std::jthread> workers_;
+    std::atomic<bool> metrics_enabled_{false};
     std::uint64_t decode_count_base_ = 0;
     std::uint64_t decode_nanoseconds_base_ = 0;
 };
