@@ -37,14 +37,14 @@
 
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
-| `--workers=` | 實體核心數，最多 16 | Worker thread 數量 |
+| `--workers=` | 實體核心數，最多 8 | Worker thread 數量 |
 | `--compressed-budget-mib=` | 無限制 | 壓縮 PNG Slot Storage 記憶體上限 |
-| `--compressed-slot-count=` | 24 | 壓縮 PNG slot 數量上限 |
+| `--compressed-slot-count=` | 10 | 壓縮 PNG slot 數量上限 |
 | `--staging-cache-mib=` | 無限制 | 解碼 staging texture Slot Storage 記憶體上限 |
-| `--staging-slot-count=` | 20 | 解碼 staging texture slot 數量上限 |
+| `--staging-slot-count=` | 12 | 解碼 staging texture slot 數量上限 |
 | `--gpu-cache-mib=` | 無限制 | GPU Texture 記憶體上限 |
 | `--gpu-reverse-slot-count=` | 1 | 反方向的 GPU Texture slots |
-| `--gpu-forward-slot-count=` | 5 | 目前方向的 GPU Texture slots；包含目前畫面 |
+| `--gpu-forward-slot-count=` | 3 | 目前方向的 GPU Texture slots；包含目前畫面 |
 
 ## 系統需求
 
@@ -63,9 +63,9 @@
 
 | 項目 | Slot 數量 | 每個 Slot | 全部配置時 |
 |---|---:|---:|---:|
-| 壓縮 PNG 資料 | 24 | 約 40 MiB | 約 960 MiB 系統記憶體 |
-| 解碼 staging texture | 20 | 約 126.56 MiB | 約 2531.25 MiB 系統記憶體 |
-| GPU Texture | 6（1 reverse + 5 forward） | 約 126.56 MiB | 約 759.38 MiB VRAM |
+| 壓縮 PNG 資料 | 10 | 約 40 MiB | 約 400 MiB 系統記憶體 |
+| 解碼 staging texture | 12 | 約 126.56 MiB | 約 1518.75 MiB 系統記憶體 |
+| GPU Texture | 4（1 reverse + 3 forward） | 約 126.56 MiB | 約 506.25 MiB VRAM |
 
 持續切換時的最低頻寬估算如下：
 

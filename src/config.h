@@ -14,9 +14,9 @@ struct Config {
     std::size_t gpu_cache_bytes = std::numeric_limits<std::size_t>::max();
     std::size_t compressed_budget_bytes = std::numeric_limits<std::size_t>::max();
     std::size_t staging_slot_count = 12;
-    std::size_t gpu_forward_slot_count = 5;
+    std::size_t gpu_forward_slot_count = 3;
     std::size_t gpu_reverse_slot_count = 1;
-    std::size_t compressed_slot_count = 24;
+    std::size_t compressed_slot_count = 10;
     std::size_t worker_count = 0;
     bool validation_exit_after_present = false;
     bool validation_elapsed_exit_code = false;

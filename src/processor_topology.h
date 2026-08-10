@@ -4,7 +4,7 @@
 
 namespace pv {
 
-inline constexpr std::size_t kMaximumDefaultWorkerCount = 16;
+inline constexpr std::size_t kMaximumDefaultWorkerCount = 8;
 
 constexpr std::size_t DefaultWorkerCountForPhysicalCores(
     const std::size_t physical_core_count) noexcept {
