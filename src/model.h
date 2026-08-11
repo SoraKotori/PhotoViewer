@@ -95,9 +95,7 @@ struct DecodeStaging {
     [[nodiscard]] bool PrepareCpuSurface(const UINT width, const UINT height,
                                          const std::size_t decoded_bytes) noexcept {
         const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-        if (width == 0 || height == 0 ||
-            row_bytes > std::numeric_limits<UINT>::max() ||
-            decoded_bytes > committed_bytes ||
+        if (decoded_bytes > committed_bytes ||
             height > committed_bytes - decoded_bytes ||
             !AllocateCpu(committed_bytes)) {
             return false;

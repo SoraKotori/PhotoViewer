@@ -1074,8 +1074,8 @@ HRESULT DecodePngSpng(const std::span<std::byte> compressed,
                       const InputConsumedCallback input_consumed,
                       void* const callback_context,
                       PngDecodeTimings* const timings) noexcept {
-    if (compressed.empty() || !surface.pixels || surface.width == 0 ||
-        surface.height == 0 || surface.stride < surface.width * 4U) {
+    if (compressed.empty() || !surface.pixels ||
+        surface.stride < surface.width * 4U) {
         return E_INVALIDARG;
     }
 

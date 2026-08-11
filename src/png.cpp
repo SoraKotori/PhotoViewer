@@ -1,5 +1,7 @@
 #include "png.h"
 
+#include <d3d11.h>
+
 #include <array>
 #include <limits>
 
@@ -30,6 +32,10 @@ std::optional<PngInfo> ParsePngHeader(const std::span<const std::byte> bytes) no
     const std::uint32_t width = ReadBigEndian(bytes.data() + 16);
     const std::uint32_t height = ReadBigEndian(bytes.data() + 20);
     if (width == 0 || height == 0) return std::nullopt;
+    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+        return std::nullopt;
+    }
     constexpr std::size_t bytes_per_pixel = 4;
     if (width > std::numeric_limits<std::size_t>::max() / bytes_per_pixel) return std::nullopt;
     const std::size_t stride = static_cast<std::size_t>(width) * bytes_per_pixel;

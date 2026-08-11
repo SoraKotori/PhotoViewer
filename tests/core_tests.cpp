@@ -6,6 +6,8 @@
 #include "reservation.h"
 #include "work_queue.h"
 
+#include <d3d11.h>
+
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -159,6 +161,30 @@ void PngTests() {
           "decoded byte reservation");
     header[0] = std::byte{0};
     Check(!pv::ParsePngHeader(header), "invalid signature must fail");
+
+    const auto set_dimension = [&](const std::size_t offset,
+                                   const std::uint32_t value) {
+        header[offset] = std::byte{static_cast<unsigned char>(value >> 24U)};
+        header[offset + 1] = std::byte{static_cast<unsigned char>(value >> 16U)};
+        header[offset + 2] = std::byte{static_cast<unsigned char>(value >> 8U)};
+        header[offset + 3] = std::byte{static_cast<unsigned char>(value)};
+    };
+    header[0] = std::byte{0x89};
+    set_dimension(16, 0);
+    set_dimension(20, 1);
+    Check(!pv::ParsePngHeader(header), "zero PNG width must fail");
+    set_dimension(16, 1);
+    set_dimension(20, 0);
+    Check(!pv::ParsePngHeader(header), "zero PNG height must fail");
+    set_dimension(16, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+    set_dimension(20, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+    Check(pv::ParsePngHeader(header),
+          "D3D11 maximum PNG dimensions must pass");
+    set_dimension(16, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1U);
+    Check(!pv::ParsePngHeader(header), "PNG width above D3D11 limit must fail");
+    set_dimension(16, 1);
+    set_dimension(20, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1U);
+    Check(!pv::ParsePngHeader(header), "PNG height above D3D11 limit must fail");
 }
 
 void ResourceSlotTests() {

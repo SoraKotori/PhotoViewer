@@ -165,12 +165,8 @@ void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
     if (!device_) {
         throw std::logic_error("Direct3D device is not initialized");
     }
-    if (staging.mapped || width == 0 || height == 0) {
+    if (staging.mapped) {
         throw std::invalid_argument("invalid decode staging preparation");
-    }
-    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
-        throw std::invalid_argument("PNG dimensions exceed D3D11 limits");
     }
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     const std::size_t extra_rows =
