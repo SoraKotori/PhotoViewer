@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model.h"
+#include "win32_handle.h"
 
 namespace pv {
 
@@ -33,7 +34,7 @@ struct IoRequest {
     void Reset() noexcept {
         header_overlapped = {};
         content_overlapped = {};
-        file = INVALID_HANDLE_VALUE;
+        file.Reset();
         index = 0;
         generation = 0;
         compressed_slot = kInvalidSlot;
@@ -54,7 +55,7 @@ struct IoRequest {
 
     OVERLAPPED header_overlapped{};
     OVERLAPPED content_overlapped{};
-    HANDLE file = INVALID_HANDLE_VALUE;
+    UniqueHandle file;
     std::size_t index = 0;
     std::uint64_t generation = 0;
     SlotId compressed_slot = kInvalidSlot;
@@ -278,7 +279,8 @@ private:
     static void RemoveFree(std::vector<SlotId>& free_index, SlotId id) {
         const auto found = std::find(free_index.begin(), free_index.end(), id);
         if (found == free_index.end()) throw std::logic_error("slot missing from free index");
-        free_index.erase(found);
+        *found = free_index.back();
+        free_index.pop_back();
     }
 
     [[nodiscard]] SlotId BestCompressed(const std::size_t bytes) const {

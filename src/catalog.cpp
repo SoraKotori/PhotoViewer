@@ -1,6 +1,7 @@
 #include "catalog.h"
 
 #include "common.h"
+#include "win32_handle.h"
 
 #include <array>
 #include <cstring>
@@ -97,49 +98,33 @@ struct AsyncCatalog::Impl {
         static_assert(sizeof(query) == sizeof(address));
         std::memcpy(&query, &address, sizeof(query));
 
-        completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        completion_event.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         if (!completion_event) ThrowLastError("CreateEventW(catalog)");
 
-        directory = CreateFileW(
+        directory.Reset(CreateFileW(
             directory_path.c_str(), FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-            nullptr);
-        if (directory == INVALID_HANDLE_VALUE) {
-            const DWORD error = GetLastError();
-            CloseHandle(completion_event);
-            completion_event = nullptr;
-            SetLastError(error);
-            ThrowLastError("CreateFileW(directory)");
-        }
-        try {
-            if (!Submit()) {
-                FinalizeCatalog(catalog, absolute);
-                completed = true;
-            }
-        } catch (...) {
-            CloseHandle(directory);
-            directory = INVALID_HANDLE_VALUE;
-            CloseHandle(completion_event);
-            completion_event = nullptr;
-            throw;
+            nullptr));
+        if (!directory) ThrowLastError("CreateFileW(directory)");
+        if (!Submit()) {
+            FinalizeCatalog(catalog, absolute);
+            completed = true;
         }
     }
 
     ~Impl() {
         if (in_flight) {
-            CancelIoEx(directory, nullptr);
-            WaitForSingleObject(completion_event, INFINITE);
+            CancelIoEx(directory.Get(), nullptr);
+            WaitForSingleObject(completion_event.Get(), INFINITE);
         }
-        if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
-        if (completion_event) CloseHandle(completion_event);
     }
 
     [[nodiscard]] bool Submit() {
         io_status = {};
         in_flight = true;
         const LONG status = query(
-            directory, completion_event, nullptr, nullptr, &io_status,
+            directory.Get(), completion_event.Get(), nullptr, nullptr, &io_status,
             buffer.data(), static_cast<ULONG>(buffer.size()),
             kFileDirectoryInformation, restart_scan ? kRestartScan : 0,
             nullptr);
@@ -207,8 +192,8 @@ struct AsyncCatalog::Impl {
 
     std::filesystem::path absolute;
     std::filesystem::path directory_path;
-    HANDLE directory = INVALID_HANDLE_VALUE;
-    HANDLE completion_event = nullptr;
+    UniqueHandle directory;
+    UniqueHandle completion_event;
     NtQueryDirectoryFileExFn query = nullptr;
     NativeIoStatusBlock io_status{};
     alignas(8) std::array<std::byte, 64 * 1024> buffer{};
@@ -226,7 +211,7 @@ AsyncCatalog::~AsyncCatalog() = default;
 bool AsyncCatalog::Advance() { return impl_->Advance(); }
 
 HANDLE AsyncCatalog::CompletionEvent() const noexcept {
-    return impl_->completion_event;
+    return impl_->completion_event.Get();
 }
 
 Catalog AsyncCatalog::TakeCatalog() {

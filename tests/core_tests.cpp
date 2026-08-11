@@ -2,6 +2,7 @@
 #include "navigation.h"
 #include "png.h"
 #include "processor_topology.h"
+#include "reservation_planner.h"
 #include "resource_slots.h"
 #include "reservation.h"
 #include "work_queue.h"
@@ -126,7 +127,8 @@ void NavigationTests() {
     Check(navigation.Empty(), "left short press must drain exactly");
     Check(navigation.PreferredDirection() == -1,
           "idle prefetch must retain the last successful left direction");
-    const auto left_plan = navigation.PlannedOrder(4);
+    std::vector<std::size_t> left_plan;
+    navigation.BuildPlan(4, left_plan);
     Check(left_plan == std::vector<std::size_t>({8, 7, 6, 5}),
           "planned order must extend from the requested left direction");
     navigation.Step(1, false);
@@ -141,6 +143,42 @@ void NavigationTests() {
     navigation.Release(-1);
     Check(navigation.PreferredDirection() == 0,
           "a rejected boundary step must not replace the last effective direction");
+}
+
+void ReservationPlannerTests() {
+    pv::Config config;
+    config.compressed_slot_count = 4;
+    config.staging_slot_count = 3;
+    config.gpu_forward_slot_count = 2;
+    config.gpu_reverse_slot_count = 1;
+
+    pv::ReservationPlanner planner(config);
+    planner.Reset(4, 3, 3);
+    pv::NavigationState navigation;
+    navigation.Reset(5, 12);
+    PresentNext(navigation);
+    navigation.Step(1, false);
+    std::vector<pv::ImageRecord> images(12);
+    pv::WorkQueue work_queue;
+    planner.Rebuild(navigation, images, work_queue);
+
+    const auto& desired = planner.DesiredGpuTextures();
+    Check(desired.size() == 3 && desired[0] == 5 &&
+              desired[1] == 6 && desired[2] == 4,
+          "planner must reserve current, forward deadline and reverse reuse");
+    Check(planner.PriorityOrder().front() == 5,
+          "upstream work must start with a GPU-backed frame");
+    Check(!planner.NeedsRebuild(images),
+          "stable image state must reuse the existing plan");
+
+    images[6].failed = true;
+    Check(planner.NeedsRebuild(images),
+          "a failed desired frame must invalidate the plan");
+    planner.Rebuild(navigation, images, work_queue);
+    Check(std::find(planner.DesiredGpuTextures().begin(),
+                    planner.DesiredGpuTextures().end(), 6) ==
+              planner.DesiredGpuTextures().end(),
+          "failed frames must be removed from GPU reservations");
 }
 
 void PngTests() {
@@ -347,6 +385,7 @@ int main() {
     ConfigDefaultTests();
     const std::size_t physical_core_count = ProcessorTopologyTests();
     NavigationTests();
+    ReservationPlannerTests();
     PngTests();
     ResourceSlotTests();
     ReservationTests();

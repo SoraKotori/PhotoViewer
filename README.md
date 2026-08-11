@@ -3,6 +3,7 @@
 ## 章節導覽
 
 - [產品目標](#產品目標)
+- [實作責任](#實作責任)
 - [使用方式](#使用方式)
 - [圖片呈現品質](#圖片呈現品質)
 - [預設參數](#預設參數)
@@ -17,6 +18,17 @@
 - 以每秒 30 張為目標切換 8K 圖片。
 - 第一階段優先支援 PNG。
 - 初期不加入非必要的複雜功能。
+
+## 實作責任
+
+- `app.cpp`：程序啟動、Win32 訊息迴圈、目錄載入與元件協調，不持有管線內部資源。
+- `viewer_window.*`：視窗 handle、標題與全螢幕狀態的唯一管理者。
+- `pipeline_runtime.*`：I/O、decoder、slot、GPU 與完成佇列的生命週期根節點；所有狀態轉換仍由主執行緒呼叫。
+- `pipeline_io.cpp`、`pipeline_decode.cpp`、`pipeline_gpu.cpp`：分別實作儲存、CPU 解碼與 GPU／依序呈現階段。
+- `pipeline_scheduler.cpp`、`reservation_planner.*`：固定容量 reservation 的規劃、改派與跨階段協調。
+- `app_validation.cpp`：驗證驅動與報告，不參與正式資源所有權。
+
+上述切分只改變程式內的責任歸屬；執行角色、固定 slot、reservation 與依序呈現規格仍以 [runtime-design.md](docs/runtime-design.md) 與 [8k-png-pipeline.md](docs/8k-png-pipeline.md) 為準。
 
 ## 使用方式
 
