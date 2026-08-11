@@ -8,18 +8,6 @@ namespace pv {
 
 Graphics::~Graphics() {
     if (d2d_context_) d2d_context_->SetTarget(nullptr);
-    if (frame_waitable_) CloseHandle(frame_waitable_);
-    if (fence_event_) CloseHandle(fence_event_);
-}
-
-void Graphics::Initialize(const HWND window) {
-    InitializeDevice(window);
-    InitializeSurface();
-}
-
-void Graphics::InitializeDevice(const HWND window) {
-    InitializeDirect3D(window);
-    InitializeDirect2D();
 }
 
 void Graphics::InitializeDirect3D(const HWND window) {
@@ -36,11 +24,6 @@ void Graphics::InitializeDirect2D() {
         throw std::logic_error("invalid Direct2D initialization");
     }
     CreateDirect2DResources();
-}
-
-void Graphics::InitializeSurface() {
-    InitializeSwapChain();
-    InitializeBackBufferTarget();
 }
 
 void Graphics::InitializeSwapChain() {
@@ -74,7 +57,7 @@ void Graphics::CreateDirect3DResources() {
     CheckHr(base_context.As(&context_), "Query ID3D11DeviceContext4");
     CheckHr(device_->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)),
             "ID3D11Device5::CreateFence");
-    fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    fence_event_.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     if (!fence_event_) ThrowLastError("CreateEvent fence");
 
     ComPtr<IDXGIDevice> dxgi_device;
@@ -126,7 +109,7 @@ void Graphics::CreateSwapChain() {
             "CreateSwapChainForHwnd");
     CheckHr(base_swap_chain.As(&swap_chain_), "Query IDXGISwapChain2");
     CheckHr(swap_chain_->SetMaximumFrameLatency(1), "SetMaximumFrameLatency");
-    frame_waitable_ = swap_chain_->GetFrameLatencyWaitableObject();
+    frame_waitable_.Reset(swap_chain_->GetFrameLatencyWaitableObject());
     if (!frame_waitable_) ThrowLastError("GetFrameLatencyWaitableObject");
     dxgi_factory_->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER);
 }
@@ -392,7 +375,7 @@ UINT64 Graphics::CompletedFenceValue() const noexcept {
 }
 
 void Graphics::ArmFence(const UINT64 value) {
-    CheckHr(fence_->SetEventOnCompletion(value, fence_event_),
+    CheckHr(fence_->SetEventOnCompletion(value, fence_event_.Get()),
             "ID3D11Fence::SetEventOnCompletion");
 }
 

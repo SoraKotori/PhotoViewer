@@ -570,7 +570,10 @@ void TestGraphics(const HINSTANCE instance) {
 
     {
         pv::Graphics graphics;
-        graphics.Initialize(window);
+        graphics.InitializeDirect3D(window);
+        graphics.InitializeDirect2D();
+        graphics.InitializeSwapChain();
+        graphics.InitializeBackBufferTarget();
         pv::DecodeStaging staging;
         constexpr std::size_t decoded_bytes = 64 * 64 * 4;
         staging.committed_bytes = decoded_bytes + 64;
@@ -888,7 +891,10 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     Check(window != nullptr, "create graphics benchmark window");
 
     pv::Graphics graphics;
-    graphics.Initialize(window);
+    graphics.InitializeDirect3D(window);
+    graphics.InitializeDirect2D();
+    graphics.InitializeSwapChain();
+    graphics.InitializeBackBufferTarget();
     pv::DecodeStaging staging;
     constexpr UINT width = 7680;
     constexpr UINT height = 4320;

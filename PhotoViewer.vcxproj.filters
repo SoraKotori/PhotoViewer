@@ -7,6 +7,11 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\app.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_decode.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_gpu.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_io.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_scheduler.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\app_validation.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\catalog.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\config.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\decoder.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -16,6 +21,9 @@
     <ClCompile Include="src\png.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\processor_topology.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\spng_decoder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\reservation_planner.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_runtime.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\viewer_window.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app.h"><Filter>Header Files</Filter></ClInclude>
@@ -28,7 +36,13 @@
     <ClInclude Include="src\navigation.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\png.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\processor_topology.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_types.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_runtime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\reservation_planner.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\spng_decoder.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\validation.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\viewer_window.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\win32_handle.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\work_queue.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest"><Filter>Resource Files</Filter></Manifest></ItemGroup>

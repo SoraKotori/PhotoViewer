@@ -77,26 +77,11 @@ void NavigationState::CompletePresentation(const std::size_t index) {
     current_index_ = index;
 }
 
-std::pair<std::size_t, std::size_t> NavigationState::RequiredBounds() const {
-    if (image_count_ == 0) return {0, 0};
-    std::size_t low = current_index_;
-    std::size_t high = current_index_;
-    std::size_t value = current_index_;
-    auto include = [&](const int direction) {
-        value = Apply(value, direction);
-        low = std::min(low, value);
-        high = std::max(high, value);
-    };
-    for (const int direction : committed_) include(direction);
-    for (const int direction : repeated_) include(direction);
-    return {low, high};
-}
-
-std::vector<std::size_t> NavigationState::PlannedOrder(
-    const std::size_t limit) const {
-    std::vector<std::size_t> order;
+void NavigationState::BuildPlan(const std::size_t limit,
+                                std::vector<std::size_t>& order) const {
+    order.clear();
+    if (image_count_ == 0 || limit == 0) return;
     order.reserve(std::min(limit, image_count_));
-    if (image_count_ == 0 || limit == 0) return order;
     const auto append = [&](const std::size_t frame) {
         if (order.size() < limit &&
             std::find(order.begin(), order.end(), frame) == order.end()) {
@@ -114,7 +99,7 @@ std::vector<std::size_t> NavigationState::PlannedOrder(
         }
         return true;
     };
-    if (!apply_pending(committed_) || !apply_pending(repeated_)) return order;
+    if (!apply_pending(committed_) || !apply_pending(repeated_)) return;
 
     int direction = PreferredDirection();
     if (direction == 0) direction = 1;
@@ -134,7 +119,6 @@ std::vector<std::size_t> NavigationState::PlannedOrder(
         append(value);
     }
     append(current_index_);
-    return order;
 }
 
 int NavigationState::PreferredDirection() const noexcept {

@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <deque>
 #include <optional>
-#include <utility>
 #include <vector>
 
 namespace pv {
@@ -17,8 +16,7 @@ public:
     [[nodiscard]] std::optional<std::size_t> NextIndex() const;
     void CompletePresentation(std::size_t index);
 
-    [[nodiscard]] std::pair<std::size_t, std::size_t> RequiredBounds() const;
-    [[nodiscard]] std::vector<std::size_t> PlannedOrder(std::size_t limit) const;
+    void BuildPlan(std::size_t limit, std::vector<std::size_t>& order) const;
     [[nodiscard]] int PreferredDirection() const noexcept;
     [[nodiscard]] int HeldDirection() const noexcept { return held_direction_; }
     [[nodiscard]] std::size_t CurrentIndex() const noexcept { return current_index_; }

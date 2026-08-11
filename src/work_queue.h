@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model.h"
+#include "win32_handle.h"
 
 namespace pv {
 
@@ -87,11 +88,11 @@ public:
     explicit CompletionQueue(const std::size_t capacity) : capacity_(capacity) {
         queue_.reserve(capacity);
         released_inputs_.reserve(capacity);
-        event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        event_.Reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         if (!event_) ThrowLastError("CreateEventW(worker completion)");
     }
 
-    ~CompletionQueue() { CloseHandle(event_); }
+    ~CompletionQueue() = default;
 
     CompletionQueue(const CompletionQueue&) = delete;
     CompletionQueue& operator=(const CompletionQueue&) = delete;
@@ -112,7 +113,7 @@ public:
         std::lock_guard lock(mutex_);
         if (queue_.size() == capacity_) std::terminate();
         queue_.push_back(std::move(result));
-        if (!SetEvent(event_)) std::terminate();
+        if (!SetEvent(event_.Get())) std::terminate();
     }
 
     void DrainAll(Batch& batch) noexcept {
@@ -123,7 +124,7 @@ public:
             std::terminate();
         }
         std::lock_guard lock(mutex_);
-        if (!ResetEvent(event_)) std::terminate();
+        if (!ResetEvent(event_.Get())) std::terminate();
         batch.results.swap(queue_);
         batch.released_inputs.swap(released_inputs_);
     }
@@ -134,17 +135,17 @@ public:
             std::terminate();
         }
         released_inputs_.push_back(std::move(input));
-        if (!SetEvent(event_)) std::terminate();
+        if (!SetEvent(event_.Get())) std::terminate();
     }
 
-    [[nodiscard]] HANDLE CompletionEvent() const noexcept { return event_; }
+    [[nodiscard]] HANDLE CompletionEvent() const noexcept { return event_.Get(); }
 
 private:
     const std::size_t capacity_;
     std::mutex mutex_;
     std::vector<DecodeResult> queue_;
     std::vector<ReleasedInput> released_inputs_;
-    HANDLE event_ = nullptr;
+    UniqueHandle event_;
 };
 
 }  // namespace pv

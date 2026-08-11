@@ -42,10 +42,13 @@ if ($SamplePng) {
     } else {
         '--validation-exit-after-present'
     }
+    $report = Join-Path ([IO.Path]::GetTempPath()) `
+        ("PhotoViewer-verify-{0}.txt" -f [Guid]::NewGuid().ToString('N'))
     $process = Start-Process `
         -FilePath (Join-Path $output 'PhotoViewer.exe') `
         -ArgumentList @(
             $validationMode,
+            "--validation-report=$report",
             '--workers=4',
             ('"' + $sample + '"')
         ) `
@@ -56,6 +59,18 @@ if ($SamplePng) {
     $after = (Get-FileHash -LiteralPath $sample -Algorithm SHA256).Hash
     if ($process.ExitCode -ne 0) { throw "PhotoViewer integration test failed: $($process.ExitCode)" }
     if ($before -ne $after) { throw 'Source PNG changed during integration test' }
+    $reportValues = @{}
+    foreach ($line in [IO.File]::ReadAllLines($report)) {
+        $separator = $line.IndexOf('=')
+        if ($separator -gt 0) {
+            $reportValues[$line.Substring(0, $separator)] =
+                $line.Substring($separator + 1)
+        }
+    }
+    [IO.File]::Delete($report)
+    if ($reportValues['title_matches_current'] -ne '1') {
+        throw 'Window title did not match the presented image filename'
+    }
     [pscustomobject]@{
         FullscreenExitCode = $fullscreenProcess.ExitCode
         IntegrationExitCode = $process.ExitCode
