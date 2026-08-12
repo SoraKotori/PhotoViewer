@@ -1,12 +1,12 @@
 #pragma once
 
-#include "model.h"
+#include "pipeline_types.h"
+
+#include <algorithm>
+#include <span>
+#include <vector>
 
 namespace pv {
-
-using ReservationId = std::uint32_t;
-constexpr ReservationId kInvalidReservation =
-    std::numeric_limits<ReservationId>::max();
 
 struct ReservationEntry {
     std::size_t frame = kInvalidFrame;
@@ -27,8 +27,8 @@ public:
         return entries_.at(id);
     }
 
-    [[nodiscard]] ReservationEntry& At(const ReservationId id) {
-        return entries_.at(id);
+    [[nodiscard]] bool IsRetiring(const ReservationId id) const noexcept {
+        return id < entries_.size() && entries_[id].retiring;
     }
 
     [[nodiscard]] ReservationId FindFrame(const std::size_t frame) const noexcept {
@@ -65,10 +65,7 @@ public:
         for (ReservationId id = 0; id < entries_.size(); ++id) {
             ReservationEntry& entry = entries_[id];
             if (entry.frame == kInvalidFrame) continue;
-            if (wanted(entry.frame)) {
-                entry.retiring = false;
-                continue;
-            }
+            if (wanted(entry.frame) && !entry.retiring) continue;
             if (!can_release(id, entry.frame)) {
                 entry.retiring = true;
                 continue;
@@ -83,7 +80,7 @@ public:
             const ReservationId id = select_free(frame, entries_);
             if (id == kInvalidReservation || id >= entries_.size() ||
                 entries_[id].frame != kInvalidFrame) {
-                break;
+                continue;
             }
             entries_[id] = ReservationEntry{frame, false};
             on_assign(id, frame);

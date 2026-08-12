@@ -10,7 +10,7 @@ namespace pv {
 class NavigationState {
 public:
     void Reset(std::size_t initial_index, std::size_t image_count);
-    void Step(int direction, bool repeat, std::size_t count = 1);
+    void Step(int direction, bool repeat);
     void Release(int direction);
 
     [[nodiscard]] std::optional<std::size_t> NextIndex() const;
