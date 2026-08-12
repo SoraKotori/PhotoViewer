@@ -160,26 +160,16 @@ void Graphics::Resize(const UINT width, const UINT height) {
     CreateBackBufferTarget();
 }
 
-void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
-                                    const UINT height) {
+void Graphics::PrepareDecodeStaging(DecodeStaging& staging) {
     if (!device_) {
         throw std::logic_error("Direct3D device is not initialized");
     }
-    if (staging.mapped) {
+    if (staging.mapped || staging.planned_texture_width == 0 ||
+        staging.planned_texture_height == 0) {
         throw std::invalid_argument("invalid decode staging preparation");
     }
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-    const std::size_t extra_rows =
-        (static_cast<std::size_t>(height) + row_bytes - 1) / row_bytes;
-    UINT texture_width = width;
-    UINT texture_height = height;
-    if (extra_rows <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION - height) {
-        texture_height += static_cast<UINT>(extra_rows);
-    } else if (width < D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
-        ++texture_width;
-    } else {
-        throw std::invalid_argument("PNG dimensions leave no filter workspace");
-    }
+    const UINT texture_width = staging.planned_texture_width;
+    const UINT texture_height = staging.planned_texture_height;
     if (!staging.texture || staging.texture_width < texture_width ||
         staging.texture_height < texture_height) {
         staging.texture.Reset();
@@ -207,7 +197,7 @@ void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
         throw std::invalid_argument("invalid decode staging map");
     }
     staging.ReleaseCpuAllocation();
-    PrepareDecodeStaging(staging, width, height);
+    PrepareDecodeStaging(staging);
     const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
     D3D11_MAPPED_SUBRESOURCE mapped{};
     CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped),
@@ -242,7 +232,7 @@ void Graphics::CopyDecodedToStaging(DecodeStaging& staging) {
     if (!staging.cpu_surface || !source.pixels || source.ByteSize() == 0) {
         throw std::invalid_argument("invalid decoded CPU source");
     }
-    PrepareDecodeStaging(staging, source.width, source.height);
+    PrepareDecodeStaging(staging);
     const std::size_t row_bytes = static_cast<std::size_t>(source.width) * 4;
     D3D11_MAPPED_SUBRESOURCE mapped{};
     CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_WRITE, 0, &mapped),

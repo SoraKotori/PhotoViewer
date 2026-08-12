@@ -119,6 +119,8 @@ struct DecodeStaging {
         texture.Reset();
         texture_width = 0;
         texture_height = 0;
+        planned_texture_width = 0;
+        planned_texture_height = 0;
         committed_bytes = 0;
         mapped = false;
         surface = {};
@@ -126,6 +128,8 @@ struct DecodeStaging {
 
     void ResetView() noexcept {
         ReleaseCpuAllocation();
+        planned_texture_width = 0;
+        planned_texture_height = 0;
         surface = {};
         mapped = false;
     }
@@ -135,6 +139,8 @@ struct DecodeStaging {
     ComPtr<ID3D11Texture2D> texture;
     UINT texture_width = 0;
     UINT texture_height = 0;
+    UINT planned_texture_width = 0;
+    UINT planned_texture_height = 0;
     std::size_t committed_bytes = 0;
     bool cpu_surface = false;
     bool mapped = false;

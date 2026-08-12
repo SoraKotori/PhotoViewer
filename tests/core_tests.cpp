@@ -178,8 +178,15 @@ void PngTests() {
     Check(!pv::ParsePngHeader(header), "zero PNG height must fail");
     set_dimension(16, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
     set_dimension(20, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-    Check(pv::ParsePngHeader(header),
-          "D3D11 maximum PNG dimensions must pass");
+    Check(!pv::ParsePngHeader(header),
+          "PNG dimensions without decode workspace must fail");
+    set_dimension(20, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION - 1U);
+    Check(pv::ParsePngHeader(header).has_value(),
+          "D3D11 maximum width with decode workspace must pass");
+    set_dimension(16, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION - 1U);
+    set_dimension(20, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+    Check(pv::ParsePngHeader(header).has_value(),
+          "D3D11 maximum height with decode workspace must pass");
     set_dimension(16, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1U);
     Check(!pv::ParsePngHeader(header), "PNG width above D3D11 limit must fail");
     set_dimension(16, 1);

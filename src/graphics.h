@@ -19,7 +19,7 @@ public:
     void InitializeBackBufferTarget();
     void Resize(UINT width, UINT height);
 
-    void PrepareDecodeStaging(DecodeStaging& staging, UINT width, UINT height);
+    void PrepareDecodeStaging(DecodeStaging& staging);
     void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
                           std::size_t decoded_bytes);
     void UnmapDecodeStaging(DecodeStaging& staging) noexcept;

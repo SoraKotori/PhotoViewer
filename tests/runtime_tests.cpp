@@ -574,6 +574,8 @@ void TestGraphics(const HINSTANCE instance) {
         pv::DecodeStaging staging;
         constexpr std::size_t decoded_bytes = 64 * 64 * 4;
         staging.committed_bytes = decoded_bytes + 64;
+        staging.planned_texture_width = 64;
+        staging.planned_texture_height = 65;
         Check(staging.AllocateCpu(decoded_bytes + 64),
               "allocate CPU decode surface");
         Check(staging.PrepareCpuSurface(64, 64, decoded_bytes),
@@ -894,6 +896,8 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     constexpr UINT height = 4320;
     constexpr std::size_t decoded_bytes =
         static_cast<std::size_t>(width) * height * 4;
+    staging.planned_texture_width = width;
+    staging.planned_texture_height = height + 1;
     graphics.MapDecodeStaging(staging, width, height, decoded_bytes);
     for (UINT row = 0; row < height; ++row) {
         std::memset(staging.surface.pixels +

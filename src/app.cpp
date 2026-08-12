@@ -51,16 +51,26 @@ DWORD QueryIoPrefixGranularity(const HANDLE file) noexcept {
     return granularity;
 }
 
-std::optional<std::size_t> DecodeStagingBytes(const PngInfo& png) noexcept {
+struct DecodeStagingPlan {
+    std::size_t committed_bytes = 0;
+    UINT texture_width = 0;
+    UINT texture_height = 0;
+};
+
+DecodeStagingPlan PlanDecodeStaging(const PngInfo& png) noexcept {
     const std::size_t row_bytes = static_cast<std::size_t>(png.width) * 4;
-    if (png.decoded_bytes > std::numeric_limits<std::size_t>::max() - png.height) {
-        return std::nullopt;
-    }
     const std::size_t filtered_bytes = png.decoded_bytes + png.height;
-    if (filtered_bytes > std::numeric_limits<std::size_t>::max() - row_bytes) {
-        return std::nullopt;
+    const std::size_t extra_rows =
+        (static_cast<std::size_t>(png.height) + row_bytes - 1) / row_bytes;
+    UINT texture_width = png.width;
+    UINT texture_height = png.height;
+    if (extra_rows <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION - png.height) {
+        texture_height += static_cast<UINT>(extra_rows);
+    } else {
+        ++texture_width;
     }
-    return filtered_bytes + row_bytes;
+    return DecodeStagingPlan{filtered_bytes + row_bytes,
+                             texture_width, texture_height};
 }
 
 std::uint64_t FileTimeTicks(const FILETIME time) noexcept {
@@ -521,32 +531,65 @@ void App::OnIoHeaderReady(IoRequest* request,
         validation_initial_header_ready_ == std::chrono::steady_clock::time_point{}) {
         validation_initial_header_ready_ = std::chrono::steady_clock::now();
     }
-    if (request->header_result == ERROR_SUCCESS && transferred >= 24) {
-        const auto header = ParsePngHeader(std::span<const std::byte>(
-            request->destination, 24));
-        if (header) {
-            CatalogItem& item = resources_.catalog.items[request->index];
-            item.png = *header;
-            item.header_valid = true;
-            PrepareStagingForImage(request->index);
-            if (!graphics_device_ready_ &&
-                resources_.navigation.InitialPending() &&
-                request->index == resources_.navigation.CurrentIndex() &&
-                image.staging_slot != kInvalidSlot) {
-                DecodeStaging& staging = resources_.slots.StagingAt(
-                    image.staging_slot).resource;
-                (void)staging.PrepareCpuSurface(
-                    item.png.width, item.png.height, item.png.decoded_bytes);
+    const auto cancel_pending_content = [&](const char* const operation) {
+        image.failed = true;
+        if (request->content_submitted && !request->content_completed &&
+            !CancelIoEx(request->file, &request->content_overlapped)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_FOUND) {
+                SetLastError(error);
+                ThrowLastError(operation);
             }
         }
-    }
-    if (!request->content_submitted || request->content_completed) {
+    };
+    const auto complete_if_ready = [&] {
+        if (request->content_submitted && !request->content_completed) return;
         if (!request->content_submitted) {
             request->result = ERROR_SUCCESS;
             request->transferred = 0;
         }
         CompleteIoRequest(request);
+    };
+
+    if (request->header_result != ERROR_SUCCESS || transferred < 24) {
+        cancel_pending_content("CancelIoEx(failed PNG header read)");
+        complete_if_ready();
+        return;
     }
+    const auto header = ParsePngHeader(std::span<const std::byte>(
+        request->destination, 24));
+    if (!header) {
+        cancel_pending_content("CancelIoEx(rejected PNG header)");
+        complete_if_ready();
+        return;
+    }
+
+    CatalogItem& item = resources_.catalog.items[request->index];
+    item.png = *header;
+    item.header_valid = true;
+    PrepareStagingForImage(request->index);
+    if (image.failed) {
+        cancel_pending_content("CancelIoEx(rejected PNG staging plan)");
+        complete_if_ready();
+        return;
+    }
+
+    if (!graphics_device_ready_ &&
+        resources_.navigation.InitialPending() &&
+        request->index == resources_.navigation.CurrentIndex() &&
+        image.staging_slot != kInvalidSlot) {
+        DecodeStaging& staging = resources_.slots.StagingAt(
+            image.staging_slot).resource;
+        if (!staging.PrepareCpuSurface(
+                item.png.width, item.png.height, item.png.decoded_bytes)) {
+            resources_.slots.ReleaseStaging(image.staging_slot);
+            image.staging_slot = kInvalidSlot;
+            cancel_pending_content("CancelIoEx(failed initial CPU surface)");
+            complete_if_ready();
+            return;
+        }
+    }
+    complete_if_ready();
 }
 
 void App::OnIoComplete(IoRequest* request, const DWORD result,
@@ -608,22 +651,24 @@ void App::CompleteIoRequest(IoRequest* const request) {
     const bool reserved = current && ReservationActive(
         resources_.compressed_reservations, image.compressed_reservation,
         request->index);
-    if (success && reserved) {
-        CatalogItem& item = resources_.catalog.items[request->index];
+    bool accepted = success && reserved && !image.failed;
+    CatalogItem& item = resources_.catalog.items[request->index];
+    if (accepted && !request->split_header) {
         const auto header = ParsePngHeader(std::span<const std::byte>(
             slot.resource.data, slot.resource.size));
         if (header) {
             item.png = *header;
             item.header_valid = true;
-            slot.state = CompressedSlotState::CompressedDataAvailable;
         } else {
-            if (resources_.compressed_bytes >= allocation) {
-                resources_.compressed_bytes -= allocation;
-            }
-            resources_.slots.ReleaseCompressed(compressed_slot);
-            image.compressed_slot = kInvalidSlot;
             image.failed = true;
+            accepted = false;
         }
+    } else if (accepted && !item.header_valid) {
+        image.failed = true;
+        accepted = false;
+    }
+    if (accepted) {
+        slot.state = CompressedSlotState::CompressedDataAvailable;
     } else {
         if (resources_.compressed_bytes >= allocation) resources_.compressed_bytes -= allocation;
         resources_.slots.ReleaseCompressed(compressed_slot);
@@ -1666,18 +1711,19 @@ void App::PrepareStagingForImage(const std::size_t index) {
     }
     const CatalogItem& item = resources_.catalog.items[index];
     if (!item.header_valid) return;
-    const std::optional<std::size_t> staging_bytes =
-        DecodeStagingBytes(item.png);
-    if (!staging_bytes || *staging_bytes == 0 ||
-        *staging_bytes > config_.staging_cache_bytes) {
+    const DecodeStagingPlan plan = PlanDecodeStaging(item.png);
+    if (plan.committed_bytes > config_.staging_cache_bytes) {
+        image.failed = true;
         return;
     }
     const SlotId staging_slot = resources_.slots.AcquireStaging(
-        *staging_bytes, index, image.generation);
+        plan.committed_bytes, index, image.generation);
     if (staging_slot == kInvalidSlot) return;
     DecodeStaging& staging = resources_.slots.StagingAt(staging_slot).resource;
+    staging.planned_texture_width = plan.texture_width;
+    staging.planned_texture_height = plan.texture_height;
     if (graphics_device_ready_) {
-        graphics_.PrepareDecodeStaging(staging, item.png.width, item.png.height);
+        graphics_.PrepareDecodeStaging(staging);
     }
     image.staging_slot = staging_slot;
 }
@@ -1909,15 +1955,11 @@ void App::DispatchDecodes() {
             continue;
         }
         const CatalogItem& item = resources_.catalog.items[index];
-        const std::optional<std::size_t> staging_bytes =
-            DecodeStagingBytes(item.png);
-        if (!staging_bytes || *staging_bytes == 0 ||
-            *staging_bytes > config_.staging_cache_bytes) {
+        PrepareStagingForImage(index);
+        if (image.failed) {
             ReleaseCompressed(image);
-            image.failed = true;
             continue;
         }
-        PrepareStagingForImage(index);
         const SlotId staging_slot = image.staging_slot;
         if (staging_slot == kInvalidSlot) continue;
         StagingSlot& staging_state = resources_.slots.StagingAt(staging_slot);
