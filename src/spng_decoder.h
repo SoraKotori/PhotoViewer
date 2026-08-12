@@ -1,8 +1,11 @@
 #pragma once
 
-#include "model.h"
+#include "decode_surface.h"
+
+#include <windows.h>
 
 #include <array>
+#include <span>
 
 namespace pv {
 

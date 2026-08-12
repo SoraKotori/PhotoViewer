@@ -1,6 +1,6 @@
 #include "catalog.h"
 
-#include "common.h"
+#include "win32_support.h"
 #include "win32_handle.h"
 
 #include <array>

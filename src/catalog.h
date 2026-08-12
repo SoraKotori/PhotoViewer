@@ -1,9 +1,10 @@
 #pragma once
 
-#include "common.h"
+#include "win32_support.h"
 #include "png.h"
 
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 namespace pv {

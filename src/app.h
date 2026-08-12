@@ -3,7 +3,7 @@
 #include "catalog.h"
 #include "config.h"
 #include "pipeline_runtime.h"
-#include "validation.h"
+#include "validation_harness.h"
 #include "viewer_window.h"
 
 namespace pv {
@@ -16,7 +16,6 @@ public:
     int Run(HINSTANCE instance, int show_command);
 
 private:
-    friend class PipelineRuntime;
     struct ComApartment {
         ComApartment();
         ~ComApartment();
@@ -31,23 +30,14 @@ private:
     LRESULT HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
     void OpenInitialImage();
-    void OnDirection(int direction, bool repeat, std::size_t repeat_count);
+    void OnDirection(int direction, bool repeat);
     void OnDirectionReleased(int direction);
     void OnCatalogComplete();
     void OnFrameReady(std::size_t index) override;
     void OnFramePresented(std::size_t index) override;
     void ToggleFullscreen();
-    void InjectValidationNavigation();
-    void InjectValidationNavigationStep();
-    void StopValidationNavigationTimer();
-    void RecordValidationReady(std::size_t index);
-    void RecordValidationPresentation(std::size_t index);
-    void WriteValidationReport(std::string_view phase, bool truncate);
-    void BeginFullscreenValidation();
-    void OnFullscreenValidationTimer();
-
     Config config_;
-    ValidationState validation_;
+    ValidationHarness validation_;
     ViewerWindow window_;
     bool running_ = true;
     bool catalog_loading_ = false;

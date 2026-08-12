@@ -1,18 +1,26 @@
-#include "common.h"
-#include "decoder.h"
+#include "win32_support.h"
+#include "decode_stage.h"
 #include "graphics.h"
+#include "pipeline_runtime.h"
 #include "spng_decoder.h"
 #define SPNG_STATIC
 #include "../third_party/libspng/spng.h"
 #include "../third_party/zlib-ng/zlib.h"
 
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <latch>
+#include <limits>
+#include <memory>
 #include <numeric>
+#include <span>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -452,20 +460,21 @@ void TestRejectedWorkReleasesInput() {
     Check(compressed_slot != pv::kInvalidSlot &&
               staging_slot != pv::kInvalidSlot,
           "allocate cancellation test slots");
+    slots.CompleteFileRead(compressed_slot);
+    slots.BeginDecodeInput(compressed_slot);
+    slots.BeginDecodeOutput(staging_slot);
 
-    pv::WorkQueue work_queue;
-    pv::CompletionQueue completion_queue(1);
+    pv::DecodeStage decode_stage(1, pv::DecodeSlotAccess(slots));
     {
-        pv::DecoderPool pool(1, work_queue, completion_queue, slots);
+        decode_stage.Start(1);
         pv::DecodeWork work{0, 1, compressed_slot, staging_slot};
-        Check(work_queue.TryPush(work), "queue rejected decode test work");
+        Check(decode_stage.Submit(work), "decode stage rejected test work");
 
         const DWORD wait = WaitForSingleObject(
-            completion_queue.CompletionEvent(), 5000);
+            decode_stage.CompletionEvent(), 5000);
         Check(wait == WAIT_OBJECT_0,
               "worker completion notification timed out");
-        pv::CompletionQueue::Batch batch(1);
-        completion_queue.DrainAll(batch);
+        const pv::CompletionQueue::Batch& batch = decode_stage.Drain();
         Check(batch.results.size() == 1 && !batch.results.front().success &&
                   batch.results.front().error == E_INVALIDARG,
               "worker must report invalid decode resources");
@@ -473,6 +482,7 @@ void TestRejectedWorkReleasesInput() {
         Check(batch.released_inputs.size() == 1 &&
                   batch.released_inputs.front().compressed_slot == compressed_slot,
               "rejected work must release its compressed input exactly once");
+        decode_stage.Stop();
     }
 
     slots.ReleaseCompressed(compressed_slot);
@@ -480,6 +490,75 @@ void TestRejectedWorkReleasesInput() {
     Check(slots.FreeCompressedCount() == 1 &&
               slots.FreeStagingCount() == 1,
           "rejected work slots must return to their free indexes");
+}
+
+class RecordingPipelineObserver final : public pv::PipelineObserver {
+public:
+    void OnFrameReady(const std::size_t index) override {
+        ready.push_back(index);
+    }
+    void OnFramePresented(const std::size_t index) override {
+        presented.push_back(index);
+    }
+
+    std::vector<std::size_t> ready;
+    std::vector<std::size_t> presented;
+};
+
+void TestPresentationControllerLifecycle() {
+    pv::PresentationController presentation;
+    Check(presentation.NeedsFrameCreditEvent() && !presentation.CanDraw(),
+          "presentation must begin without frame credit");
+    presentation.GrantFrameCredit();
+    Check(presentation.CanDraw(), "frame credit must authorize one draw");
+    presentation.StartDraw(3, 7);
+    Check(!presentation.CanDraw() && presentation.DrawFence() == 7,
+          "draw handoff must retain its slot until the fence completes");
+    Check(!presentation.CompleteDraw(6),
+          "an earlier fence value must not release a draw slot");
+    const auto completed = presentation.CompleteDraw(7);
+    Check(completed && *completed == 3 && presentation.DrawFence() == 0,
+          "the matching fence must release the draw slot exactly once");
+    Check(!presentation.CompleteDraw(8),
+          "a completed draw slot must not be released twice");
+
+    bool rejected_invalid_draw = false;
+    presentation.RequestRedraw(true);
+    try {
+        presentation.StartDraw(pv::kInvalidSlot, 9);
+    } catch (const std::logic_error&) {
+        rejected_invalid_draw = true;
+    }
+    Check(rejected_invalid_draw,
+          "presentation must reject a draw without a valid texture slot");
+}
+
+void TestPipelineInitialFailureState() {
+    pv::Config config;
+    config.compressed_slot_count = 1;
+    config.staging_slot_count = 1;
+    config.gpu_forward_slot_count = 1;
+    config.gpu_reverse_slot_count = 0;
+    pv::ViewerWindow window;
+    RecordingPipelineObserver observer;
+    pv::PipelineRuntime pipeline(observer, config, window);
+
+    pv::Catalog catalog;
+    pv::CatalogItem item;
+    item.path = L"known-empty.png";
+    item.file_size_known = true;
+    item.file_bytes = 0;
+    catalog.items.push_back(std::move(item));
+    pipeline.LoadInitialCatalog(std::move(catalog), true);
+
+    Check(pipeline.InitialContentFailed(),
+          "known-invalid initial content must surface a startup failure");
+    Check(!pipeline.InitialContentPending(),
+          "failed initial content must not leave startup waiting forever");
+    Check(pipeline.PendingFrameStage() == pv::PipelineStage::Failed,
+          "pipeline diagnostics must identify the failed initial stage");
+    Check(observer.ready.empty() && observer.presented.empty(),
+          "failed initial content must never publish frame callbacks");
 }
 
 void TestManagedStagingUpload() {
@@ -951,13 +1030,21 @@ int wmain(const int argc, wchar_t** const argv) {
             Check(images > 0 && images <= 256, "invalid full pixel verification count");
             return VerifyFullPixels(argv[2], images);
         }
-        TestSpng();
-        TestMixedFiltersAndBounds();
-        TestMalformedDeflateAndOutputBounds();
-        TestFusedDeflateUnfilterObservability();
-        TestRejectedWorkReleasesInput();
-        TestManagedStagingUpload();
-        TestGraphics(GetModuleHandleW(nullptr));
+        const auto run = [](const char* const name, auto&& test) {
+            std::cerr << "RUN: " << name << '\n';
+            test();
+        };
+        run("spng", TestSpng);
+        run("mixed filters and bounds", TestMixedFiltersAndBounds);
+        run("malformed deflate and output bounds",
+            TestMalformedDeflateAndOutputBounds);
+        run("fused deflate unfilter observability",
+            TestFusedDeflateUnfilterObservability);
+        run("rejected work releases input", TestRejectedWorkReleasesInput);
+        run("presentation lifecycle", TestPresentationControllerLifecycle);
+        run("pipeline initial failure", TestPipelineInitialFailureState);
+        run("managed staging upload", TestManagedStagingUpload);
+        run("graphics", [] { TestGraphics(GetModuleHandleW(nullptr)); });
         std::cout << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, malformed input and guarded output bounds, rejected-work input release, libspng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {

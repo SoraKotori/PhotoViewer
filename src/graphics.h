@@ -1,7 +1,10 @@
 #pragma once
 
-#include "model.h"
+#include "image_resources.h"
+#include "pipeline_types.h"
 #include "win32_handle.h"
+
+#include <dxgi1_6.h>
 
 namespace pv {
 

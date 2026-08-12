@@ -1,6 +1,6 @@
 #include "decoder.h"
 
-#include "common.h"
+#include "win32_support.h"
 #include "spng_decoder.h"
 
 namespace pv {
@@ -16,7 +16,8 @@ std::size_t ValidateWorkerCount(const std::size_t worker_count) {
 }  // namespace
 
 DecoderPool::DecoderPool(const std::size_t worker_count, WorkQueue& work_queue,
-                         CompletionQueue& completion_queue, ResourceSlots& slots)
+                         CompletionQueue& completion_queue,
+                         DecodeSlotAccess& slots)
     : work_queue_(work_queue), completion_queue_(completion_queue), slots_(slots),
       worker_metrics_(ValidateWorkerCount(worker_count)) {
     workers_.reserve(worker_count);
@@ -102,9 +103,10 @@ DecodeResult DecoderPool::Decode(DecodeWork work) {
         result.error = E_INVALIDARG;
         return result;
     }
-    CompressedBuffer& compressed = slots_.Compressed(work.compressed_slot).resource;
-    DecodeSurface& surface = slots_.StagingAt(work.staging_slot).resource.surface;
-    if (!compressed.data || compressed.size == 0 || !surface.pixels) {
+    const std::span<std::byte> compressed =
+        slots_.CompressedInput(work.compressed_slot);
+    DecodeSurface& surface = slots_.DecodeOutput(work.staging_slot);
+    if (compressed.empty() || !surface.pixels) {
         result.error = E_INVALIDARG;
         return result;
     }
@@ -117,7 +119,7 @@ DecodeResult DecoderPool::Decode(DecodeWork work) {
         context->pool->ReleaseInput(*context->work);
     };
     const HRESULT hr = DecodePngSpng(
-        std::span<std::byte>(compressed.data, compressed.size),
+        compressed,
         surface, input_consumed, &callback_context);
     result.error = hr;
     result.success = SUCCEEDED(hr);

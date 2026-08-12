@@ -2,9 +2,15 @@
 #include "navigation.h"
 #include "png.h"
 #include "processor_topology.h"
+#include "pipeline_resource_size.h"
+#include "pipeline_model.h"
+#include "pipeline_resources.h"
+#include "presentation_order.h"
 #include "reservation_planner.h"
 #include "resource_slots.h"
 #include "reservation.h"
+#include "runtime_telemetry.h"
+#include "upload_ledger.h"
 #include "work_queue.h"
 
 #include <array>
@@ -12,6 +18,52 @@
 #include <iostream>
 
 namespace {
+
+template <typename Access>
+concept CanBeginDecodeWork = requires(Access access) { access.BeginWork(0); };
+template <typename Access>
+concept CanAttachCompressed = requires(Access access) {
+    access.AttachCompressedSlot(0, 0);
+};
+template <typename Access>
+concept CanClearStaging = requires(Access access) {
+    access.ClearStagingSlot(0, 0);
+};
+template <typename Access>
+concept CanReadIoRequest = requires(Access access) {
+    access.FileReadRequest(0);
+};
+template <typename Access>
+concept CanMutateGpu = requires(Access access) { access.BeginGpuUpload(0); };
+template <typename Access>
+concept CanRecordHeader = requires(Access access, const pv::PngInfo& png) {
+    access.RecordHeader(0, png);
+};
+template <typename Access>
+concept CanCompletePresentation = requires(Access access) {
+    access.Complete(0);
+};
+template <typename Model>
+concept CanNavigate = requires(Model& model) { model.Navigate(1, false); };
+
+static_assert(CanAttachCompressed<pv::StorageFrameAccess>);
+static_assert(!CanBeginDecodeWork<pv::StorageFrameAccess>);
+static_assert(!CanClearStaging<pv::StorageFrameAccess>);
+static_assert(CanBeginDecodeWork<pv::DecodeFrameAccess>);
+static_assert(!CanAttachCompressed<pv::DecodeFrameAccess>);
+static_assert(CanClearStaging<pv::GraphicsFrameAccess>);
+static_assert(!CanBeginDecodeWork<pv::GraphicsFrameAccess>);
+static_assert(CanReadIoRequest<pv::StorageResourceAccess>);
+static_assert(!CanMutateGpu<pv::StorageResourceAccess>);
+static_assert(!CanReadIoRequest<pv::DecodeResourceAccess>);
+static_assert(!CanMutateGpu<pv::DecodeResourceAccess>);
+static_assert(CanMutateGpu<pv::GraphicsResourceAccess>);
+static_assert(!CanReadIoRequest<pv::GraphicsResourceAccess>);
+static_assert(CanRecordHeader<pv::StorageCatalogAccess>);
+static_assert(!CanCompletePresentation<pv::StorageCatalogAccess>);
+static_assert(CanCompletePresentation<pv::PresentationCompletionAccess>);
+static_assert(!CanRecordHeader<pv::PresentationCompletionAccess>);
+static_assert(!CanNavigate<const pv::PipelineModel>);
 
 void Check(const bool condition, const char* message) {
     if (!condition) {
@@ -85,21 +137,21 @@ void NavigationTests() {
     navigation.Reset(5, 20);
     PresentNext(navigation);
     navigation.Step(1, false);
-    navigation.Step(1, true, 4);
-    for (const std::size_t index : std::array<std::size_t, 5>{6, 7, 8, 9, 10}) {
+    navigation.Step(1, true);
+    for (const std::size_t index : std::array<std::size_t, 2>{6, 7}) {
         Check(PresentNext(navigation) == index,
-              "merged key repeat count must preserve every adjacent image");
+              "each repeat event must add exactly one adjacent image");
     }
-    Check(navigation.Empty(), "merged key repeat count must drain exactly");
+    Check(navigation.Empty(), "single repeat event must drain exactly");
 
     navigation.Reset(5, 20);
     PresentNext(navigation);
     navigation.Step(1, false);
-    navigation.Step(1, true, 4);
+    navigation.Step(1, true);
     navigation.Release(1);
     Check(PresentNext(navigation) == 6,
           "release must discard every unpresented merged repeat");
-    Check(navigation.Empty(), "merged repeats must not survive release");
+    Check(navigation.Empty(), "repeat event must not survive release");
 
     navigation.Reset(0, 2);
     PresentNext(navigation);
@@ -152,15 +204,14 @@ void ReservationPlannerTests() {
     config.gpu_forward_slot_count = 2;
     config.gpu_reverse_slot_count = 1;
 
-    pv::ReservationPlanner planner(config);
+    pv::ReservationPlanner planner{pv::PipelineLimits(config)};
     planner.Reset(4, 3, 3);
     pv::NavigationState navigation;
     navigation.Reset(5, 12);
     PresentNext(navigation);
     navigation.Step(1, false);
     std::vector<pv::ImageRecord> images(12);
-    pv::WorkQueue work_queue;
-    planner.Rebuild(navigation, images, work_queue);
+    planner.Rebuild(navigation, images);
 
     const auto& desired = planner.DesiredGpuTextures();
     Check(desired.size() == 3 && desired[0] == 5 &&
@@ -171,10 +222,10 @@ void ReservationPlannerTests() {
     Check(!planner.NeedsRebuild(images),
           "stable image state must reuse the existing plan");
 
-    images[6].failed = true;
+    images[6] = pv::ImageRecord::FailedRecord();
     Check(planner.NeedsRebuild(images),
           "a failed desired frame must invalidate the plan");
-    planner.Rebuild(navigation, images, work_queue);
+    planner.Rebuild(navigation, images);
     Check(std::find(planner.DesiredGpuTextures().begin(),
                     planner.DesiredGpuTextures().end(), 6) ==
               planner.DesiredGpuTextures().end(),
@@ -205,8 +256,9 @@ void ResourceSlotTests() {
           "compressed slot storage and free index must start at configured count");
     Check(slots.StagingCount() == 2 && slots.FreeStagingCount() == 2,
           "staging slot storage and free index must start at configured count");
-    Check(slots.GpuTextureCount() == 2 && slots.FreeGpuTextureCount() == 2,
-          "GPU slot storage and free index must start at configured count");
+    Check(slots.GpuTextureCount() == 2 &&
+              slots.InactiveGpuTextureCount() == 2,
+          "GPU slot storage and inactive index must start at configured count");
 
     const pv::SlotId compressed0 = slots.AcquireCompressed(4096, 3, 7);
     const pv::SlotId compressed1 = slots.AcquireCompressed(4096, 4, 7);
@@ -216,19 +268,20 @@ void ResourceSlotTests() {
           "compressed free index must exclude occupied slots");
     Check(slots.AcquireCompressed(1, 5, 7) == pv::kInvalidSlot,
           "compressed slot count must be a hard limit");
-    Check(slots.Compressed(compressed0).state ==
+    Check(slots.Compressed(compressed0).State() ==
               pv::CompressedSlotState::FileReadDestination,
           "compressed acquisition state must describe its pipeline phase");
-    pv::IoRequest* const io_address = &slots.Compressed(compressed0).io;
-    slots.Compressed(compressed0).state =
-        pv::CompressedSlotState::CompressedDataAvailable;
+    const pv::IoRequest* const io_address =
+        &slots.Compressed(compressed0).Request();
+    slots.CompleteFileRead(compressed0);
     slots.ReleaseCompressed(compressed0);
     Check(slots.FreeCompressedCount() == 1 &&
-              slots.Compressed(compressed0).state == pv::CompressedSlotState::Free,
+              slots.Compressed(compressed0).State() ==
+                  pv::CompressedSlotState::Free,
           "compressed release must restore state and free index together");
     const pv::SlotId recycled_compressed = slots.AcquireCompressed(4096, 5, 8);
     Check(recycled_compressed == compressed0 &&
-              &slots.Compressed(recycled_compressed).io == io_address,
+              &slots.Compressed(recycled_compressed).Request() == io_address,
           "compressed slot must retain an inline stable I/O request");
     slots.ReleaseCompressed(recycled_compressed);
 
@@ -238,8 +291,8 @@ void ResourceSlotTests() {
           "compressed slot must allocate initial storage");
     growing_slots.ReleaseCompressed(growing);
     Check(growing_slots.AcquireCompressed(8192, 1, 2) == growing &&
-              growing_slots.Compressed(growing).resource.data != nullptr &&
-              growing_slots.Compressed(growing).resource.allocation_size == 8192,
+              growing_slots.Compressed(growing).Buffer().data != nullptr &&
+              growing_slots.Compressed(growing).Buffer().allocation_size == 8192,
           "free compressed slot must grow its allocation immediately");
     growing_slots.ReleaseCompressed(growing);
 
@@ -249,14 +302,15 @@ void ResourceSlotTests() {
           "configured staging slots must be allocatable");
     Check(slots.AcquireStaging(1, 5, 7) == pv::kInvalidSlot,
           "staging slot count must be a hard limit");
-    Check(slots.StagingAt(staging0).state ==
+    Check(slots.Staging(staging0).State() ==
               pv::StagingSlotState::Prepared,
           "staging acquisition must reserve an unmapped prepared slot");
-    slots.StagingAt(staging0).state =
-        pv::StagingSlotState::DecodedPixelsAvailable;
+    slots.BeginDecodeOutput(staging0);
+    slots.CompleteDecodeOutput(staging0);
     slots.ReleaseStaging(staging0);
     Check(slots.FreeStagingCount() == 1 &&
-              slots.StagingAt(staging0).state == pv::StagingSlotState::Free,
+              slots.Staging(staging0).State() ==
+                  pv::StagingSlotState::Free,
           "staging release must restore state and free index together");
     const pv::SlotId recycled_staging = slots.AcquireStaging(4096, 5, 8);
     Check(recycled_staging == staging0,
@@ -269,11 +323,48 @@ void ResourceSlotTests() {
           "configured GPU Texture slots must be activatable once");
     Check(!slots.ActivateGpuTexture(2),
           "GPU Texture slot count must be a hard limit");
-    Check(slots.GpuTextureAt(gpu0).state ==
+    Check(slots.GpuTexture(gpu0).State() ==
               pv::GpuTextureSlotState::Writable,
           "GPU acquisition state must describe its pipeline phase");
-    Check(slots.FreeGpuTextureCount() == 0,
+    Check(slots.InactiveGpuTextureCount() == 0,
           "fixed GPU Texture slots leave the inactive index when activated");
+    slots.ReserveGpuTexture(gpu0, 3, 7);
+    Check(slots.GpuTexture(gpu0).ReservedFrame() == 3 &&
+              slots.GpuTexture(gpu0).ReservationGeneration() == 7,
+          "GPU reservation must update frame identity atomically");
+    slots.BeginGpuUpload(gpu0);
+    slots.CompleteGpuUpload(gpu0, 3, 7, 90, true);
+    Check(slots.GpuTexture(gpu0).ContentFrame() == 3 &&
+              slots.GpuTexture(gpu0).ContentGeneration() == 7,
+          "GPU completion must publish content identity in Writing state");
+    bool rejected_invalid_transition = false;
+    try {
+        slots.CompleteGpuRead(gpu0);
+    } catch (const std::logic_error&) {
+        rejected_invalid_transition = true;
+    }
+    Check(rejected_invalid_transition,
+          "slot lifecycle must reject a transition from an unexpected state");
+    slots.ClearGpuTextureReservation(gpu0);
+    Check(slots.GpuTexture(gpu0).ReservedFrame() == pv::kInvalidFrame &&
+              slots.GpuTexture(gpu0).ContentFrame() == 3 &&
+              slots.GpuTexture(gpu0).State() ==
+                  pv::GpuTextureSlotState::Writable,
+          "clearing a GPU reservation must retain reusable stale content");
+    slots.ReserveGpuTexture(gpu0, 3, 8);
+    Check(slots.GpuTexture(gpu0).ContentFrame() == 3 &&
+              slots.GpuTexture(gpu0).ContentGeneration() == 7 &&
+              slots.GpuTexture(gpu0).State() ==
+                  pv::GpuTextureSlotState::Writable,
+          "a new catalog generation must not reuse same-index GPU content");
+    Check(slots.ReleaseReplaceableGpuContent(gpu0) == 90 &&
+              slots.GpuTexture(gpu0).ReservedFrame() == 3 &&
+              slots.GpuTexture(gpu0).ContentFrame() == pv::kInvalidFrame,
+          "budget pressure must evict reserved-but-mismatched stale content");
+    slots.ClearGpuTextureReservation(gpu0);
+    Check(slots.ReleaseReplaceableGpuContent(gpu0) == 0 &&
+              slots.GpuTexture(gpu0).ContentFrame() == pv::kInvalidFrame,
+          "budget-pressure eviction must invalidate only unreserved GPU content");
 
     pv::ResourceSlots budget_limited(2, 2, 1, 4096, 4096);
     Check(budget_limited.AcquireCompressed(4096, 0, 1) != pv::kInvalidSlot,
@@ -307,12 +398,33 @@ void ReservationTests() {
     const auto old = table.FindFrame(10);
     Check(old != pv::kInvalidReservation && table.At(old).retiring,
           "busy obsolete reservation must retire without unsafe reuse");
+    reconcile({10, 11}, false);
+    Check(table.FindFrame(10) == old && table.At(old).retiring,
+          "a desired frame must not revoke an in-flight cancellation");
+    reconcile({10, 11}, true);
+    Check(table.FindFrame(10) != pv::kInvalidReservation &&
+              !table.At(table.FindFrame(10)).retiring,
+          "a completed cancellation must release and reacquire the reservation");
+    reconcile({12, 11}, false);
     reconcile({12, 11}, true);
     Check(table.FindFrame(12) != pv::kInvalidReservation &&
               table.FindFrame(10) == pv::kInvalidReservation,
           "safe retired reservation must be reassigned without a second pool");
 
-    pv::WorkQueue queue;
+    table.Reset(3);
+    reconcile({10, 11, 12}, true);
+    const std::array<std::size_t, 3> independently_reassigned{20, 21, 12};
+    table.Reconcile(
+        independently_reassigned,
+        [](pv::ReservationId, const std::size_t frame) { return frame != 10; },
+        [](pv::ReservationId, std::size_t) {},
+        [](pv::ReservationId, std::size_t) {},
+        pv::ReservationTable::FirstFree);
+    Check(table.IsRetiring(table.FindFrame(10)) &&
+              table.FindFrame(20) != pv::kInvalidReservation,
+          "one retiring owner must not block independently released capacity");
+
+    pv::WorkQueue queue(4);
     pv::DecodeWork work{3, 7, 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
     pv::DecodeWork cancelled;
@@ -337,21 +449,24 @@ void ReservationTests() {
     Check(queue.Pop(popped, std::stop_token{}) && popped.index == 4,
           "queued decode work must follow the latest navigation priority");
 
-    pv::WorkQueue remap_queue;
+    pv::WorkQueue remap_queue(1);
     pv::DecodeWork remapped{0, 11, 0, 0};
     Check(remap_queue.TryPush(remapped), "catalog remap test work must enter queue");
     remap_queue.Remap(0, 84, 11);
     Check(remap_queue.Pop(popped, std::stop_token{}) && popped.index == 84,
           "queued decode work must follow the catalog frame remap");
 
-    pv::WorkQueue naturally_bounded_queue;
+    pv::WorkQueue naturally_bounded_queue(32);
     for (std::size_t index = 0; index < 32; ++index) {
         pv::DecodeWork queued{index, 1, 0, static_cast<pv::SlotId>(index)};
         Check(naturally_bounded_queue.TryPush(queued),
-              "work queue must not impose an independent item-count limit");
+              "slot-backed work must fit the queue's fixed construction capacity");
     }
     Check(naturally_bounded_queue.Size() == 32,
-          "work queue size must be bounded only by dispatched slot-backed work");
+          "work queue must retain every slot-backed item without reallocating");
+    pv::DecodeWork overflow{32, 1, 0, 32};
+    Check(!naturally_bounded_queue.TryPush(overflow),
+          "work queue must reject work beyond its fixed slot capacity");
 }
 
 void CompletionQueueTests() {
@@ -379,6 +494,155 @@ void CompletionQueueTests() {
           "completion queue must remain reusable after a batch drain");
 }
 
+void RuntimeTelemetryTests() {
+    pv::RuntimeTelemetry telemetry(std::chrono::steady_clock::now());
+    telemetry.BeginNavigation(std::chrono::steady_clock::now());
+    const int measured = telemetry.Measure(
+        pv::TimedOperation::PipelinePump, [] { return 42; });
+    Check(measured == 42,
+          "telemetry measurement must preserve operation results");
+    Check(telemetry.Timing(pv::TimedOperation::PipelinePump).calls == 1,
+          "measured operation must increment its call count");
+    telemetry.Record(pv::TimedOperation::PipelinePump, {});
+    Check(telemetry.Timing(pv::TimedOperation::PipelinePump).calls == 1,
+          "zero begin time must not record process uptime as an operation");
+}
+
+void ReservationByteBudgetTests() {
+    pv::CatalogItem compressed;
+    compressed.file_size_known = true;
+    compressed.file_bytes = 4097;
+    const auto aligned = pv::CompressedReservationBytes(compressed, 1);
+    Check(aligned && *aligned == 8192,
+          "compressed reservations must include 4 KiB backing alignment");
+    std::size_t used = 0;
+    Check(pv::AddWithinBudget(*aligned, 8194, used),
+          "first aligned compressed reservation must fit");
+    Check(!pv::AddWithinBudget(*aligned, 8194, used),
+          "raw file sizes must not overcommit aligned backing storage");
+    Check(pv::CompressedReservationBytes(compressed, 1, 65536) == 65536,
+          "compressed reservations must honor the transport allocation alignment");
+    Check(pv::CompressedReservationBytes(compressed, 8192, 0) == 8192,
+          "unknown transport alignment must conservatively reserve the budget");
+
+    pv::CatalogItem decoded;
+    decoded.header_valid = true;
+    decoded.png = pv::PngInfo{10, 2, 80};
+    const auto staging = pv::StagingReservationBytes(decoded, 1);
+    const auto gpu = pv::GpuReservationBytes(decoded, 1);
+    Check(staging && *staging == 122,
+          "staging reservation must include filters and row scratch");
+    Check(gpu && *gpu == 80,
+          "GPU reservation must use decoded pixel bytes");
+
+    pv::CatalogItem unknown;
+    Check(pv::StagingReservationBytes(unknown, 777) == 777 &&
+              pv::GpuReservationBytes(unknown, 888) == 888,
+          "unknown headers must conservatively reserve the whole budget");
+
+    pv::FixedSlotByteBudget residency(2, 100);
+    Check(residency.CanReplace(0, 50),
+          "first GPU slot must fit its fixed residency budget");
+    residency.CommitReplacement(0, 50);
+    residency.CommitReplacement(1, 50);
+    Check(residency.Committed() == 100 && !residency.CanReplace(0, 100),
+          "stale GPU residency must prevent an over-budget replacement");
+    Check(residency.Release(0) == 50 && residency.Release(1) == 50 &&
+              residency.CanReplace(0, 100),
+          "releasing obsolete reservations must make the full budget redeemable");
+    residency.CommitReplacement(0, 100);
+    Check(residency.Committed() == 100,
+          "a replacement after stale-slot reclamation must consume exact bytes");
+
+    pv::ResourceSlots stale_slots(0, 0, 2, 0, 0);
+    Check(stale_slots.ActivateGpuTexture(0) &&
+              stale_slots.ActivateGpuTexture(1),
+          "pressure test must activate both fixed GPU slots");
+    stale_slots.ReserveGpuTexture(0, 0, 1);
+    stale_slots.BeginGpuUpload(0);
+    stale_slots.CompleteGpuUpload(0, 0, 1, 90, true);
+    stale_slots.ReserveGpuTexture(1, 1, 1);
+    stale_slots.BeginGpuUpload(1);
+    stale_slots.CompleteGpuUpload(1, 1, 1, 10, true);
+    pv::FixedSlotByteBudget swapped_residency(2, 100);
+    swapped_residency.CommitReplacement(0, 90);
+    swapped_residency.CommitReplacement(1, 10);
+    stale_slots.ClearGpuTextureReservation(0);
+    stale_slots.ClearGpuTextureReservation(1);
+    stale_slots.ReserveGpuTexture(0, 1, 2);
+    stale_slots.ReserveGpuTexture(1, 0, 2);
+    Check(!swapped_residency.CanReplace(1, 90),
+          "inverse-size readiness must initially encounter stale residency");
+    const std::size_t evicted =
+        stale_slots.ReleaseReplaceableGpuContent(0);
+    Check(evicted == 90 && swapped_residency.Release(0) == evicted &&
+              swapped_residency.CanReplace(1, 90) &&
+              stale_slots.GpuTexture(0).ReservedFrame() == 1,
+          "pressure eviction must preserve the reassigned reservation while "
+          "making its peer immediately redeemable");
+}
+
+void ControlledCompletionOrderingTests() {
+    pv::NavigationState navigation;
+    navigation.Reset(0, 4);
+    navigation.Step(1, false);
+    navigation.Step(1, false);
+    std::array<pv::PipelineStage, 4> stages{};
+    stages.fill(pv::PipelineStage::Outside);
+
+    pv::UploadLedger uploads(3);
+    uploads.Queue(pv::UploadTicket{2, 1, 10});
+    uploads.Queue(pv::UploadTicket{1, 1, 20});
+    uploads.Queue(pv::UploadTicket{0, 1, 30});
+    while (auto ticket = uploads.TakeCompleted(20)) {
+        stages[ticket->index] = pv::PipelineStage::PresentationTextureAvailable;
+    }
+    const auto ready = [&](const std::size_t frame) {
+        return stages[frame] ==
+               pv::PipelineStage::PresentationTextureAvailable;
+    };
+    Check(!pv::NextPresentableFrame(navigation, ready),
+          "later GPU completions must not bypass the first ordered frame");
+
+    const auto first = uploads.TakeCompleted(30);
+    Check(first && first->index == 0 && uploads.Empty(),
+          "coalesced fence completion must release every prior upload");
+    stages[first->index] = pv::PipelineStage::PresentationTextureAvailable;
+    for (const std::size_t expected : std::array<std::size_t, 3>{0, 1, 2}) {
+        const auto frame = pv::NextPresentableFrame(navigation, ready);
+        Check(frame && *frame == expected,
+              "out-of-order intermediate completion must present in navigation order");
+        navigation.CompletePresentation(*frame);
+    }
+
+    navigation.Reset(2, 5);
+    navigation.CompletePresentation(2);
+    navigation.Step(1, false);
+    navigation.Step(1, true);
+    navigation.Release(1);
+    navigation.Step(-1, false);
+    stages.fill(pv::PipelineStage::PresentationTextureAvailable);
+    for (const std::size_t expected : std::array<std::size_t, 2>{3, 2}) {
+        const auto frame = pv::NextPresentableFrame(navigation, ready);
+        Check(frame && *frame == expected,
+              "direction change must discard repeated work without reordering commitments");
+        navigation.CompletePresentation(*frame);
+    }
+    Check(navigation.Empty(),
+          "stale completion for a cancelled repeated frame must remain unauthorized");
+
+    bool rejected_nonmonotonic = false;
+    try {
+        pv::UploadLedger invalid(2);
+        invalid.Queue(pv::UploadTicket{0, 1, 5});
+        invalid.Queue(pv::UploadTicket{1, 1, 4});
+    } catch (const std::logic_error&) {
+        rejected_nonmonotonic = true;
+    }
+    Check(rejected_nonmonotonic,
+          "upload ledger must make the D3D monotonic fence premise explicit");
+}
+
 }  // namespace
 
 int main() {
@@ -390,6 +654,9 @@ int main() {
     ResourceSlotTests();
     ReservationTests();
     CompletionQueueTests();
+    RuntimeTelemetryTests();
+    ReservationByteBudgetTests();
+    ControlledCompletionOrderingTests();
     std::cout << "PASS: core tests physical_core_count=" << physical_core_count
               << " default_worker_count=" << pv::DefaultWorkerCount() << '\n';
     return 0;

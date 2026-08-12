@@ -10,7 +10,7 @@ namespace pv {
 class DecoderPool {
 public:
     DecoderPool(std::size_t worker_count, WorkQueue& work_queue,
-                CompletionQueue& completion_queue, ResourceSlots& slots);
+                CompletionQueue& completion_queue, DecodeSlotAccess& slots);
     ~DecoderPool();
 
     void ResetMetrics() noexcept;
@@ -41,7 +41,7 @@ private:
 
     WorkQueue& work_queue_;
     CompletionQueue& completion_queue_;
-    ResourceSlots& slots_;
+    DecodeSlotAccess& slots_;
     // Constructed once at the configured size and never resized. This keeps
     // the runtime-sized, cache-line-aligned sequence off the main stack.
     std::vector<WorkerMetrics> worker_metrics_;

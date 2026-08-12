@@ -36,6 +36,28 @@ if ($SamplePng) {
     if ($fullscreenProcess.ExitCode -ne 0) {
         throw "F11 fullscreen integration test failed: $($fullscreenProcess.ExitCode)"
     }
+    $startupFailureExitCode = $null
+    if ((Get-Item -LiteralPath $sample).Length -gt 1MB) {
+        $startupFailure = Start-Process `
+            -FilePath (Join-Path $output 'PhotoViewer.exe') `
+            -ArgumentList @(
+                '--validation-exit-after-present',
+                '--validation-timeout-ms=500',
+                '--compressed-budget-mib=1',
+                '--workers=4',
+                ('"' + $sample + '"')
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        if (-not $startupFailure.WaitForExit(5000)) {
+            Stop-Process -Id $startupFailure.Id -Force
+            throw 'Initial image allocation failure left startup waiting indefinitely'
+        }
+        $startupFailureExitCode = $startupFailure.ExitCode
+        if ($startupFailureExitCode -ne 109) {
+            throw "Initial image failure returned unexpected exit code: $startupFailureExitCode"
+        }
+    }
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $validationMode = if ($NavigationScript) {
         "--validation-navigation=$NavigationScript"
@@ -73,6 +95,7 @@ if ($SamplePng) {
     }
     [pscustomobject]@{
         FullscreenExitCode = $fullscreenProcess.ExitCode
+        StartupFailureExitCode = $startupFailureExitCode
         IntegrationExitCode = $process.ExitCode
         IntegrationElapsedMs = $timer.ElapsedMilliseconds
         NavigationScript = $NavigationScript
