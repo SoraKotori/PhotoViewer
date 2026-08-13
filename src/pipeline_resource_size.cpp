@@ -24,24 +24,13 @@ std::optional<std::size_t> CompressedReservationBytes(
 std::optional<std::size_t> StagingReservationBytes(
     const CatalogItem& item, const std::size_t unknown_bytes) noexcept {
     if (!item.header_valid) return unknown_bytes;
-    const std::size_t row_bytes = static_cast<std::size_t>(item.png.width) * 4;
-    if (item.png.decoded_bytes >
-        std::numeric_limits<std::size_t>::max() - item.png.height) {
-        return std::nullopt;
-    }
-    const std::size_t filtered = item.png.decoded_bytes + item.png.height;
-    if (filtered > std::numeric_limits<std::size_t>::max() - row_bytes) {
-        return std::nullopt;
-    }
-    return filtered + row_bytes;
+    return item.resource_plan.staging_committed_bytes;
 }
 
 std::optional<std::size_t> GpuReservationBytes(
     const CatalogItem& item, const std::size_t unknown_bytes) noexcept {
     if (!item.header_valid) return unknown_bytes;
-    return item.png.decoded_bytes == 0
-               ? std::nullopt
-               : std::optional<std::size_t>(item.png.decoded_bytes);
+    return item.resource_plan.gpu_reservation_bytes;
 }
 
 bool AddWithinBudget(const std::size_t bytes, const std::size_t budget,

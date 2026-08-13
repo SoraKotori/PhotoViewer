@@ -5,6 +5,7 @@
 #include "pipeline_resource_size.h"
 #include "pipeline_model.h"
 #include "pipeline_resources.h"
+#include "pipeline_state.h"
 #include "presentation_order.h"
 #include "reservation_planner.h"
 #include "resource_slots.h"
@@ -12,6 +13,8 @@
 #include "runtime_telemetry.h"
 #include "upload_ledger.h"
 #include "work_queue.h"
+
+#include "../third_party/libdeflate/libdeflate.h"
 
 #include <array>
 #include <cstdlib>
@@ -36,8 +39,9 @@ concept CanReadIoRequest = requires(Access access) {
 template <typename Access>
 concept CanMutateGpu = requires(Access access) { access.BeginGpuUpload(0); };
 template <typename Access>
-concept CanRecordHeader = requires(Access access, const pv::PngInfo& png) {
-    access.RecordHeader(0, png);
+concept CanRecordResourcePlan = requires(
+    Access access, const pv::PngResourcePlan& plan) {
+    access.RecordResourcePlan(0, plan);
 };
 template <typename Access>
 concept CanCompletePresentation = requires(Access access) {
@@ -59,11 +63,14 @@ static_assert(!CanReadIoRequest<pv::DecodeResourceAccess>);
 static_assert(!CanMutateGpu<pv::DecodeResourceAccess>);
 static_assert(CanMutateGpu<pv::GraphicsResourceAccess>);
 static_assert(!CanReadIoRequest<pv::GraphicsResourceAccess>);
-static_assert(CanRecordHeader<pv::StorageCatalogAccess>);
+static_assert(CanRecordResourcePlan<pv::StorageCatalogAccess>);
 static_assert(!CanCompletePresentation<pv::StorageCatalogAccess>);
 static_assert(CanCompletePresentation<pv::PresentationCompletionAccess>);
-static_assert(!CanRecordHeader<pv::PresentationCompletionAccess>);
+static_assert(!CanRecordResourcePlan<pv::PresentationCompletionAccess>);
 static_assert(!CanNavigate<const pv::PipelineModel>);
+static_assert(pv::ShouldContinuePipelinePass(true, false));
+static_assert(pv::ShouldContinuePipelinePass(false, true));
+static_assert(!pv::ShouldContinuePipelinePass(false, false));
 
 void Check(const bool condition, const char* message) {
     if (!condition) {
@@ -83,6 +90,9 @@ void ConfigDefaultTests() {
     Check(config.gpu_forward_slot_count == 3 &&
               config.gpu_reverse_slot_count == 1,
           "application default must use the measured GPU slot minimum");
+    Check(config.png_validation.chunk_crc == pv::PngChunkCrcMode::All &&
+              config.png_validation.adler32,
+          "PNG integrity validation must be strict by default");
 }
 
 std::size_t ProcessorTopologyTests() {
@@ -232,22 +242,59 @@ void ReservationPlannerTests() {
           "failed frames must be removed from GPU reservations");
 }
 
-void PngTests() {
+std::array<std::byte, pv::kPngHeaderBytes> MakePngHeader(
+    const std::uint32_t width, const std::uint32_t height,
+    const std::uint8_t depth = 8, const std::uint8_t color = 6,
+    const std::uint8_t interlace = 0) {
     std::array<std::byte, 33> header{};
-    const std::array<unsigned char, 24> prefix{
+    const std::array<unsigned char, 16> prefix{
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-        0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R',
-        0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x10, 0xE0};
+        0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R'};
     for (std::size_t index = 0; index < prefix.size(); ++index) {
         header[index] = std::byte{prefix[index]};
     }
-    const auto parsed = pv::ParsePngHeader(header);
+    const auto write = [&](const std::size_t offset,
+                           const std::uint32_t value) {
+        header[offset] = std::byte{static_cast<std::uint8_t>(value >> 24U)};
+        header[offset + 1] = std::byte{static_cast<std::uint8_t>(value >> 16U)};
+        header[offset + 2] = std::byte{static_cast<std::uint8_t>(value >> 8U)};
+        header[offset + 3] = std::byte{static_cast<std::uint8_t>(value)};
+    };
+    write(16, width);
+    write(20, height);
+    header[24] = std::byte{depth};
+    header[25] = std::byte{color};
+    header[28] = std::byte{interlace};
+    write(29, libdeflate_crc32(0, header.data() + 12, 17));
+    return header;
+}
+
+void PngTests() {
+    auto header = MakePngHeader(7680, 4320);
+    const auto parsed = pv::ParsePngResourcePlan(header);
     Check(parsed.has_value(), "valid PNG IHDR");
     Check(parsed->width == 7680 && parsed->height == 4320, "8K dimensions");
     Check(parsed->decoded_bytes == 7680ULL * 4320ULL * 4ULL,
           "decoded byte reservation");
+    Check(parsed->filter_workspace_bytes == 4320 + 7680 * 4 &&
+              parsed->staging_committed_bytes ==
+                  parsed->decoded_bytes + parsed->filter_workspace_bytes &&
+              parsed->texture_width == 7680 &&
+              parsed->texture_height == 4321 &&
+              parsed->gpu_reservation_bytes == parsed->decoded_bytes,
+          "main-thread resource plan must contain all downstream sizes");
+    const auto tall = pv::ParsePngResourcePlan(
+        MakePngHeader(16383, 16384));
+    Check(tall && tall->texture_width == 16384 &&
+              tall->texture_height == 16384,
+          "maximum-height texture may use the planned workspace column");
+    Check(!pv::ParsePngResourcePlan(MakePngHeader(16384, 16384)),
+          "maximum square texture has no room for PNG filter workspace");
+    Check(!pv::ParsePngResourcePlan(MakePngHeader(16385, 1)) &&
+              !pv::ParsePngResourcePlan(MakePngHeader(1, 16385)),
+          "IHDR dimensions beyond D3D11 limits must fail before allocation");
     header[0] = std::byte{0};
-    Check(!pv::ParsePngHeader(header), "invalid signature must fail");
+    Check(!pv::ParsePngResourcePlan(header), "invalid signature must fail");
 }
 
 void ResourceSlotTests() {
@@ -527,7 +574,7 @@ void ReservationByteBudgetTests() {
 
     pv::CatalogItem decoded;
     decoded.header_valid = true;
-    decoded.png = pv::PngInfo{10, 2, 80};
+    decoded.resource_plan = *pv::ParsePngResourcePlan(MakePngHeader(10, 2));
     const auto staging = pv::StagingReservationBytes(decoded, 1);
     const auto gpu = pv::GpuReservationBytes(decoded, 1);
     Check(staging && *staging == 122,

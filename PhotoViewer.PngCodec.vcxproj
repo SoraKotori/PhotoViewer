@@ -35,6 +35,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="third_party\libdeflate\lib\adler32.c"><ObjectFileName>$(IntDir)libdeflate\adler32.obj</ObjectFileName></ClCompile>
+    <ClCompile Include="third_party\libdeflate\lib\crc32.c"><ObjectFileName>$(IntDir)libdeflate\crc32.obj</ObjectFileName></ClCompile>
     <ClCompile Include="third_party\libdeflate\lib\deflate_decompress.c"><ObjectFileName>$(IntDir)libdeflate\deflate_decompress.obj</ObjectFileName></ClCompile>
     <ClCompile Include="third_party\libdeflate\lib\utils.c"><ObjectFileName>$(IntDir)libdeflate\utils.obj</ObjectFileName></ClCompile>
     <ClCompile Include="third_party\libdeflate\lib\zlib_decompress.c"><ObjectFileName>$(IntDir)libdeflate\zlib_decompress.obj</ObjectFileName></ClCompile>

@@ -3,6 +3,8 @@
 #include "pipeline_limits.h"
 #include "resource_slots.h"
 
+#include <memory>
+
 namespace pv {
 
 class StorageResourceAccess {
@@ -105,6 +107,20 @@ private:
     ResourceSlots* slots_;
 };
 
+// Grants only the process-exit escape hatch needed when cancelled kernel I/O
+// does not drain within the bounded shutdown interval.
+class ResourceBackingAbandonment final {
+public:
+    void AbandonForProcessExit() noexcept { (void)slots_->release(); }
+
+private:
+    friend class PipelineResources;
+    explicit ResourceBackingAbandonment(
+        std::unique_ptr<ResourceSlots>& slots) noexcept
+        : slots_(&slots) {}
+    std::unique_ptr<ResourceSlots>* slots_;
+};
+
 // Owns fixed slot storage and the compressed-content budget. GPU accounting
 // belongs to GraphicsPipeline, the only component that can submit uploads.
 class PipelineResources {
@@ -112,24 +128,27 @@ public:
     explicit PipelineResources(const PipelineLimits& limits);
 
     [[nodiscard]] const ResourceSlots& SlotsView() const noexcept {
-        return slots_;
+        return *slots_;
     }
 
 private:
     friend class PipelineRuntime;
     friend class PipelineScheduler;
     [[nodiscard]] StorageResourceAccess StorageAccess() noexcept {
-        return StorageResourceAccess(slots_);
+        return StorageResourceAccess(*slots_);
     }
     [[nodiscard]] DecodeResourceAccess DecodeAccess() noexcept {
-        return DecodeResourceAccess(slots_);
+        return DecodeResourceAccess(*slots_);
     }
     [[nodiscard]] GraphicsResourceAccess GraphicsAccess() noexcept {
-        return GraphicsResourceAccess(slots_);
+        return GraphicsResourceAccess(*slots_);
     }
-    [[nodiscard]] ResourceSlots& Slots() noexcept { return slots_; }
-    [[nodiscard]] const ResourceSlots& Slots() const noexcept { return slots_; }
-    ResourceSlots slots_;
+    [[nodiscard]] ResourceBackingAbandonment BackingAbandonment() noexcept {
+        return ResourceBackingAbandonment(slots_);
+    }
+    [[nodiscard]] ResourceSlots& Slots() noexcept { return *slots_; }
+    [[nodiscard]] const ResourceSlots& Slots() const noexcept { return *slots_; }
+    std::unique_ptr<ResourceSlots> slots_;
 };
 
 }  // namespace pv

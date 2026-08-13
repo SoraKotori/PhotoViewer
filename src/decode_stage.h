@@ -12,7 +12,8 @@ namespace pv {
 // queue synchronization and worker lifetime never escape this boundary.
 class DecodeStage {
 public:
-    DecodeStage(std::size_t capacity, DecodeSlotAccess slots);
+    DecodeStage(std::size_t capacity, DecodeSlotAccess slots,
+                PngValidationOptions validation);
     ~DecodeStage();
 
     DecodeStage(const DecodeStage&) = delete;
@@ -38,6 +39,7 @@ private:
     CompletionQueue completion_queue_;
     CompletionQueue::Batch completion_batch_;
     DecodeSlotAccess slots_;
+    PngValidationOptions validation_;
     std::optional<DecoderPool> workers_;
 };
 

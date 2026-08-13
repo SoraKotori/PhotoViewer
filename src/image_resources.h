@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decode_surface.h"
+#include "png.h"
 #include "win32_support.h"
 
 #include <d2d1_3.h>
@@ -70,16 +71,18 @@ struct DecodeStaging {
         return true;
     }
 
-    [[nodiscard]] bool PrepareCpuSurface(const UINT width, const UINT height,
-                                         const std::size_t decoded_bytes) noexcept {
-        const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-        if (width == 0 || height == 0 ||
-            row_bytes > std::numeric_limits<UINT>::max() ||
-            decoded_bytes > committed_bytes ||
-            height > committed_bytes - decoded_bytes ||
+    void Configure(const PngResourcePlan& plan) noexcept {
+        resource_plan = plan;
+    }
+
+    [[nodiscard]] bool PrepareCpuSurface() noexcept {
+        if (resource_plan.width == 0 || resource_plan.height == 0 ||
+            resource_plan.staging_committed_bytes > committed_bytes ||
             !AllocateCpu(committed_bytes)) return false;
-        surface = DecodeSurface{cpu_data, cpu_capacity, decoded_bytes,
-                                width, height, static_cast<UINT>(row_bytes)};
+        surface = DecodeSurface{cpu_data, cpu_capacity,
+                                resource_plan.decoded_bytes,
+                                resource_plan.width, resource_plan.height,
+                                resource_plan.row_bytes};
         cpu_surface = true;
         return true;
     }
@@ -98,6 +101,7 @@ struct DecodeStaging {
         texture_width = 0;
         texture_height = 0;
         committed_bytes = 0;
+        resource_plan = {};
         mapped = false;
         surface = {};
     }
@@ -106,6 +110,7 @@ struct DecodeStaging {
         ReleaseCpuAllocation();
         surface = {};
         mapped = false;
+        resource_plan = {};
     }
 
     std::byte* cpu_data = nullptr;
@@ -114,6 +119,7 @@ struct DecodeStaging {
     UINT texture_width = 0;
     UINT texture_height = 0;
     std::size_t committed_bytes = 0;
+    PngResourcePlan resource_plan;
     bool cpu_surface = false;
     bool mapped = false;
     DecodeSurface surface;

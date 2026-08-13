@@ -101,7 +101,8 @@ enum spng_state
 enum spng__internal
 {
     SPNG__IO_SIGNAL = 1 << 9,
-    SPNG__CTX_FLAGS_ALL = (SPNG_CTX_IGNORE_ADLER32 | SPNG_CTX_ENCODER)
+    SPNG__CTX_FLAGS_ALL = (SPNG_CTX_IGNORE_ADLER32 | SPNG_CTX_ENCODER |
+                           SPNG_CTX_SKIP_CHUNK_CRC)
 };
 
 #define SPNG_STR(x) _SPNG_STR(x)
@@ -1079,7 +1080,8 @@ static inline int read_header(spng_ctx *ctx)
 
     ctx->cur_chunk_bytes_left = chunk.length;
 
-    if(is_critical_chunk(&chunk) && ctx->crc_action_critical == SPNG_CRC_USE) ctx->skip_crc = 1;
+    if(ctx->flags & SPNG_CTX_SKIP_CHUNK_CRC) ctx->skip_crc = 1;
+    else if(is_critical_chunk(&chunk) && ctx->crc_action_critical == SPNG_CRC_USE) ctx->skip_crc = 1;
     else if(ctx->crc_action_ancillary == SPNG_CRC_USE) ctx->skip_crc = 1;
     else ctx->skip_crc = 0;
 

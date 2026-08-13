@@ -15,10 +15,11 @@ DecodePipeline::DecodePipeline(const PipelineLimits& limits,
                                const PipelineResources& resources,
                                DecodeResourceAccess slots,
                                GraphicsPipeline& graphics,
-                               RuntimeTelemetry& telemetry)
+                               RuntimeTelemetry& telemetry,
+                               const PngValidationOptions validation)
     : limits_(limits), model_(model), frames_(frames), resources_(resources),
       slots_(slots), graphics_(graphics), telemetry_(telemetry),
-      workers_(limits.staging_slot_count, slots.WorkerAccess()) {}
+      workers_(limits.staging_slot_count, slots.WorkerAccess(), validation) {}
 
 void DecodePipeline::Start(const std::size_t worker_count) {
     workers_.Start(worker_count);
@@ -143,10 +144,10 @@ void DecodePipeline::PrepareStaging(const std::size_t index) {
         *staging_bytes, index, image.Generation());
     if (staging_slot == kInvalidSlot) return;
     DecodeStaging& staging = slots_.StagingResource(staging_slot);
+    staging.Configure(item.resource_plan);
     if (graphics_device_ready_) {
-        graphics_.PrepareDecodeStaging(staging, item.png.width, item.png.height);
-    } else if (!staging.PrepareCpuSurface(
-                   item.png.width, item.png.height, item.png.decoded_bytes)) {
+        graphics_.PrepareDecodeStaging(staging);
+    } else if (!staging.PrepareCpuSurface()) {
         slots_.ReleaseStaging(staging_slot);
         return;
     }
@@ -191,13 +192,9 @@ void DecodePipeline::DispatchEligible() {
             throw std::logic_error("invalid prepared staging slot");
         }
         if (graphics_device_ready_) {
-            graphics_.MapDecodeStaging(staging,
-                                       item.png.width, item.png.height,
-                                       item.png.decoded_bytes);
+            graphics_.MapDecodeStaging(staging);
         } else if (!staging.cpu_surface &&
-                   !staging.PrepareCpuSurface(
-                       item.png.width, item.png.height,
-                       item.png.decoded_bytes)) {
+                   !staging.PrepareCpuSurface()) {
             slots_.ReleaseStaging(staging_slot);
             frames_.ClearStagingSlot(index, staging_slot);
             continue;

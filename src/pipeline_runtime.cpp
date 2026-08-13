@@ -12,17 +12,20 @@ PipelineRuntime::PipelineRuntime(PipelineObserver& observer, const Config& confi
       telemetry_(telemetry ? *telemetry : disabled_telemetry_),
       model_(limits_),
       resources_(limits_),
-      storage_(limits_, model_, model_.StorageCatalog(), model_.StorageFrames(), resources_,
+      storage_(limits_, model_, model_.StorageCatalog(), model_.StorageFrames(),
+               resources_,
+               resources_.BackingAbandonment(),
                resources_.StorageAccess(), telemetry_),
       graphics_(limits_, model_, model_.PresentationCompletion(),
                 model_.GraphicsFrames(), resources_,
                 resources_.GraphicsAccess(), observer, window_),
       decode_(limits_, model_, model_.DecodeFrames(), resources_,
-              resources_.DecodeAccess(), graphics_, telemetry_),
+              resources_.DecodeAccess(), graphics_, telemetry_,
+              config.png_validation),
       scheduler_(limits_, model_, resources_, storage_, decode_, graphics_,
                  telemetry_) {}
 
-PipelineRuntime::~PipelineRuntime() {
+PipelineRuntime::~PipelineRuntime() noexcept {
     decode_.Stop();
     graphics_.DrainForShutdown();
     graphics_.UnmapAllStagingForShutdown();

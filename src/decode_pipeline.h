@@ -20,7 +20,8 @@ public:
                    DecodeFrameAccess frames,
                    const PipelineResources& resources,
                    DecodeResourceAccess slots, GraphicsPipeline& graphics,
-                   RuntimeTelemetry& telemetry);
+                   RuntimeTelemetry& telemetry,
+                   PngValidationOptions validation);
 
     void Start(std::size_t worker_count);
     void Stop() noexcept;

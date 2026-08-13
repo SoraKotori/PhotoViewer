@@ -43,9 +43,8 @@ public:
     void Resize(UINT width, UINT height);
     void Paint();
 
-    void PrepareDecodeStaging(DecodeStaging& staging, UINT width, UINT height);
-    void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
-                          std::size_t decoded_bytes);
+    void PrepareDecodeStaging(DecodeStaging& staging);
+    void MapDecodeStaging(DecodeStaging& staging);
     void UnmapDecodeStaging(DecodeStaging& staging);
 
     void SubmitEligibleUploads();

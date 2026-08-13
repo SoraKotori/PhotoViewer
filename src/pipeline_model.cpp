@@ -70,9 +70,10 @@ void PipelineModel::MarkReservationPlanDirty() noexcept {
     reservations_.MarkDirty();
 }
 
-void PipelineModel::RecordHeader(const std::size_t index, const PngInfo& png) {
+void PipelineModel::RecordResourcePlan(const std::size_t index,
+                                       const PngResourcePlan& plan) {
     CatalogItem& item = catalog_.items.at(index);
-    item.png = png;
+    item.resource_plan = plan;
     item.header_valid = true;
     reservations_.MarkDirty();
 }

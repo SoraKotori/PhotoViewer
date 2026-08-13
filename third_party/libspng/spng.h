@@ -184,7 +184,8 @@ enum spng_format
 enum spng_ctx_flags
 {
     SPNG_CTX_IGNORE_ADLER32 = 1, /* Ignore checksum in DEFLATE streams */
-    SPNG_CTX_ENCODER = 2 /* Create an encoder context */
+    SPNG_CTX_ENCODER = 2, /* Create an encoder context */
+    SPNG_CTX_SKIP_CHUNK_CRC = 4 /* Caller validates PNG chunk CRC */
 };
 
 enum spng_decode_flags

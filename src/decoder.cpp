@@ -17,8 +17,10 @@ std::size_t ValidateWorkerCount(const std::size_t worker_count) {
 
 DecoderPool::DecoderPool(const std::size_t worker_count, WorkQueue& work_queue,
                          CompletionQueue& completion_queue,
-                         DecodeSlotAccess& slots)
+                         DecodeSlotAccess& slots,
+                         const PngValidationOptions validation)
     : work_queue_(work_queue), completion_queue_(completion_queue), slots_(slots),
+      validation_(validation),
       worker_metrics_(ValidateWorkerCount(worker_count)) {
     workers_.reserve(worker_count);
     for (std::size_t index = 0; index < worker_count; ++index) {
@@ -106,6 +108,7 @@ DecodeResult DecoderPool::Decode(DecodeWork work) {
     const std::span<std::byte> compressed =
         slots_.CompressedInput(work.compressed_slot);
     DecodeSurface& surface = slots_.DecodeOutput(work.staging_slot);
+    const PngResourcePlan& expected = slots_.ExpectedPng(work.staging_slot);
     if (compressed.empty() || !surface.pixels) {
         result.error = E_INVALIDARG;
         return result;
@@ -119,8 +122,8 @@ DecodeResult DecoderPool::Decode(DecodeWork work) {
         context->pool->ReleaseInput(*context->work);
     };
     const HRESULT hr = DecodePngSpng(
-        compressed,
-        surface, input_consumed, &callback_context);
+        compressed, surface, expected, validation_, input_consumed,
+        &callback_context);
     result.error = hr;
     result.success = SUCCEEDED(hr);
     return result;

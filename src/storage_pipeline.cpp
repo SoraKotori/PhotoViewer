@@ -16,15 +16,16 @@ StoragePipeline::StoragePipeline(const PipelineLimits& limits,
                                  StorageCatalogAccess catalog,
                                  StorageFrameAccess frames,
                                  const PipelineResources& resources,
+                                 ResourceBackingAbandonment backing,
                                  StorageResourceAccess slots,
                                  RuntimeTelemetry& telemetry)
     : limits_(limits), model_(model), catalog_(catalog), frames_(frames),
-      resources_(resources),
+      resources_(resources), backing_(backing),
       slots_(slots), telemetry_(telemetry) {
     header_ready_frames_.reserve(limits.compressed_slot_count);
 }
 
-StoragePipeline::~StoragePipeline() {
+StoragePipeline::~StoragePipeline() noexcept {
     if (!shutdown_) Shutdown();
 }
 
@@ -101,12 +102,24 @@ void StoragePipeline::OnHeaderReady(IoRequest* request,
             std::chrono::steady_clock::time_point{}) {
         telemetry_.Mark(StartupMilestone::InitialHeaderReady);
     }
-    if (request->header_result == ERROR_SUCCESS && transferred >= 24) {
-        const auto header = ParsePngHeader(std::span<const std::byte>(
-            request->destination, 24));
-        if (header) {
-            catalog_.RecordHeader(request->index, *header);
+    bool accepted = false;
+    if (request->header_result == ERROR_SUCCESS &&
+        transferred >= kPngHeaderBytes) {
+        const auto plan = ParsePngResourcePlan(std::span<const std::byte>(
+            request->destination, transferred));
+        accepted = plan &&
+                   plan->staging_committed_bytes <=
+                       limits_.staging_cache_bytes &&
+                   plan->gpu_reservation_bytes <= limits_.gpu_cache_bytes;
+        if (accepted) {
+            catalog_.RecordResourcePlan(request->index, *plan);
             header_ready_frames_.push_back(request->index);
+        }
+    }
+    if (!accepted) {
+        frames_.MarkFailed(request->index);
+        if (request->content_submitted && !request->content_completed) {
+            (void)transport_.RequestCancellation(*request);
         }
     }
     if (!request->content_submitted || request->content_completed) {
@@ -178,17 +191,9 @@ void StoragePipeline::FinishRead(IoRequest* const request) {
     const bool reserved = current && IsReservationActive(
         model_.ReservationPlan().Compressed(), image.CompressedReservation(),
         request->index);
-    if (success && reserved) {
-        const auto header = ParsePngHeader(std::span<const std::byte>(
-            slot.Buffer().data, slot.Buffer().size));
-        if (header) {
-            catalog_.RecordHeader(request->index, *header);
-            slots_.CompleteFileRead(compressed_slot);
-        } else {
-            slots_.ReleaseCompressed(compressed_slot);
-            frames_.ClearCompressedSlot(request->index, compressed_slot);
-            frames_.MarkFailed(request->index);
-        }
+    if (success && reserved && !image.Failed() &&
+        model_.CatalogItemAt(request->index).header_valid) {
+        slots_.CompleteFileRead(compressed_slot);
     } else {
         slots_.ReleaseCompressed(compressed_slot);
         frames_.ClearCompressedSlot(request->index, compressed_slot);
@@ -198,7 +203,7 @@ void StoragePipeline::FinishRead(IoRequest* const request) {
     }
 }
 
-void StoragePipeline::SubmitEligibleReads() {
+bool StoragePipeline::SubmitEligibleReads() {
     struct ReadSubmission {
         DWORD result = ERROR_SUCCESS;
         DWORD transferred = 0;
@@ -225,6 +230,7 @@ void StoragePipeline::SubmitEligibleReads() {
                    ? ReadSubmission{}
                    : ReadSubmission{error, 0, true};
     };
+    bool synchronous_progress = false;
     const auto submit_request = [&](const std::size_t index) {
         IoRequest* const request = frames_.Io(index);
         ReadSubmission header;
@@ -267,9 +273,11 @@ void StoragePipeline::SubmitEligibleReads() {
                 });
         }
         if (header.completed && frames_.Io(index) == request) {
+            synchronous_progress = true;
             OnHeaderReady(request, header.result, header.transferred);
         }
         if (content.completed && frames_.Io(index) == request) {
+            synchronous_progress = true;
             OnContentReady(request, content.result, content.transferred);
         }
     };
@@ -315,7 +323,7 @@ void StoragePipeline::SubmitEligibleReads() {
             catalog_.RecordFileSize(
                 index, static_cast<std::uint64_t>(file_size.QuadPart));
         }
-        if (item.file_bytes <= 24 ||
+        if (item.file_bytes < kPngHeaderBytes ||
             item.file_bytes > std::numeric_limits<DWORD>::max()) {
             CloseHandle(opened_file);
             frames_.MarkFailed(index);
@@ -379,7 +387,7 @@ void StoragePipeline::SubmitEligibleReads() {
         transport_.ConfigureCompletionMode(opened_file);
         prepared_reads = true;
     }
-    if (!prepared_reads) return;
+    if (!prepared_reads) return false;
 
     for (const std::size_t index : model_.ReservationPlan().PriorityOrder()) {
         IoRequest* const request = frames_.Io(index);
@@ -389,14 +397,23 @@ void StoragePipeline::SubmitEligibleReads() {
         }
         submit_request(index);
     }
+    return synchronous_progress;
 }
 
-void StoragePipeline::Shutdown() {
+void StoragePipeline::Shutdown() noexcept {
+    constexpr ULONGLONG shutdown_timeout_ms = 5000;
     std::size_t pending_operations = 0;
     for (std::size_t index = 0; index < model_.FrameCount(); ++index) {
         IoRequest* const request = frames_.Io(index);
         if (request && request->file) {
-            (void)transport_.RequestCancellation(*request);
+            try {
+                (void)transport_.RequestCancellation(*request);
+            } catch (...) {
+                transport_.AbandonForProcessExit();
+                backing_.AbandonForProcessExit();
+                shutdown_ = true;
+                return;
+            }
             if (request->header_submitted && !request->header_completed) {
                 ++pending_operations;
             }
@@ -405,15 +422,30 @@ void StoragePipeline::Shutdown() {
             }
         }
     }
+    const ULONGLONG deadline = GetTickCount64() + shutdown_timeout_ms;
     while (pending_operations != 0) {
-        const IoCompletion completion =
-            transport_.WaitForShutdownCompletion();
-        IoRequest* const request = completion.request;
-        if (completion.overlapped == &request->header_overlapped &&
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            transport_.AbandonForProcessExit();
+            backing_.AbandonForProcessExit();
+            shutdown_ = true;
+            return;
+        }
+        const DWORD remaining = static_cast<DWORD>(deadline - now);
+        const auto completion =
+            transport_.WaitForShutdownCompletion(remaining);
+        if (!completion || !completion->request) {
+            transport_.AbandonForProcessExit();
+            backing_.AbandonForProcessExit();
+            shutdown_ = true;
+            return;
+        }
+        IoRequest* const request = completion->request;
+        if (completion->overlapped == &request->header_overlapped &&
             request->header_submitted && !request->header_completed) {
             request->header_completed = true;
             --pending_operations;
-        } else if (completion.overlapped == &request->content_overlapped &&
+        } else if (completion->overlapped == &request->content_overlapped &&
                    request->content_submitted &&
                    !request->content_completed) {
             request->content_completed = true;

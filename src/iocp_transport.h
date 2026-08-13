@@ -4,6 +4,7 @@
 #include "win32_handle.h"
 
 #include <cstddef>
+#include <optional>
 #include <span>
 
 namespace pv {
@@ -29,7 +30,9 @@ public:
     [[nodiscard]] DWORD CachedTransferGranularity() const noexcept;
 
     std::size_t DrainAvailable(std::span<IoCompletion> completions);
-    [[nodiscard]] IoCompletion WaitForShutdownCompletion();
+    [[nodiscard]] std::optional<IoCompletion> WaitForShutdownCompletion(
+        DWORD timeout_ms) noexcept;
+    void AbandonForProcessExit() noexcept;
     void Associate(HANDLE file, IoRequest& request);
     void ConfigureCompletionMode(HANDLE file);
     [[nodiscard]] bool RequestCancellation(IoRequest& request);

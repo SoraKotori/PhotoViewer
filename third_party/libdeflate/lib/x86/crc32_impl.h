@@ -72,8 +72,8 @@ static const u8 MAYBE_UNUSED shift_tab[48] = {
  * VPCLMULQDQ/AVX2 implementation.  This is used on CPUs that have AVX2 and
  * VPCLMULQDQ but don't have AVX-512, for example Intel Alder Lake.
  *
- * Currently this can't be enabled with MSVC because MSVC has a bug where it
- * incorrectly assumes that VPCLMULQDQ implies AVX-512:
+ * MSVC versions before 19.50 can't enable this because they incorrectly
+ * assume that VPCLMULQDQ implies AVX-512:
  * https://developercommunity.visualstudio.com/t/Compiler-incorrectly-assumes-VAES-and-VP/10578785
  *
  * gcc 8.1 and 8.2 had a similar bug where they assumed that
@@ -81,7 +81,8 @@ static const u8 MAYBE_UNUSED shift_tab[48] = {
  *
  * _mm256_zextsi128_si256() requires gcc 10.
  */
-#if (GCC_PREREQ(10, 1) || CLANG_PREREQ(6, 0, 10000000)) && \
+#if (GCC_PREREQ(10, 1) || CLANG_PREREQ(6, 0, 10000000) || \
+     MSVC_PREREQ(1950)) && \
 	!defined(LIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ)
 #  define crc32_x86_vpclmulqdq_avx2	crc32_x86_vpclmulqdq_avx2
 #  define SUFFIX				 _vpclmulqdq_avx2

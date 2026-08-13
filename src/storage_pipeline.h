@@ -21,8 +21,9 @@ public:
                     StorageCatalogAccess catalog,
                     StorageFrameAccess frames,
                     const PipelineResources& resources,
+                    ResourceBackingAbandonment backing,
                     StorageResourceAccess slots, RuntimeTelemetry& telemetry);
-    ~StoragePipeline();
+    ~StoragePipeline() noexcept;
 
     StoragePipeline(const StoragePipeline&) = delete;
     StoragePipeline& operator=(const StoragePipeline&) = delete;
@@ -34,10 +35,12 @@ public:
     [[nodiscard]] bool InitialContentCompleted() const noexcept;
 
     [[nodiscard]] bool DrainCompletions();
-    void SubmitEligibleReads();
+    // Returns true when at least one ReadFile completed synchronously and
+    // changed pipeline-visible state without an IOCP wakeup.
+    [[nodiscard]] bool SubmitEligibleReads();
     void RetireRead(std::size_t frame);
     void RemapActiveRead(std::size_t destination);
-    void Shutdown();
+    void Shutdown() noexcept;
 
     [[nodiscard]] std::span<const std::size_t> HeaderReadyFrames() const noexcept;
     void ClearHeaderReadyFrames() noexcept;
@@ -56,6 +59,7 @@ private:
     StorageCatalogAccess catalog_;
     StorageFrameAccess frames_;
     const PipelineResources& resources_;
+    ResourceBackingAbandonment backing_;
     StorageResourceAccess slots_;
     RuntimeTelemetry& telemetry_;
     IocpTransport transport_;

@@ -30,14 +30,17 @@ void PipelineScheduler::Pump() {
         ReconcileReservations();
         telemetry_.Measure(TimedOperation::DispatchDecode,
                             [&] { decode_.DispatchEligible(); });
-        telemetry_.Measure(TimedOperation::SubmitReads,
-                            [&] { SubmitStorageReads(); });
+        const bool storage_progress = telemetry_.Measure(
+            TimedOperation::SubmitReads,
+            [&] { return SubmitStorageReads(); });
         if (catalog_complete_) {
             telemetry_.Measure(TimedOperation::SubmitUploads,
                                [&] { graphics_.SubmitEligibleUploads(); });
         }
-        if (!telemetry_.Measure(TimedOperation::TryPresent,
-                                 [&] { return graphics_.TryPresent(); })) {
+        const bool presented = telemetry_.Measure(
+            TimedOperation::TryPresent,
+            [&] { return graphics_.TryPresent(); });
+        if (!ShouldContinuePipelinePass(storage_progress, presented)) {
             break;
         }
     }
@@ -57,9 +60,10 @@ void PipelineScheduler::PrepareStorageHeaders() {
     storage_.ClearHeaderReadyFrames();
 }
 
-void PipelineScheduler::SubmitStorageReads() {
-    storage_.SubmitEligibleReads();
+bool PipelineScheduler::SubmitStorageReads() {
+    const bool synchronous_progress = storage_.SubmitEligibleReads();
     PrepareStorageHeaders();
+    return synchronous_progress;
 }
 
 PipelineStage PipelineScheduler::StageOf(

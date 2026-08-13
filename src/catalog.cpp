@@ -113,11 +113,25 @@ struct AsyncCatalog::Impl {
         }
     }
 
-    ~Impl() {
-        if (in_flight) {
-            CancelIoEx(directory.Get(), nullptr);
-            WaitForSingleObject(completion_event.Get(), INFINITE);
+    ~Impl() = default;
+
+    [[nodiscard]] bool CancelAndWaitForShutdown(
+        const DWORD timeout_ms) noexcept {
+        if (!in_flight) return true;
+        if (io_status.value.status != kStatusPending) {
+            in_flight = false;
+            return true;
         }
+        if (!CancelIoEx(directory.Get(), nullptr)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_FOUND) return false;
+        }
+        if (WaitForSingleObject(completion_event.Get(), timeout_ms) !=
+            WAIT_OBJECT_0) {
+            return false;
+        }
+        in_flight = false;
+        return true;
     }
 
     [[nodiscard]] bool Submit() {
@@ -206,7 +220,15 @@ struct AsyncCatalog::Impl {
 AsyncCatalog::AsyncCatalog(const std::filesystem::path& initial_image)
     : impl_(std::make_unique<Impl>(initial_image)) {}
 
-AsyncCatalog::~AsyncCatalog() = default;
+AsyncCatalog::~AsyncCatalog() noexcept {
+    constexpr DWORD shutdown_timeout_ms = 5000;
+    if (impl_ && !impl_->CancelAndWaitForShutdown(shutdown_timeout_ms)) {
+        // The kernel may still reference Impl::buffer and io_status. Keep the
+        // entire request alive until process teardown instead of hanging or
+        // freeing storage that an outstanding directory query can still use.
+        (void)impl_.release();
+    }
+}
 
 bool AsyncCatalog::Advance() { return impl_->Advance(); }
 
