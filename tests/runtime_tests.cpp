@@ -2,6 +2,7 @@
 #include "decode_stage.h"
 #include "graphics.h"
 #include "pipeline_runtime.h"
+#include "png_unfilter.h"
 #include "spng_decoder.h"
 #define SPNG_STATIC
 #include "../third_party/libdeflate/libdeflate.h"
@@ -306,6 +307,91 @@ void TestMixedFiltersAndBounds() {
 
     const SyntheticPng mixed = BuildMixedFilterPng(17);
     CheckSyntheticDecode(mixed, mixed.width * 4 + 28);
+}
+
+std::vector<std::uint8_t> ReferencePaethRows(
+    const std::span<const std::uint8_t> filtered,
+    const std::size_t row_bytes, const std::size_t height) {
+    std::vector<std::uint8_t> decoded(row_bytes * height);
+    for (std::size_t row = 0; row < height; ++row) {
+        Check(filtered[row * (row_bytes + 1)] == 4,
+              "Paeth differential input uses filter 4");
+        for (std::size_t column = 0; column < row_bytes; ++column) {
+            const std::uint8_t left = column >= 4
+                ? decoded[row * row_bytes + column - 4]
+                : 0;
+            const std::uint8_t up = row != 0
+                ? decoded[(row - 1) * row_bytes + column]
+                : 0;
+            const std::uint8_t upper_left = row != 0 && column >= 4
+                ? decoded[(row - 1) * row_bytes + column - 4]
+                : 0;
+            decoded[row * row_bytes + column] = static_cast<std::uint8_t>(
+                filtered[row * (row_bytes + 1) + column + 1] +
+                ReferencePaeth(left, up, upper_left));
+        }
+    }
+    return decoded;
+}
+
+void CheckPaethWavefront(const std::size_t row_bytes,
+                         const std::size_t prefix_rows,
+                         const std::size_t batch_rows) {
+    const std::size_t height = prefix_rows + batch_rows;
+    std::vector<std::uint8_t> filtered((row_bytes + 1) * height);
+    for (std::size_t row = 0; row < height; ++row) {
+        filtered[row * (row_bytes + 1)] = 4;
+        for (std::size_t column = 0; column < row_bytes; ++column) {
+            filtered[row * (row_bytes + 1) + column + 1] =
+                static_cast<std::uint8_t>(
+                    row * 97U + column * 53U + (row ^ column) * 29U);
+        }
+    }
+    const std::vector<std::uint8_t> expected =
+        ReferencePaethRows(filtered, row_bytes, height);
+    std::vector<std::uint8_t> actual = filtered;
+    for (std::size_t row = 0; row < prefix_rows; ++row) {
+        std::uint8_t* const destination =
+            actual.data() + row * row_bytes;
+        const std::uint8_t* const previous =
+            row == 0 ? nullptr : destination - row_bytes;
+        Check(pv::png_internal::UnfilterRgba8Row(
+                  destination,
+                  actual.data() + row * (row_bytes + 1) + 1,
+                  previous, row_bytes, 4),
+              "decode Paeth prefix row");
+    }
+    std::vector<std::uint8_t> scratch(height * 7);
+    std::uint8_t* const destination =
+        actual.data() + prefix_rows * row_bytes;
+    const std::uint8_t* const source =
+        actual.data() + prefix_rows * (row_bytes + 1) + 1;
+    if (batch_rows == 4) {
+        pv::png_internal::UnfilterPaethRows4(
+            destination, source, row_bytes, scratch.data());
+    } else {
+        Check(batch_rows == 8, "supported Paeth wavefront batch");
+        pv::png_internal::UnfilterPaethRows8(
+            destination, source, row_bytes, scratch.data());
+    }
+    Check(std::equal(expected.begin(), expected.end(), actual.begin()),
+          "SIMD Paeth wavefront must match scalar reference");
+}
+
+void TestPaethWavefrontDifferential() {
+    for (const std::size_t row_bytes :
+         {4U, 12U, 16U, 20U, 28U, 64U, 68U, 252U, 1028U}) {
+        CheckPaethWavefront(row_bytes, 1, 4);
+        CheckPaethWavefront(row_bytes, 5, 4);
+        CheckPaethWavefront(row_bytes, 1, 8);
+        CheckPaethWavefront(row_bytes, 5, 8);
+    }
+    std::array<std::uint8_t, 4> source{};
+    std::array<std::uint8_t, 4> destination{};
+    Check(!pv::png_internal::UnfilterRgba8Row(
+              destination.data(), source.data(), nullptr,
+              destination.size(), 5),
+          "reject invalid PNG row filter");
 }
 
 void CheckSyntheticDecodeFails(const SyntheticPng& sample,
@@ -660,7 +746,7 @@ void TestRejectedWorkReleasesInput() {
     slots.BeginDecodeInput(compressed_slot);
     slots.BeginDecodeOutput(staging_slot);
 
-    pv::DecodeStage decode_stage(1, pv::DecodeSlotAccess(slots), {});
+    pv::DecodeStage decode_stage(1, pv::DecodeSlotView(slots), {});
     {
         decode_stage.Start(1);
         pv::DecodeWork work{0, 1, compressed_slot, staging_slot};
@@ -1242,6 +1328,7 @@ int wmain(const int argc, wchar_t** const argv) {
         };
         run("spng", TestSpng);
         run("mixed filters and bounds", TestMixedFiltersAndBounds);
+        run("Paeth wavefront differential", TestPaethWavefrontDifferential);
         run("malformed deflate and output bounds",
             TestMalformedDeflateAndOutputBounds);
         run("fused deflate unfilter observability",

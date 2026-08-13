@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pipeline_model.h"
+#include "pipeline_resources.h"
 #include "pipeline_types.h"
 
 namespace pv {
@@ -7,7 +9,6 @@ namespace pv {
 class DecodePipeline;
 class GraphicsPipeline;
 struct PipelineLimits;
-class PipelineModel;
 class PipelineResources;
 class ReservationTable;
 class RuntimeTelemetry;
@@ -18,8 +19,8 @@ class StoragePipeline;
 // decides which frame receives each fixed capacity unit.
 class PipelineScheduler {
 public:
-    PipelineScheduler(const PipelineLimits& limits, PipelineModel& model,
-                      PipelineResources& resources, StoragePipeline& storage,
+    PipelineScheduler(const PipelineLimits& limits, SchedulerModelAccess model,
+                      SchedulerResourceAccess resources, StoragePipeline& storage,
                       DecodePipeline& decode, GraphicsPipeline& graphics,
                       RuntimeTelemetry& telemetry);
 
@@ -39,13 +40,16 @@ private:
     [[nodiscard]] bool SubmitStorageReads();
     void RebuildReservationPlan();
     void ReconcileReservations();
+    void ReconcileGpuReservations();
+    void ReconcileStagingReservations();
+    void ReconcileCompressedReservations();
     [[nodiscard]] bool ReservationActive(const ReservationTable& table,
                                          ReservationId id,
                                          std::size_t frame) const noexcept;
 
     const PipelineLimits& limits_;
-    PipelineModel& model_;
-    PipelineResources& resources_;
+    SchedulerModelAccess model_;
+    SchedulerResourceAccess resources_;
     StoragePipeline& storage_;
     DecodePipeline& decode_;
     GraphicsPipeline& graphics_;

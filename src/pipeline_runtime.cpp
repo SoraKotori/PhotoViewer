@@ -22,8 +22,8 @@ PipelineRuntime::PipelineRuntime(PipelineObserver& observer, const Config& confi
       decode_(limits_, model_, model_.DecodeFrames(), resources_,
               resources_.DecodeAccess(), graphics_, telemetry_,
               config.png_validation),
-      scheduler_(limits_, model_, resources_, storage_, decode_, graphics_,
-                 telemetry_) {}
+      scheduler_(limits_, model_.SchedulerAccess(), resources_.SchedulerAccess(),
+                 storage_, decode_, graphics_, telemetry_) {}
 
 PipelineRuntime::~PipelineRuntime() noexcept {
     decode_.Stop();

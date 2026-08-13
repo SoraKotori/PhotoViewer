@@ -25,9 +25,6 @@ App::~App() {
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
-        ThrowLastError("SetThreadPriority(main)");
-    }
     if (!config_.initial_image.empty()) OpenInitialImage();
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
         GetLastError() != ERROR_ACCESS_DENIED) {

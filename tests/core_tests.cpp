@@ -1,4 +1,6 @@
 #include "config.h"
+#include "catalog_shutdown.h"
+#include "linear_capability.h"
 #include "navigation.h"
 #include "png.h"
 #include "processor_topology.h"
@@ -11,6 +13,7 @@
 #include "resource_slots.h"
 #include "reservation.h"
 #include "runtime_telemetry.h"
+#include "storage_shutdown.h"
 #include "upload_ledger.h"
 #include "work_queue.h"
 
@@ -19,6 +22,7 @@
 #include <array>
 #include <cstdlib>
 #include <iostream>
+#include <type_traits>
 
 namespace {
 
@@ -68,6 +72,27 @@ static_assert(!CanCompletePresentation<pv::StorageCatalogAccess>);
 static_assert(CanCompletePresentation<pv::PresentationCompletionAccess>);
 static_assert(!CanRecordResourcePlan<pv::PresentationCompletionAccess>);
 static_assert(!CanNavigate<const pv::PipelineModel>);
+static_assert(!CanNavigate<pv::SchedulerModelAccess>);
+static_assert(!std::is_copy_constructible_v<pv::StorageFrameAccess>);
+static_assert(!std::is_copy_constructible_v<pv::DecodeFrameAccess>);
+static_assert(!std::is_copy_constructible_v<pv::GraphicsFrameAccess>);
+static_assert(!std::is_copy_constructible_v<pv::StorageCatalogAccess>);
+static_assert(!std::is_copy_constructible_v<pv::PresentationCompletionAccess>);
+static_assert(!std::is_copy_constructible_v<pv::StorageResourceAccess>);
+static_assert(!std::is_copy_constructible_v<pv::DecodeResourceAccess>);
+static_assert(!std::is_copy_constructible_v<pv::GraphicsResourceAccess>);
+static_assert(std::is_move_constructible_v<pv::StorageFrameAccess>);
+static_assert(std::is_move_constructible_v<pv::DecodeFrameAccess>);
+static_assert(std::is_move_constructible_v<pv::GraphicsFrameAccess>);
+static_assert(std::is_move_constructible_v<pv::StorageCatalogAccess>);
+static_assert(std::is_move_constructible_v<pv::PresentationCompletionAccess>);
+static_assert(std::is_move_constructible_v<pv::StorageResourceAccess>);
+static_assert(std::is_move_constructible_v<pv::DecodeResourceAccess>);
+static_assert(std::is_move_constructible_v<pv::GraphicsResourceAccess>);
+static_assert(!std::is_copy_constructible_v<pv::SchedulerModelAccess>);
+static_assert(std::is_move_constructible_v<pv::SchedulerModelAccess>);
+static_assert(!std::is_copy_constructible_v<pv::SchedulerResourceAccess>);
+static_assert(std::is_move_constructible_v<pv::SchedulerResourceAccess>);
 static_assert(pv::ShouldContinuePipelinePass(true, false));
 static_assert(pv::ShouldContinuePipelinePass(false, true));
 static_assert(!pv::ShouldContinuePipelinePass(false, false));
@@ -93,6 +118,141 @@ void ConfigDefaultTests() {
     Check(config.png_validation.chunk_crc == pv::PngChunkCrcMode::All &&
               config.png_validation.adler32,
           "PNG integrity validation must be strict by default");
+}
+
+class CapabilityProbe final : private pv::LinearCapability<int> {
+public:
+    explicit CapabilityProbe(int& target) noexcept : LinearCapability(target) {}
+    CapabilityProbe(CapabilityProbe&&) noexcept = default;
+    CapabilityProbe& operator=(CapabilityProbe&&) = delete;
+    using LinearCapability::IsValid;
+
+    void Set(const int value) { Target() = value; }
+};
+
+void LinearCapabilityTests() {
+    int target = 0;
+    CapabilityProbe source(target);
+    CapabilityProbe destination(std::move(source));
+    Check(!source.IsValid() && destination.IsValid(),
+          "capability move must revoke the source");
+    destination.Set(42);
+    Check(target == 42, "transferred capability must retain authorization");
+
+    bool rejected = false;
+    try {
+        source.Set(7);
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    Check(rejected && target == 42,
+          "moved-from capability must not retain write authorization");
+}
+
+struct FakeShutdownTransport {
+    bool throw_on_cancel = false;
+    std::array<std::optional<pv::IoCompletion>, 2> completions{};
+    std::size_t completion_count = 0;
+    std::size_t next_completion = 0;
+    std::size_t cancellation_count = 0;
+
+    bool RequestCancellation(pv::IoRequest&) {
+        ++cancellation_count;
+        if (throw_on_cancel) throw std::runtime_error("cancel failed");
+        return true;
+    }
+
+    std::optional<pv::IoCompletion> WaitForShutdownCompletion(DWORD) {
+        if (next_completion == completion_count) return std::nullopt;
+        return completions[next_completion++];
+    }
+};
+
+void StorageShutdownTests() {
+    const auto request_at = [](pv::IoRequest* const request) {
+        return [request](const std::size_t index) {
+            return index == 0 ? request : nullptr;
+        };
+    };
+
+    pv::IoRequest normal;
+    normal.header_submitted = true;
+    normal.content_submitted = true;
+    FakeShutdownTransport drained;
+    drained.completions[0] = pv::IoCompletion{
+        &normal, &normal.header_overlapped, ERROR_OPERATION_ABORTED, 0};
+    drained.completions[1] = pv::IoCompletion{
+        &normal, &normal.content_overlapped, ERROR_OPERATION_ABORTED, 0};
+    drained.completion_count = 2;
+    Check(pv::DrainStorageForShutdown(1, request_at(&normal), drained,
+                                      [] { return std::uint64_t{0}; }, 5000) ==
+              pv::StorageShutdownResult::Drained &&
+              normal.header_completed && normal.content_completed,
+          "shutdown must drain every submitted operation exactly once");
+
+    pv::IoRequest cancellation_failure;
+    FakeShutdownTransport failing;
+    failing.throw_on_cancel = true;
+    Check(pv::DrainStorageForShutdown(
+              1, request_at(&cancellation_failure), failing,
+              [] { return std::uint64_t{0}; }, 5000) ==
+              pv::StorageShutdownResult::AbandonBacking,
+          "cancellation failure must preserve kernel-visible backing");
+
+    pv::IoRequest timed_out;
+    timed_out.header_submitted = true;
+    FakeShutdownTransport timeout;
+    std::size_t clock_call = 0;
+    Check(pv::DrainStorageForShutdown(
+              1, request_at(&timed_out), timeout,
+              [&] { return clock_call++ == 0 ? 10ULL : 5010ULL; }, 5000) ==
+              pv::StorageShutdownResult::AbandonBacking,
+          "shutdown timeout must preserve kernel-visible backing");
+
+    pv::IoRequest unexpected;
+    unexpected.header_submitted = true;
+    OVERLAPPED unrelated{};
+    FakeShutdownTransport wrong_completion;
+    wrong_completion.completions[0] = pv::IoCompletion{
+        &unexpected, &unrelated, ERROR_OPERATION_ABORTED, 0};
+    wrong_completion.completion_count = 1;
+    Check(pv::DrainStorageForShutdown(
+              1, request_at(&unexpected), wrong_completion,
+              [] { return std::uint64_t{0}; }, 5000) ==
+              pv::StorageShutdownResult::AbandonBacking,
+          "unexpected completion must not release backing");
+}
+
+void CatalogShutdownTests() {
+    std::size_t cancel_count = 0;
+    std::size_t wait_count = 0;
+    const auto cancel = [&] {
+        ++cancel_count;
+        return true;
+    };
+    const auto wait = [&](const std::uint32_t timeout_ms) {
+        ++wait_count;
+        return timeout_ms == 5000;
+    };
+
+    Check(pv::DrainCatalogQueryForShutdown(false, false, cancel, wait, 5000) &&
+              cancel_count == 0 && wait_count == 0,
+          "inactive catalog query must release without cancellation");
+    Check(pv::DrainCatalogQueryForShutdown(true, false, cancel, wait, 5000) &&
+              cancel_count == 0 && wait_count == 0,
+          "already completed catalog query must release without waiting");
+    Check(pv::DrainCatalogQueryForShutdown(true, true, cancel, wait, 5000) &&
+              cancel_count == 1 && wait_count == 1,
+          "pending catalog query must cancel and drain before release");
+
+    Check(!pv::DrainCatalogQueryForShutdown(
+              true, true, [] { return false; },
+              [](const std::uint32_t) { return true; }, 5000),
+          "catalog cancellation failure must preserve query backing");
+    Check(!pv::DrainCatalogQueryForShutdown(
+              true, true, [] { return true; },
+              [](const std::uint32_t) { return false; }, 5000),
+          "catalog wait timeout must preserve query backing");
 }
 
 std::size_t ProcessorTopologyTests() {
@@ -693,6 +853,9 @@ void ControlledCompletionOrderingTests() {
 }  // namespace
 
 int main() {
+    LinearCapabilityTests();
+    StorageShutdownTests();
+    CatalogShutdownTests();
     ConfigDefaultTests();
     const std::size_t physical_core_count = ProcessorTopologyTests();
     NavigationTests();

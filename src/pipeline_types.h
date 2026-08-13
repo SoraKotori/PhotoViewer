@@ -30,7 +30,7 @@ struct IoRequest;
 class StorageFrameAccess;
 class DecodeFrameAccess;
 class GraphicsFrameAccess;
-class PipelineScheduler;
+class SchedulerModelAccess;
 
 class ImageRecord {
 public:
@@ -62,7 +62,7 @@ public:
 private:
     friend class PipelineModel;
     friend class PipelineRuntime;
-    friend class PipelineScheduler;
+    friend class SchedulerModelAccess;
     friend class StorageFrameAccess;
     friend class DecodeFrameAccess;
     friend class GraphicsFrameAccess;

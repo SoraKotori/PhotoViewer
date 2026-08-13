@@ -80,5 +80,25 @@
     <ClInclude Include="src\work_queue.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\upload_ledger.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\png_unfilter.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\png_paeth_wavefront.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_compressed.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_staging.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_gpu.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_completion.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_submission.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_shutdown.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClInclude Include="src\png_unfilter.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\linear_capability.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\storage_shutdown.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\scheduler_reservation_policy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\catalog_shutdown.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\pipeline_scheduler_gpu.inl"><Filter>Source Files</Filter></None>
+    <None Include="src\pipeline_scheduler_staging.inl"><Filter>Source Files</Filter></None>
+    <None Include="src\pipeline_scheduler_compressed.inl"><Filter>Source Files</Filter></None>
+  </ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest"><Filter>Resource Files</Filter></Manifest></ItemGroup>
 </Project>

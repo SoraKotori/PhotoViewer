@@ -42,7 +42,7 @@ struct CompressedSlot {
     [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_; }
 
 private:
-    friend class DecodeSlotAccess;
+    friend class DecodeSlotView;
     friend class ResourceSlots;
     CompressedBuffer resource_;
     IoRequest io_;
@@ -58,7 +58,7 @@ struct StagingSlot {
     [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_; }
 
 private:
-    friend class DecodeSlotAccess;
+    friend class DecodeSlotView;
     friend class ResourceSlots;
     DecodeStaging resource_;
     std::size_t image_ = 0;
@@ -139,7 +139,7 @@ public:
     [[nodiscard]] std::size_t GpuTextureCount() const noexcept;
 
 private:
-    friend class DecodeSlotAccess;
+    friend class DecodeSlotView;
     friend class StorageResourceAccess;
     friend class DecodeResourceAccess;
     friend class GraphicsResourceAccess;
@@ -185,9 +185,9 @@ private:
 
 // The CPU executor receives only the two resources required by DecodeWork.
 // It cannot mutate slot identity/state or access file-I/O and GPU resources.
-class DecodeSlotAccess {
+class DecodeSlotView {
 public:
-    explicit DecodeSlotAccess(ResourceSlots& slots) noexcept : slots_(slots) {}
+    explicit DecodeSlotView(ResourceSlots& slots) noexcept : slots_(slots) {}
 
     [[nodiscard]] std::span<std::byte> CompressedInput(SlotId id) const;
     [[nodiscard]] DecodeSurface& DecodeOutput(SlotId id) const;

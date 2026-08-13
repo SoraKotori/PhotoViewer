@@ -8,6 +8,8 @@
 #include "runtime_telemetry.h"
 #include "win32_support.h"
 
+#include <utility>
+
 namespace pv {
 DecodePipeline::DecodePipeline(const PipelineLimits& limits,
                                const PipelineModel& model,
@@ -17,9 +19,10 @@ DecodePipeline::DecodePipeline(const PipelineLimits& limits,
                                GraphicsPipeline& graphics,
                                RuntimeTelemetry& telemetry,
                                const PngValidationOptions validation)
-    : limits_(limits), model_(model), frames_(frames), resources_(resources),
-      slots_(slots), graphics_(graphics), telemetry_(telemetry),
-      workers_(limits.staging_slot_count, slots.WorkerAccess(), validation) {}
+    : limits_(limits), model_(model), frames_(std::move(frames)),
+      resources_(resources), slots_(std::move(slots)), graphics_(graphics),
+      telemetry_(telemetry),
+      workers_(limits.staging_slot_count, slots_.WorkerView(), validation) {}
 
 void DecodePipeline::Start(const std::size_t worker_count) {
     workers_.Start(worker_count);
@@ -156,7 +159,8 @@ void DecodePipeline::PrepareStaging(const std::size_t index) {
 
 void DecodePipeline::DispatchEligible() {
     for (const std::size_t index : model_.ReservationPlan().PriorityOrder()) {
-        if (DeterminePipelineStage(index, frames_.View(index), resources_,
+        if (DeterminePipelineStage(index, frames_.View(index),
+                                   resources_.SlotsView(),
                                    model_.ReservationPlan()) !=
             PipelineStage::CompressedReady) {
             continue;
