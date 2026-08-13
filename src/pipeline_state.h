@@ -4,7 +4,7 @@
 
 namespace pv {
 
-class PipelineResources;
+class ResourceSlots;
 class ReservationPlanner;
 class ReservationTable;
 
@@ -23,7 +23,7 @@ class ReservationTable;
 
 [[nodiscard]] PipelineStage DeterminePipelineStage(
     std::size_t frame, const ImageRecord& image,
-    const PipelineResources& resources,
+    const ResourceSlots& slots,
     const ReservationPlanner& reservations) noexcept;
 
 }  // namespace pv

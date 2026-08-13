@@ -8,6 +8,8 @@
 #include "viewer_window.h"
 #include "win32_support.h"
 
+#include <utility>
+
 namespace pv {
 namespace {
 
@@ -30,9 +32,9 @@ GraphicsPipeline::GraphicsPipeline(const PipelineLimits& limits,
                                    PipelineObserver& observer,
                                    ViewerWindow& window)
     : limits_(limits), model_(model),
-      presentation_completion_(presentation_completion), frames_(frames),
-      resources_(resources),
-      slots_(slots), observer_(observer), window_(window),
+      presentation_completion_(std::move(presentation_completion)),
+      frames_(std::move(frames)), resources_(resources),
+      slots_(std::move(slots)), observer_(observer), window_(window),
       uploads_(limits.staging_slot_count),
       gpu_budget_(limits.GpuSlotCount(), limits.gpu_cache_bytes) {}
 
@@ -154,7 +156,8 @@ bool GraphicsPipeline::HasReadableTexture(const std::size_t frame) const noexcep
 void GraphicsPipeline::SubmitEligibleUploads() {
     if (!upload_ready_) return;
     for (const std::size_t index : model_.ReservationPlan().PriorityOrder()) {
-        if (DeterminePipelineStage(index, frames_.View(index), resources_,
+        if (DeterminePipelineStage(index, frames_.View(index),
+                                   resources_.SlotsView(),
                                    model_.ReservationPlan()) !=
             PipelineStage::DecodedStagingAvailable) {
             continue;

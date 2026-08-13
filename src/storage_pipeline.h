@@ -5,6 +5,7 @@
 #include "pipeline_model.h"
 #include "pipeline_resources.h"
 
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -46,6 +47,12 @@ public:
     void ClearHeaderReadyFrames() noexcept;
 
 private:
+    struct ReadSubmission {
+        DWORD result = ERROR_SUCCESS;
+        DWORD transferred = 0;
+        bool completed = false;
+    };
+
     void OnCompletion(IoRequest* request, OVERLAPPED* overlapped,
                       DWORD result, ULONG_PTR transferred);
     void OnHeaderReady(IoRequest* request, DWORD result,
@@ -53,6 +60,17 @@ private:
     void OnContentReady(IoRequest* request, DWORD result,
                         ULONG_PTR transferred);
     void FinishRead(IoRequest* request);
+    [[nodiscard]] HANDLE OpenReadFile(std::size_t frame);
+    [[nodiscard]] std::optional<std::size_t> PlanReadTransfer(
+        std::size_t frame, HANDLE file);
+    [[nodiscard]] bool PrepareRead(std::size_t frame,
+                                   bool initial_content);
+    [[nodiscard]] bool PrepareEligibleReads();
+    [[nodiscard]] ReadSubmission SubmitRead(
+        IoRequest& request, OVERLAPPED& overlapped,
+        DWORD buffer_offset, DWORD bytes, std::uint64_t file_offset);
+    [[nodiscard]] bool SubmitPreparedRead(std::size_t frame);
+    [[nodiscard]] bool SubmitPreparedReads();
 
     const PipelineLimits& limits_;
     const PipelineModel& model_;

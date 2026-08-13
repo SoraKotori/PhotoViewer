@@ -11,7 +11,7 @@ namespace pv {
 class DecoderPool {
 public:
     DecoderPool(std::size_t worker_count, WorkQueue& work_queue,
-                CompletionQueue& completion_queue, DecodeSlotAccess& slots,
+                CompletionQueue& completion_queue, DecodeSlotView& slots,
                 PngValidationOptions validation);
     ~DecoderPool();
 
@@ -43,7 +43,7 @@ private:
 
     WorkQueue& work_queue_;
     CompletionQueue& completion_queue_;
-    DecodeSlotAccess& slots_;
+    DecodeSlotView& slots_;
     const PngValidationOptions validation_;
     // Constructed once at the configured size and never resized. This keeps
     // the runtime-sized, cache-line-aligned sequence off the main stack.

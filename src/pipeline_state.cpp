@@ -1,6 +1,6 @@
 #include "pipeline_state.h"
 
-#include "pipeline_resources.h"
+#include "resource_slots.h"
 #include "reservation_planner.h"
 
 namespace pv {
@@ -13,10 +13,9 @@ bool IsReservationActive(const ReservationTable& table,
 
 PipelineStage DeterminePipelineStage(
     const std::size_t frame, const ImageRecord& image,
-    const PipelineResources& resources,
+    const ResourceSlots& slots,
     const ReservationPlanner& reservations) noexcept {
     if (image.Failed()) return PipelineStage::Failed;
-    const ResourceSlots& slots = resources.SlotsView();
     if (image.GpuTextureReservation() != kInvalidReservation &&
         image.GpuTextureReservation() < slots.GpuTextureCount()) {
         const GpuTextureSlot& gpu_texture =

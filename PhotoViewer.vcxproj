@@ -37,6 +37,33 @@
   </ItemGroup>
   <ItemGroup><ProjectReference Include="PhotoViewer.PngCodec.vcxproj"><Project>{55A9D4F1-5B69-4D89-AE99-80361473B839}</Project></ProjectReference></ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest" /></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_unfilter.cpp" /></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_paeth_wavefront.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\resource_slots_compressed.cpp" />
+    <ClCompile Include="src\resource_slots_staging.cpp" />
+    <ClCompile Include="src\resource_slots_gpu.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\storage_pipeline_completion.cpp" />
+    <ClCompile Include="src\storage_pipeline_submission.cpp" />
+    <ClCompile Include="src\storage_pipeline_shutdown.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\pipeline_scheduler_gpu.inl" />
+    <None Include="src\pipeline_scheduler_staging.inl" />
+    <None Include="src\pipeline_scheduler_compressed.inl" />
+  </ItemGroup>
+  <ItemGroup><ClInclude Include="src\png_unfilter.h" /></ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\linear_capability.h" />
+    <ClInclude Include="src\storage_shutdown.h" />
+    <ClInclude Include="src\scheduler_reservation_policy.h" />
+    <ClInclude Include="src\catalog_shutdown.h" />
+  </ItemGroup>
+  <Target Name="CheckThreadPriorityPolicy" AfterTargets="Link">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\check-thread-priority.ps1&quot; -ProjectRoot &quot;$(ProjectDir).&quot; -Binary &quot;$(TargetPath)&quot; -Dumpbin &quot;$(VCToolsInstallDir)bin\Hostx64\x64\dumpbin.exe&quot;" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ItemGroup><ClInclude Include="src\pipeline_scheduler.h" /></ItemGroup>
 </Project>

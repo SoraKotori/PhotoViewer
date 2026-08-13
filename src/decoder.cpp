@@ -17,7 +17,7 @@ std::size_t ValidateWorkerCount(const std::size_t worker_count) {
 
 DecoderPool::DecoderPool(const std::size_t worker_count, WorkQueue& work_queue,
                          CompletionQueue& completion_queue,
-                         DecodeSlotAccess& slots,
+                         DecodeSlotView& slots,
                          const PngValidationOptions validation)
     : work_queue_(work_queue), completion_queue_(completion_queue), slots_(slots),
       validation_(validation),

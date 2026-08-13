@@ -13,6 +13,10 @@ $output = Join-Path $projectRoot 'x64\Release'
 & $msbuild $solution /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal
 if ($LASTEXITCODE -ne 0) { throw "Release build failed: $LASTEXITCODE" }
 
+& (Join-Path $PSScriptRoot 'check-thread-priority.ps1') `
+    -ProjectRoot $projectRoot `
+    -Binary (Join-Path $output 'PhotoViewer.exe')
+
 & (Join-Path $output 'PhotoViewer.CoreTests.exe')
 if ($LASTEXITCODE -ne 0) { throw "Core tests failed: $LASTEXITCODE" }
 

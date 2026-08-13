@@ -4,7 +4,7 @@
 
 namespace pv {
 
-DecodeStage::DecodeStage(const std::size_t capacity, DecodeSlotAccess slots,
+DecodeStage::DecodeStage(const std::size_t capacity, DecodeSlotView slots,
                          const PngValidationOptions validation)
     : work_queue_(capacity), completion_queue_(capacity),
       completion_batch_(capacity),

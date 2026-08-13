@@ -1,5 +1,6 @@
 #include "catalog.h"
 
+#include "catalog_shutdown.h"
 #include "win32_support.h"
 #include "win32_handle.h"
 
@@ -117,21 +118,19 @@ struct AsyncCatalog::Impl {
 
     [[nodiscard]] bool CancelAndWaitForShutdown(
         const DWORD timeout_ms) noexcept {
-        if (!in_flight) return true;
-        if (io_status.value.status != kStatusPending) {
-            in_flight = false;
-            return true;
-        }
-        if (!CancelIoEx(directory.Get(), nullptr)) {
-            const DWORD error = GetLastError();
-            if (error != ERROR_NOT_FOUND) return false;
-        }
-        if (WaitForSingleObject(completion_event.Get(), timeout_ms) !=
-            WAIT_OBJECT_0) {
-            return false;
-        }
-        in_flight = false;
-        return true;
+        const bool drained = DrainCatalogQueryForShutdown(
+            in_flight, io_status.value.status == kStatusPending,
+            [&] {
+                if (CancelIoEx(directory.Get(), nullptr)) return true;
+                return GetLastError() == ERROR_NOT_FOUND;
+            },
+            [&](const std::uint32_t remaining_ms) {
+                return WaitForSingleObject(completion_event.Get(),
+                                           remaining_ms) == WAIT_OBJECT_0;
+            },
+            timeout_ms);
+        if (drained) in_flight = false;
+        return drained;
     }
 
     [[nodiscard]] bool Submit() {
