@@ -39,6 +39,8 @@
 | 參數 | 預設值 | 意義 |
 |---|---:|---|
 | `--workers=` | 實體核心數，最多 8 | Worker thread 數量 |
+| `--png-chunk-crc=` | `all` | PNG chunk CRC：`all`、`critical`、`non-idat` 或 `none` |
+| `--png-adler32=` | `on` | zlib Adler-32 驗證：`on` 或 `off` |
 | `--compressed-budget-mib=` | 無限制 | 壓縮 PNG Slot Storage 記憶體上限 |
 | `--compressed-slot-count=` | 10 | 壓縮 PNG slot 數量上限 |
 | `--staging-cache-mib=` | 無限制 | 解碼 staging texture Slot Storage 記憶體上限 |

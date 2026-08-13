@@ -23,7 +23,11 @@ param(
     [ValidateRange(0, 1000)]
     [int]$NavigationIntervalMs = 0,
     [ValidateRange(0.01, 1000.0)]
-    [double]$TargetFps = 30.0
+    [double]$TargetFps = 30.0,
+    [ValidateSet('all', 'critical', 'non-idat', 'none')]
+    [string]$PngChunkCrc = 'all',
+    [ValidateSet('on', 'off')]
+    [string]$PngAdler32 = 'on'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,6 +134,7 @@ foreach ($file in $usedFiles) {
 
 $navigation = $Direction * $Steps
 $inputMode = if ($ShortPresses) { 'short' } else { 'hold' }
+$pngValidationMode = "$PngChunkCrc-$PngAdler32"
 $measurements = @()
 $injectionMeasurements = @()
 $tailMeasurements = @()
@@ -143,7 +148,7 @@ $maximumLatenessMeasurements = @()
 $maximumReadyLatenessMeasurements = @()
 $lateReadyCountMeasurements = @()
 for ($run = 1; $run -le $Runs; ++$run) {
-    $report = Join-Path $resultDirectory "performance-report-$Direction-$inputMode-$run.txt"
+    $report = Join-Path $resultDirectory "performance-report-$Direction-$inputMode-$pngValidationMode-$run.txt"
     $arguments = @(
         ('"' + $sample + '"'),
         "--workers=$Workers",
@@ -151,6 +156,8 @@ for ($run = 1; $run -le $Runs; ++$run) {
         "--gpu-forward-slot-count=$GpuForwardSlots",
         "--gpu-reverse-slot-count=$GpuReverseSlots",
         "--compressed-slot-count=$CompressedSlots",
+        "--png-chunk-crc=$PngChunkCrc",
+        "--png-adler32=$PngAdler32",
         "--validation-navigation=$navigation",
         "--validation-report=$report",
         '--validation-elapsed-exit-code',
@@ -320,6 +327,8 @@ $average = ($measurements | Measure-Object -Average).Average
     CompressedSlots = $CompressedSlots
     Direction = $Direction
     InputMode = $inputMode
+    PngChunkCrc = $PngChunkCrc
+    PngAdler32 = $PngAdler32
     StepsPerRun = $Steps
     WarmupMs = $WarmupMs
     NavigationIntervalMs = $NavigationIntervalMs

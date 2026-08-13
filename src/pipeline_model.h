@@ -103,7 +103,8 @@ private:
 // mutations from turning a read-only model dependency into a global backdoor.
 class StorageCatalogAccess {
 public:
-    void RecordHeader(std::size_t index, const PngInfo& png) const;
+    void RecordResourcePlan(std::size_t index,
+                            const PngResourcePlan& plan) const;
     void RecordFileSize(std::size_t index, std::uint64_t bytes) const;
     void MarkReservationPlanDirty() const noexcept;
 
@@ -139,7 +140,8 @@ public:
     void ReleaseNavigation(int direction);
     void CompletePresentation(std::size_t index);
     void MarkReservationPlanDirty() noexcept;
-    void RecordHeader(std::size_t index, const PngInfo& png);
+    void RecordResourcePlan(std::size_t index,
+                            const PngResourcePlan& plan);
     void RecordFileSize(std::size_t index, std::uint64_t bytes);
 
     [[nodiscard]] const Catalog& CatalogData() const noexcept { return catalog_; }
@@ -195,9 +197,9 @@ private:
     ReservationPlanner reservations_;
 };
 
-inline void StorageCatalogAccess::RecordHeader(
-    const std::size_t index, const PngInfo& png) const {
-    model_->RecordHeader(index, png);
+inline void StorageCatalogAccess::RecordResourcePlan(
+    const std::size_t index, const PngResourcePlan& plan) const {
+    model_->RecordResourcePlan(index, plan);
 }
 
 inline void StorageCatalogAccess::RecordFileSize(

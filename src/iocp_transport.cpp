@@ -90,16 +90,16 @@ std::size_t IocpTransport::DrainAvailable(
     return removed;
 }
 
-IoCompletion IocpTransport::WaitForShutdownCompletion() {
+std::optional<IoCompletion> IocpTransport::WaitForShutdownCompletion(
+    const DWORD timeout_ms) noexcept {
     DWORD transferred = 0;
     ULONG_PTR completion_key = 0;
     OVERLAPPED* overlapped = nullptr;
     const BOOL completed = GetQueuedCompletionStatus(
         completion_port_.Get(), &transferred, &completion_key, &overlapped,
-        INFINITE);
+        timeout_ms);
     if (!overlapped) {
-        if (!completed) ThrowLastError("GetQueuedCompletionStatus(shutdown)");
-        throw std::runtime_error("IOCP returned an empty shutdown completion");
+        return std::nullopt;
     }
     OVERLAPPED_ENTRY entry{};
     entry.lpCompletionKey = completion_key;
@@ -107,6 +107,11 @@ IoCompletion IocpTransport::WaitForShutdownCompletion() {
     entry.dwNumberOfBytesTransferred = transferred;
     entry.Internal = completed ? 0 : 1;
     return ResolveCompletion(entry);
+}
+
+void IocpTransport::AbandonForProcessExit() noexcept {
+    (void)completion_port_.Release();
+    (void)completion_event_.Release();
 }
 
 void IocpTransport::Associate(const HANDLE file, IoRequest& request) {

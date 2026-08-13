@@ -488,4 +488,12 @@ DecodeSurface& DecodeSlotAccess::DecodeOutput(const SlotId id) const {
     return slot.resource_.surface;
 }
 
+const PngResourcePlan& DecodeSlotAccess::ExpectedPng(const SlotId id) const {
+    StagingSlot& slot = slots_.MutableStaging(id);
+    ResourceSlots::RequireState(slot.state_,
+                                StagingSlotState::DecodeOutputActive,
+                                "access expected PNG plan");
+    return slot.resource_.resource_plan;
+}
+
 }  // namespace pv

@@ -174,14 +174,8 @@ void GraphicsPipeline::SubmitEligibleUploads() {
             slots_.StagingResource(image.StagingSlot());
         GpuImage& gpu_resource =
             slots_.GpuResource(image.GpuTextureReservation());
-        const std::size_t bytes = staging.surface.ByteSize();
-        if (bytes == 0 || bytes > limits_.gpu_cache_bytes) {
-            const SlotId staging_slot = image.StagingSlot();
-            slots_.ReleaseStaging(staging_slot);
-            frames_.ClearStagingSlot(index, staging_slot);
-            frames_.MarkFailed(index);
-            continue;
-        }
+        const std::size_t bytes =
+            staging.resource_plan.gpu_reservation_bytes;
         const SlotId gpu_slot = image.GpuTextureReservation();
         if (!MakeGpuBytesAvailable(gpu_slot, bytes)) continue;
         if (staging.cpu_surface) {
@@ -280,16 +274,12 @@ void GraphicsPipeline::ArmOldestFence() {
     }
 }
 
-void GraphicsPipeline::PrepareDecodeStaging(DecodeStaging& staging,
-                                            const UINT width,
-                                            const UINT height) {
-    graphics_.PrepareDecodeStaging(staging, width, height);
+void GraphicsPipeline::PrepareDecodeStaging(DecodeStaging& staging) {
+    graphics_.PrepareDecodeStaging(staging);
 }
 
-void GraphicsPipeline::MapDecodeStaging(DecodeStaging& staging,
-                                        const UINT width, const UINT height,
-                                        const std::size_t decoded_bytes) {
-    graphics_.MapDecodeStaging(staging, width, height, decoded_bytes);
+void GraphicsPipeline::MapDecodeStaging(DecodeStaging& staging) {
+    graphics_.MapDecodeStaging(staging);
 }
 
 void GraphicsPipeline::UnmapDecodeStaging(DecodeStaging& staging) {
@@ -309,10 +299,16 @@ bool GraphicsPipeline::ReservationActive(const ReservationTable& table,
 void GraphicsPipeline::DrainForShutdown() noexcept {
     if (!upload_ready_) return;
     try {
+        constexpr ULONGLONG shutdown_timeout_ms = 5000;
+        const ULONGLONG deadline = GetTickCount64() + shutdown_timeout_ms;
         while (!uploads_.Empty() || presentation_.DrawFence() != 0) {
             ArmOldestFence();
             const HANDLE event = graphics_.FenceEvent();
-            if (!event || WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0) {
+            const ULONGLONG now = GetTickCount64();
+            if (!event || now >= deadline ||
+                WaitForSingleObject(
+                    event, static_cast<DWORD>(deadline - now)) !=
+                    WAIT_OBJECT_0) {
                 break;
             }
             (void)HandleGpuCompletion();

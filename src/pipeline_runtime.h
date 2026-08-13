@@ -26,7 +26,7 @@ public:
     PipelineRuntime(PipelineObserver& observer, const Config& config,
                     ViewerWindow& window,
                     RuntimeTelemetry* telemetry = nullptr);
-    ~PipelineRuntime();
+    ~PipelineRuntime() noexcept;
 
     PipelineRuntime(const PipelineRuntime&) = delete;
     PipelineRuntime& operator=(const PipelineRuntime&) = delete;

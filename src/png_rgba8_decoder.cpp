@@ -16,6 +16,13 @@
 
 namespace pv {
 namespace {
+std::uint32_t ReadBigEndian32(const std::uint8_t* const data) noexcept {
+    return (static_cast<std::uint32_t>(data[0]) << 24U) |
+           (static_cast<std::uint32_t>(data[1]) << 16U) |
+           (static_cast<std::uint32_t>(data[2]) << 8U) |
+           static_cast<std::uint32_t>(data[3]);
+}
+
 void CopyForward(std::byte* const destination, const std::byte* const source,
                  const std::size_t bytes) noexcept {
     std::size_t offset = 0;
@@ -848,12 +855,114 @@ private:
 };
 
 template <bool TrackTimings>
+class ChecksummedUnfilter final {
+public:
+    ChecksummedUnfilter(std::byte* const bytes, const std::size_t row_bytes,
+                        const std::uint32_t height,
+                        PngDecodeTimings* const timings,
+                        const std::span<std::uint8_t> scratch) noexcept
+        : unfilter_(bytes, row_bytes, height, timings, scratch),
+          base_(reinterpret_cast<std::uint8_t*>(bytes)),
+          scanline_bytes_(row_bytes + 1),
+          height_(height) {}
+
+    [[nodiscard]] bool ProcessSafePrefix(const std::size_t safe_output_bytes,
+                                         const bool during_deflate) noexcept {
+        if (safe_output_bytes > scanline_bytes_ * height_) return false;
+        const std::uint32_t available_rows = std::min<std::uint32_t>(
+            height_, static_cast<std::uint32_t>(
+                         safe_output_bytes / scanline_bytes_));
+        constexpr std::uint32_t checksum_batch_rows = 8;
+        while (checksum_rows_ < available_rows) {
+            const std::uint32_t batch_end = std::min(
+                available_rows, checksum_rows_ + checksum_batch_rows);
+            const std::size_t checksum_end =
+                static_cast<std::size_t>(batch_end) * scanline_bytes_;
+            adler32_ = libdeflate_adler32(
+                adler32_, base_ + checksum_bytes_,
+                checksum_end - checksum_bytes_);
+            checksum_bytes_ = checksum_end;
+            checksum_rows_ = batch_end;
+            if (!unfilter_.ProcessSafePrefix(checksum_end, during_deflate)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::uint32_t RowsProcessed() const noexcept {
+        return unfilter_.RowsProcessed();
+    }
+
+    [[nodiscard]] bool OwnsOutput(const void* const output) const noexcept {
+        return unfilter_.OwnsOutput(output);
+    }
+
+    [[nodiscard]] std::uint32_t Adler32() const noexcept {
+        return adler32_;
+    }
+
+private:
+    FusedUnfilter<TrackTimings> unfilter_;
+    std::uint8_t* base_ = nullptr;
+    std::size_t scanline_bytes_ = 0;
+    std::size_t checksum_bytes_ = 0;
+    std::uint32_t height_ = 0;
+    std::uint32_t checksum_rows_ = 0;
+    std::uint32_t adler32_ = 1;
+};
+
+template <bool TrackTimings, typename Unfilter>
 int FusedUnfilterCallback(void* const opaque, void* const output,
                           const std::size_t safe_output_bytes,
                           const int final) noexcept {
-    auto* const unfilter = static_cast<FusedUnfilter<TrackTimings>*>(opaque);
+    auto* const unfilter = static_cast<Unfilter*>(opaque);
     if (!unfilter || !unfilter->OwnsOutput(output)) return 1;
     return unfilter->ProcessSafePrefix(safe_output_bytes, final == 0) ? 0 : 1;
+}
+
+struct FusedDecodeResult {
+    libdeflate_result status = LIBDEFLATE_BAD_DATA;
+    std::uint32_t rows = 0;
+    std::uint32_t adler32 = 1;
+    std::size_t consumed_bytes = 0;
+    std::size_t produced_bytes = 0;
+};
+
+template <bool TrackTimings, bool ValidateAdler>
+FusedDecodeResult RunFusedDecode(
+    libdeflate_decompressor* const decompressor,
+    const std::uint8_t* const deflate, const std::size_t deflate_bytes,
+    DecodeSurface& surface, const std::size_t filtered_bytes,
+    const std::size_t callback_interval, const std::size_t row_bytes,
+    PngDecodeTimings* const timings,
+    const std::span<std::uint8_t> scratch) noexcept {
+    FusedDecodeResult decoded;
+    if constexpr (ValidateAdler) {
+        ChecksummedUnfilter<TrackTimings> unfilter(
+            surface.pixels, row_bytes, surface.height,
+            TrackTimings ? timings : nullptr, scratch);
+        decoded.status = libdeflate_deflate_decompress_ex_callback(
+            decompressor, deflate, deflate_bytes, surface.pixels,
+            filtered_bytes, callback_interval,
+            FusedUnfilterCallback<TrackTimings,
+                                  ChecksummedUnfilter<TrackTimings>>,
+            &unfilter, &decoded.consumed_bytes, &decoded.produced_bytes);
+        decoded.rows = unfilter.RowsProcessed();
+        decoded.adler32 = unfilter.Adler32();
+    } else {
+        FusedUnfilter<TrackTimings> unfilter(
+            surface.pixels, row_bytes, surface.height,
+            TrackTimings ? timings : nullptr, scratch);
+        decoded.status = libdeflate_deflate_decompress_ex_callback(
+            decompressor, deflate, deflate_bytes, surface.pixels,
+            filtered_bytes, callback_interval,
+            FusedUnfilterCallback<TrackTimings,
+                                  FusedUnfilter<TrackTimings>>,
+            &unfilter, &decoded.consumed_bytes, &decoded.produced_bytes);
+        decoded.rows = unfilter.RowsProcessed();
+    }
+    return decoded;
 }
 
 bool ExpandRowsToPitch(DecodeSurface& surface) noexcept {
@@ -875,6 +984,7 @@ bool ExpandRowsToPitch(DecodeSurface& surface) noexcept {
 
 HRESULT DecodeRgba8Scanlines(
     const std::span<const std::byte> zlib_stream, DecodeSurface& surface,
+    const bool validate_adler32,
     const InputConsumedCallback input_consumed,
     void* const callback_context,
     PngDecodeTimings* const timings) noexcept {
@@ -906,6 +1016,7 @@ HRESULT DecodeRgba8Scanlines(
         decompressor(libdeflate_alloc_decompressor());
     if (!decompressor) return E_OUTOFMEMORY;
     constexpr std::size_t minimum_callback_interval = 32 * 1024;
+    constexpr std::size_t checksum_locality_rows = 64;
     constexpr std::size_t cache_local_batch_bytes = 8 * 1024 * 1024;
     const std::size_t scanline_bytes = row_bytes + 1;
     const std::size_t cache_local_batch =
@@ -920,6 +1031,10 @@ HRESULT DecodeRgba8Scanlines(
     const std::size_t callback_interval = std::max(
         scanline_bytes,
         std::max(minimum_callback_interval, wide_batch));
+    // Checksum and unfilter strict-mode output while it is cache-local.
+    const std::size_t decode_callback_interval = validate_adler32
+        ? scanline_bytes * checksum_locality_rows
+        : callback_interval;
     const auto deflate_begin = timings ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
     thread_local std::vector<std::uint8_t> wavefront_scratch;
@@ -932,33 +1047,38 @@ HRESULT DecodeRgba8Scanlines(
             return E_OUTOFMEMORY;
         }
     }
-    libdeflate_result result = LIBDEFLATE_BAD_DATA;
-    std::uint32_t rows_processed = 0;
-    if (timings) {
-        FusedUnfilter<true> unfilter(
-            surface.pixels, row_bytes, surface.height, timings,
-            std::span<std::uint8_t>(wavefront_scratch));
-        result = libdeflate_deflate_decompress_ex_callback(
-            decompressor.get(), zlib + 2, zlib_stream.size() - 6, surface.pixels,
-            filtered_bytes, callback_interval, FusedUnfilterCallback<true>,
-            &unfilter, nullptr, nullptr);
-        rows_processed = unfilter.RowsProcessed();
-    } else {
-        FusedUnfilter<false> unfilter(
-            surface.pixels, row_bytes, surface.height, nullptr,
-            std::span<std::uint8_t>(wavefront_scratch));
-        result = libdeflate_deflate_decompress_ex_callback(
-            decompressor.get(), zlib + 2, zlib_stream.size() - 6, surface.pixels,
-            filtered_bytes, callback_interval, FusedUnfilterCallback<false>,
-            &unfilter, nullptr, nullptr);
-        rows_processed = unfilter.RowsProcessed();
-    }
+    const std::span<std::uint8_t> scratch(wavefront_scratch);
+    const FusedDecodeResult decoded = timings
+        ? (validate_adler32
+               ? RunFusedDecode<true, true>(
+                     decompressor.get(), zlib + 2, zlib_stream.size() - 6,
+                     surface, filtered_bytes, decode_callback_interval, row_bytes,
+                     timings, scratch)
+               : RunFusedDecode<true, false>(
+                     decompressor.get(), zlib + 2, zlib_stream.size() - 6,
+                     surface, filtered_bytes, decode_callback_interval, row_bytes,
+                     timings, scratch))
+        : (validate_adler32
+               ? RunFusedDecode<false, true>(
+                     decompressor.get(), zlib + 2, zlib_stream.size() - 6,
+                     surface, filtered_bytes, decode_callback_interval, row_bytes,
+                     nullptr, scratch)
+               : RunFusedDecode<false, false>(
+                     decompressor.get(), zlib + 2, zlib_stream.size() - 6,
+                     surface, filtered_bytes, decode_callback_interval, row_bytes,
+                     nullptr, scratch));
     if (timings) {
         timings->deflate_nanoseconds = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - deflate_begin).count());
     }
-    if (result != LIBDEFLATE_SUCCESS || rows_processed != surface.height) {
+    const std::uint32_t expected_adler = ReadBigEndian32(
+        zlib + zlib_stream.size() - 4);
+    if (decoded.status != LIBDEFLATE_SUCCESS ||
+        decoded.consumed_bytes != zlib_stream.size() - 6 ||
+        decoded.produced_bytes != filtered_bytes ||
+        decoded.rows != surface.height ||
+        (validate_adler32 && decoded.adler32 != expected_adler)) {
         return WINCODEC_ERR_BADIMAGE;
     }
 

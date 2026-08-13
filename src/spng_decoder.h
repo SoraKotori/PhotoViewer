@@ -1,6 +1,8 @@
 #pragma once
 
 #include "decode_surface.h"
+#include "png.h"
+#include "png_validation.h"
 
 #include <windows.h>
 
@@ -28,6 +30,8 @@ struct PngDecodeTimings {
 
 HRESULT DecodePngSpng(std::span<std::byte> compressed,
                       DecodeSurface& surface,
+                      const PngResourcePlan& expected,
+                      PngValidationOptions validation,
                       InputConsumedCallback input_consumed = nullptr,
                       void* callback_context = nullptr,
                       PngDecodeTimings* timings = nullptr) noexcept;

@@ -4,16 +4,18 @@
 
 namespace pv {
 
-DecodeStage::DecodeStage(const std::size_t capacity, DecodeSlotAccess slots)
+DecodeStage::DecodeStage(const std::size_t capacity, DecodeSlotAccess slots,
+                         const PngValidationOptions validation)
     : work_queue_(capacity), completion_queue_(capacity),
       completion_batch_(capacity),
-      slots_(slots) {}
+      slots_(slots), validation_(validation) {}
 
 DecodeStage::~DecodeStage() { Stop(); }
 
 void DecodeStage::Start(const std::size_t worker_count) {
     if (workers_) throw std::logic_error("decoder workers already started");
-    workers_.emplace(worker_count, work_queue_, completion_queue_, slots_);
+    workers_.emplace(worker_count, work_queue_, completion_queue_, slots_,
+                     validation_);
 }
 
 void DecodeStage::Stop() noexcept { workers_.reset(); }

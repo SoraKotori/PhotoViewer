@@ -4,6 +4,7 @@
 #include "pipeline_runtime.h"
 #include "spng_decoder.h"
 #define SPNG_STATIC
+#include "../third_party/libdeflate/libdeflate.h"
 #include "../third_party/libspng/spng.h"
 #include "../third_party/zlib-ng/zlib.h"
 
@@ -20,12 +21,36 @@
 #include <numeric>
 #include <span>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
 
+static_assert(std::is_nothrow_destructible_v<pv::AsyncCatalog>);
+static_assert(std::is_nothrow_destructible_v<pv::StoragePipeline>);
+static_assert(std::is_nothrow_destructible_v<pv::PipelineRuntime>);
+
 void Check(const bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+pv::PngResourcePlan ParsePlan(const std::span<const std::byte> png) {
+    const auto plan = pv::ParsePngResourcePlan(png);
+    Check(plan.has_value(), "test PNG must have a valid resource header");
+    return *plan;
+}
+
+pv::PngResourcePlan TestRgba8Plan(const std::uint32_t width,
+                                  const std::uint32_t height) {
+    const std::uint32_t row_bytes = width * 4;
+    const std::uint32_t decoded_bytes = row_bytes * height;
+    const std::uint32_t workspace = row_bytes + height;
+    const std::uint32_t extra_rows =
+        (height + row_bytes - 1) / row_bytes;
+    return pv::PngResourcePlan{
+        width, height, row_bytes, decoded_bytes, workspace,
+        decoded_bytes + workspace, width, height + extra_rows,
+        decoded_bytes, 8, 6, 0};
 }
 
 std::uint32_t ReadBigEndian(const std::byte* data);
@@ -45,6 +70,31 @@ void AppendBigEndian(std::vector<std::byte>& output, const std::uint32_t value) 
     output.push_back(std::byte{static_cast<std::uint8_t>(value >> 16)});
     output.push_back(std::byte{static_cast<std::uint8_t>(value >> 8)});
     output.push_back(std::byte{static_cast<std::uint8_t>(value)});
+}
+
+void WriteBigEndian(std::vector<std::byte>& output, const std::size_t offset,
+                    const std::uint32_t value) {
+    Check(output.size() >= 4 && offset <= output.size() - 4,
+          "write synthetic big-endian value");
+    output[offset] = std::byte{static_cast<std::uint8_t>(value >> 24)};
+    output[offset + 1] = std::byte{static_cast<std::uint8_t>(value >> 16)};
+    output[offset + 2] = std::byte{static_cast<std::uint8_t>(value >> 8)};
+    output[offset + 3] = std::byte{static_cast<std::uint8_t>(value)};
+}
+
+void RefreshChunkCrc(std::vector<std::byte>& png,
+                     const std::size_t chunk_offset) {
+    Check(png.size() >= 12 && chunk_offset <= png.size() - 12,
+          "synthetic chunk offset");
+    const std::uint32_t length = ReadBigEndian(png.data() + chunk_offset);
+    Check(length <= png.size() - chunk_offset - 12,
+          "synthetic chunk length");
+    uLong crc = crc32(0, Z_NULL, 0);
+    crc = crc32(crc,
+                reinterpret_cast<const Bytef*>(png.data() + chunk_offset + 4),
+                static_cast<uInt>(length + 4));
+    WriteBigEndian(png, chunk_offset + 8 + length,
+                   static_cast<std::uint32_t>(crc));
 }
 
 void AppendChunk(std::vector<std::byte>& png, const std::string_view type,
@@ -211,7 +261,8 @@ void CheckGuardBytes(const std::span<const std::byte> storage,
 
 void CheckSyntheticDecode(const SyntheticPng& sample,
                           const std::uint32_t stride = 0,
-                          pv::PngDecodeTimings* const timings = nullptr) {
+                          pv::PngDecodeTimings* const timings = nullptr,
+                          const pv::PngValidationOptions validation = {}) {
     constexpr std::size_t guard_bytes = 64;
     const std::size_t decoded_bytes = sample.pixels.size();
     const std::uint32_t actual_stride = stride == 0 ? sample.width * 4 : stride;
@@ -224,7 +275,9 @@ void CheckSyntheticDecode(const SyntheticPng& sample,
                               decoded_bytes, sample.width, sample.height,
                               actual_stride};
     std::vector<std::byte> encoded = sample.encoded;
-    pv::CheckHr(pv::DecodePngSpng(encoded, surface, nullptr, nullptr, timings),
+    const pv::PngResourcePlan plan = ParsePlan(encoded);
+    pv::CheckHr(pv::DecodePngSpng(encoded, surface, plan, validation,
+                                  nullptr, nullptr, timings),
                 "decode mixed-filter synthetic PNG");
     const std::size_t row_bytes = static_cast<std::size_t>(sample.width) * 4;
     for (std::uint32_t row = 0; row < sample.height; ++row) {
@@ -257,7 +310,8 @@ void TestMixedFiltersAndBounds() {
 
 void CheckSyntheticDecodeFails(const SyntheticPng& sample,
                                const std::size_t allocation_bytes,
-                               const char* const message) {
+                               const char* const message,
+                               const pv::PngValidationOptions validation = {}) {
     constexpr std::size_t guard_bytes = 64;
     std::vector<std::byte> storage(guard_bytes + allocation_bytes + guard_bytes,
                                    std::byte{0xC7});
@@ -265,7 +319,9 @@ void CheckSyntheticDecodeFails(const SyntheticPng& sample,
         storage.data() + guard_bytes, allocation_bytes, sample.pixels.size(),
         sample.width, sample.height, sample.width * 4};
     std::vector<std::byte> encoded = sample.encoded;
-    Check(FAILED(pv::DecodePngSpng(encoded, surface)), message);
+    const pv::PngResourcePlan plan = ParsePlan(encoded);
+    Check(FAILED(pv::DecodePngSpng(encoded, surface, plan, validation)),
+          message);
     CheckGuardBytes(storage, guard_bytes, std::byte{0xC7},
                     "failed decode leading canary",
                     "failed decode trailing canary");
@@ -299,6 +355,7 @@ void TestMalformedDeflateAndOutputBounds() {
         if (std::memcmp(corrupt_deflate.encoded.data() + offset + 4,
                         "IDAT", 4) == 0 && length >= 2) {
             corrupt_deflate.encoded[offset + 8] = std::byte{0};
+            RefreshChunkCrc(corrupt_deflate.encoded, offset);
             corrupted = true;
             break;
         }
@@ -308,6 +365,138 @@ void TestMalformedDeflateAndOutputBounds() {
     CheckSyntheticDecodeFails(corrupt_deflate, required_bytes,
                               "reject corrupt zlib/DEFLATE stream");
 
+    SyntheticPng corrupt_idat_crc = valid;
+    bool crc_corrupted = false;
+    for (std::size_t offset = 8;
+         offset + 12 <= corrupt_idat_crc.encoded.size();) {
+        const std::uint32_t length = ReadBigEndian(
+            corrupt_idat_crc.encoded.data() + offset);
+        Check(length <= corrupt_idat_crc.encoded.size() - offset - 12,
+              "CRC test chunk remains in bounds");
+        if (std::memcmp(corrupt_idat_crc.encoded.data() + offset + 4,
+                        "IDAT", 4) == 0) {
+            corrupt_idat_crc.encoded[offset + 8 + length] ^=
+                std::byte{0x01};
+            crc_corrupted = true;
+            break;
+        }
+        offset += static_cast<std::size_t>(length) + 12;
+    }
+    Check(crc_corrupted, "find synthetic IDAT CRC to corrupt");
+    CheckSyntheticDecodeFails(corrupt_idat_crc, required_bytes,
+                              "reject IDAT payload with invalid CRC");
+    CheckSyntheticDecodeFails(
+        corrupt_idat_crc, required_bytes,
+        "critical CRC mode must validate IDAT",
+        {pv::PngChunkCrcMode::Critical, true});
+    CheckSyntheticDecode(
+        corrupt_idat_crc, 0, nullptr,
+        {pv::PngChunkCrcMode::NonIdat, true});
+    CheckSyntheticDecode(corrupt_idat_crc, 0, nullptr,
+                         {pv::PngChunkCrcMode::None, true});
+
+    SyntheticPng corrupt_ancillary_crc = valid;
+    std::array<std::byte, 13> ancillary{
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{'t'}, std::byte{'E'}, std::byte{'X'}, std::byte{'t'},
+        std::byte{'x'}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}};
+    const std::uint32_t ancillary_crc = libdeflate_crc32(
+        0, ancillary.data() + 4, 5);
+    ancillary[9] = std::byte{
+        static_cast<std::uint8_t>((ancillary_crc >> 24U) ^ 1U)};
+    ancillary[10] = std::byte{static_cast<std::uint8_t>(ancillary_crc >> 16U)};
+    ancillary[11] = std::byte{static_cast<std::uint8_t>(ancillary_crc >> 8U)};
+    ancillary[12] = std::byte{static_cast<std::uint8_t>(ancillary_crc)};
+    corrupt_ancillary_crc.encoded.insert(
+        corrupt_ancillary_crc.encoded.begin() + 33, ancillary.begin(),
+        ancillary.end());
+    CheckSyntheticDecodeFails(
+        corrupt_ancillary_crc, required_bytes,
+        "all CRC mode must validate ancillary chunks");
+    CheckSyntheticDecodeFails(
+        corrupt_ancillary_crc, required_bytes,
+        "non-IDAT CRC mode must validate ancillary chunks",
+        {pv::PngChunkCrcMode::NonIdat, true});
+    CheckSyntheticDecode(
+        corrupt_ancillary_crc, 0, nullptr,
+        {pv::PngChunkCrcMode::Critical, true});
+    CheckSyntheticDecode(corrupt_ancillary_crc, 0, nullptr,
+                         {pv::PngChunkCrcMode::None, true});
+
+    SyntheticPng corrupt_adler = valid;
+    std::size_t last_idat = std::numeric_limits<std::size_t>::max();
+    for (std::size_t offset = 8; offset + 12 <= corrupt_adler.encoded.size();) {
+        const std::uint32_t length = ReadBigEndian(
+            corrupt_adler.encoded.data() + offset);
+        Check(length <= corrupt_adler.encoded.size() - offset - 12,
+              "Adler test chunk remains in bounds");
+        if (std::memcmp(corrupt_adler.encoded.data() + offset + 4,
+                        "IDAT", 4) == 0) {
+            last_idat = offset;
+        }
+        offset += static_cast<std::size_t>(length) + 12;
+    }
+    Check(last_idat != std::numeric_limits<std::size_t>::max(),
+          "find final synthetic IDAT");
+    const std::uint32_t last_length = ReadBigEndian(
+        corrupt_adler.encoded.data() + last_idat);
+    Check(last_length >= 4, "final IDAT contains zlib Adler trailer");
+    corrupt_adler.encoded[last_idat + 8 + last_length - 1] ^=
+        std::byte{0x01};
+    RefreshChunkCrc(corrupt_adler.encoded, last_idat);
+    CheckSyntheticDecodeFails(corrupt_adler, required_bytes,
+                              "reject valid-DEFLATE stream with invalid Adler-32");
+    CheckSyntheticDecode(corrupt_adler, 0, nullptr,
+                         {pv::PngChunkCrcMode::All, false});
+
+    SyntheticPng trailing_deflate_data = valid;
+    last_idat = std::numeric_limits<std::size_t>::max();
+    for (std::size_t offset = 8;
+         offset + 12 <= trailing_deflate_data.encoded.size();) {
+        const std::uint32_t length = ReadBigEndian(
+            trailing_deflate_data.encoded.data() + offset);
+        Check(length <= trailing_deflate_data.encoded.size() - offset - 12,
+              "trailing-data test chunk remains in bounds");
+        if (std::memcmp(trailing_deflate_data.encoded.data() + offset + 4,
+                        "IDAT", 4) == 0) {
+            last_idat = offset;
+        }
+        offset += static_cast<std::size_t>(length) + 12;
+    }
+    Check(last_idat != std::numeric_limits<std::size_t>::max(),
+          "find final IDAT for trailing-data test");
+    const std::uint32_t trailing_length = ReadBigEndian(
+        trailing_deflate_data.encoded.data() + last_idat);
+    Check(trailing_length >= 4 && trailing_length != UINT32_MAX,
+          "final IDAT can accept one trailing DEFLATE byte");
+    trailing_deflate_data.encoded.insert(
+        trailing_deflate_data.encoded.begin() +
+            static_cast<std::ptrdiff_t>(last_idat + 8 + trailing_length - 4),
+        std::byte{0});
+    WriteBigEndian(trailing_deflate_data.encoded, last_idat,
+                   trailing_length + 1);
+    RefreshChunkCrc(trailing_deflate_data.encoded, last_idat);
+    CheckSyntheticDecodeFails(
+        trailing_deflate_data, required_bytes,
+        "reject bytes between the DEFLATE end and zlib Adler-32");
+    CheckSyntheticDecodeFails(
+        trailing_deflate_data, required_bytes,
+        "fast mode must still require exact DEFLATE input consumption",
+        {pv::PngChunkCrcMode::None, false});
+
+    SyntheticPng corrupt_ihdr_crc = valid;
+    corrupt_ihdr_crc.encoded[32] ^= std::byte{1};
+    std::vector<std::byte> bad_header_storage(required_bytes);
+    pv::DecodeSurface bad_header_surface{
+        bad_header_storage.data(), bad_header_storage.size(),
+        valid.pixels.size(), valid.width, valid.height, valid.width * 4};
+    Check(FAILED(pv::DecodePngSpng(
+              corrupt_ihdr_crc.encoded, bad_header_surface,
+              ParsePlan(valid.encoded),
+              {pv::PngChunkCrcMode::None, false})),
+          "IHDR CRC remains mandatory in fast mode");
+
     constexpr std::size_t guard_bytes = 64;
     std::vector<std::byte> storage(
         guard_bytes + required_bytes + guard_bytes, std::byte{0xD3});
@@ -315,7 +504,8 @@ void TestMalformedDeflateAndOutputBounds() {
         storage.data() + guard_bytes, required_bytes, valid.pixels.size(),
         valid.width, valid.height, valid.width * 4 - 1};
     std::vector<std::byte> encoded = valid.encoded;
-    Check(pv::DecodePngSpng(encoded, bad_stride) == E_INVALIDARG,
+    Check(pv::DecodePngSpng(encoded, bad_stride, ParsePlan(encoded), {}) ==
+              E_INVALIDARG,
           "reject output stride narrower than a decoded row");
     CheckGuardBytes(storage, guard_bytes, std::byte{0xD3},
                     "bad stride leading canary",
@@ -357,6 +547,10 @@ void TestFusedDeflateUnfilterObservability() {
     std::array<HRESULT, workers> results;
     results.fill(E_PENDING);
     std::array<pv::PngDecodeTimings, workers> timings;
+    std::array<pv::PngResourcePlan, workers> plans;
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        plans[worker] = ParsePlan(encoded_images[worker]);
+    }
     std::vector<std::jthread> threads;
     threads.reserve(workers);
     for (std::size_t worker = 0; worker < workers; ++worker) {
@@ -364,8 +558,8 @@ void TestFusedDeflateUnfilterObservability() {
             ready.count_down();
             start.wait();
             results[worker] = pv::DecodePngSpng(
-                encoded_images[worker], surfaces[worker], nullptr, nullptr,
-                &timings[worker]);
+                encoded_images[worker], surfaces[worker], plans[worker], {},
+                nullptr, nullptr, &timings[worker]);
         });
     }
     ready.wait();
@@ -424,7 +618,7 @@ void TestSpng() {
         0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,0x89,
         0x00,0x00,0x00,0x0D,0x49,0x44,0x41,0x54,
         0x08,0xD7,0x63,0xF8,0xCF,0xC0,0xF0,0x1F,0x00,
-        0x05,0x00,0x01,0xFF,0x89,0x99,0x3D,0x1D,
+        0x05,0x00,0x01,0xFF,0x72,0x9C,0x52,0x67,
         0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,
         0xAE,0x42,0x60,0x82};
     std::array<std::byte, raw.size()> png{};
@@ -432,7 +626,8 @@ void TestSpng() {
 
     std::array<std::byte, 8> decoded{};
     pv::DecodeSurface surface{decoded.data(), decoded.size(), 4, 1, 1, 4};
-    pv::CheckHr(pv::DecodePngSpng(png, surface), "Decode embedded PNG with libspng");
+    pv::CheckHr(pv::DecodePngSpng(png, surface, ParsePlan(png), {}),
+                "Decode embedded PNG with libspng");
     Check(surface.pixels[3] == std::byte{0xFF}, "decoded alpha channel");
 
     const std::array<unsigned char, 68> fallback_raw{
@@ -449,7 +644,8 @@ void TestSpng() {
     for (std::size_t index = 0; index < fallback_raw.size(); ++index) {
         fallback_png[index] = std::byte{fallback_raw[index]};
     }
-    pv::CheckHr(pv::DecodePngSpng(fallback_png, surface),
+    pv::CheckHr(pv::DecodePngSpng(fallback_png, surface,
+                                  ParsePlan(fallback_png), {}),
                 "Decode grayscale-alpha PNG with libspng/zlib-ng fallback");
 }
 
@@ -464,7 +660,7 @@ void TestRejectedWorkReleasesInput() {
     slots.BeginDecodeInput(compressed_slot);
     slots.BeginDecodeOutput(staging_slot);
 
-    pv::DecodeStage decode_stage(1, pv::DecodeSlotAccess(slots));
+    pv::DecodeStage decode_stage(1, pv::DecodeSlotAccess(slots), {});
     {
         decode_stage.Start(1);
         pv::DecodeWork work{0, 1, compressed_slot, staging_slot};
@@ -654,11 +850,11 @@ void TestGraphics(const HINSTANCE instance) {
         graphics.InitializeSwapChain();
         graphics.InitializeBackBufferTarget();
         pv::DecodeStaging staging;
-        constexpr std::size_t decoded_bytes = 64 * 64 * 4;
-        staging.committed_bytes = decoded_bytes + 64;
-        Check(staging.AllocateCpu(decoded_bytes + 64),
+        staging.Configure(TestRgba8Plan(64, 64));
+        staging.committed_bytes = staging.resource_plan.staging_committed_bytes;
+        Check(staging.AllocateCpu(staging.committed_bytes),
               "allocate CPU decode surface");
-        Check(staging.PrepareCpuSurface(64, 64, decoded_bytes),
+        Check(staging.PrepareCpuSurface(),
               "prepare CPU decode surface");
         for (UINT row = 0; row < staging.surface.height; ++row) {
             std::byte* const pixels = staging.surface.pixels +
@@ -778,7 +974,8 @@ int VerifyFullPixels(const std::filesystem::path& start_path,
             guard_bytes + allocation_bytes + guard_bytes, std::byte{0x5A});
         pv::DecodeSurface surface{storage.data() + guard_bytes, allocation_bytes,
                                   decoded_bytes, width, height, width * 4};
-        pv::CheckHr(pv::DecodePngSpng(mutable_png, surface),
+        pv::CheckHr(pv::DecodePngSpng(mutable_png, surface,
+                                      ParsePlan(mutable_png), {}),
                     "fast-path PNG decode for full pixel verification");
         const auto mismatch = std::mismatch(reference.begin(), reference.end(),
                                             surface.pixels);
@@ -817,7 +1014,8 @@ int VerifyFullPixels(const std::filesystem::path& start_path,
     return 0;
 }
 
-int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers) {
+int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers,
+                    const pv::PngValidationOptions validation = {}) {
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
         if (entry.is_regular_file() && entry.path().extension() == L".png") {
@@ -836,8 +1034,10 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
 
     std::vector<std::vector<std::byte>> pixel_storage;
     std::vector<pv::DecodeSurface> surfaces;
+    std::vector<pv::PngResourcePlan> plans;
     pixel_storage.reserve(workers);
     surfaces.reserve(workers);
+    plans.reserve(workers);
     for (std::size_t index = 0; index < workers; ++index) {
         std::ifstream input(*(first + index), std::ios::binary | std::ios::ate);
         Check(input.good(), "open benchmark PNG");
@@ -855,6 +1055,7 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
         pv::DecodeSurface surface{pixel_storage.back().data(),
                                   pixel_storage.back().size(), decoded_bytes,
                                   width, height, width * 4};
+        plans.push_back(ParsePlan(compressed));
         compressed_images.push_back(std::move(compressed));
         surfaces.push_back(surface);
     }
@@ -872,9 +1073,9 @@ int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers
             ready.count_down();
             start.wait();
             const auto worker_begin = std::chrono::steady_clock::now();
-            results[index] = pv::DecodePngSpng(compressed_images[index],
-                                               surfaces[index], nullptr, nullptr,
-                                               &decode_timings[index]);
+            results[index] = pv::DecodePngSpng(
+                compressed_images[index], surfaces[index], plans[index], validation,
+                nullptr, nullptr, &decode_timings[index]);
             worker_milliseconds[index] = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - worker_begin).count();
         });
@@ -977,9 +1178,8 @@ int BenchmarkGraphics(const HINSTANCE instance) {
     pv::DecodeStaging staging;
     constexpr UINT width = 7680;
     constexpr UINT height = 4320;
-    constexpr std::size_t decoded_bytes =
-        static_cast<std::size_t>(width) * height * 4;
-    graphics.MapDecodeStaging(staging, width, height, decoded_bytes);
+    staging.Configure(TestRgba8Plan(width, height));
+    graphics.MapDecodeStaging(staging);
     for (UINT row = 0; row < height; ++row) {
         std::memset(staging.surface.pixels +
                         static_cast<std::size_t>(row) * staging.surface.stride,
@@ -1020,10 +1220,16 @@ int wmain(const int argc, wchar_t** const argv) {
         if (argc == 2 && std::wstring_view(argv[1]) == L"--graphics-benchmark") {
             return BenchmarkGraphics(GetModuleHandleW(nullptr));
         }
-        if (argc == 4 && std::wstring_view(argv[1]) == L"--decode-benchmark") {
+        if (argc == 4 &&
+            (std::wstring_view(argv[1]) == L"--decode-benchmark" ||
+             std::wstring_view(argv[1]) == L"--decode-benchmark-fast")) {
             const std::size_t workers = std::stoull(argv[3]);
             Check(workers > 0 && workers <= 64, "invalid benchmark worker count");
-            return BenchmarkDecode(argv[2], workers);
+            const pv::PngValidationOptions validation =
+                std::wstring_view(argv[1]) == L"--decode-benchmark-fast"
+                    ? pv::PngValidationOptions{pv::PngChunkCrcMode::None, false}
+                    : pv::PngValidationOptions{};
+            return BenchmarkDecode(argv[2], workers, validation);
         }
         if (argc == 4 && std::wstring_view(argv[1]) == L"--verify-full-pixels") {
             const std::size_t images = std::stoull(argv[3]);

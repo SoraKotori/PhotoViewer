@@ -191,6 +191,7 @@ public:
 
     [[nodiscard]] std::span<std::byte> CompressedInput(SlotId id) const;
     [[nodiscard]] DecodeSurface& DecodeOutput(SlotId id) const;
+    [[nodiscard]] const PngResourcePlan& ExpectedPng(SlotId id) const;
 
 private:
     ResourceSlots& slots_;

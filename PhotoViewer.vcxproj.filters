@@ -61,6 +61,7 @@
     <ClInclude Include="src\pipeline_resource_size.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\presentation_controller.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\png.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\png_validation.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\processor_topology.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\pipeline_types.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\pipeline_state.h"><Filter>Header Files</Filter></ClInclude>

@@ -36,7 +36,7 @@ public:
 
 private:
     void PrepareStorageHeaders();
-    void SubmitStorageReads();
+    [[nodiscard]] bool SubmitStorageReads();
     void RebuildReservationPlan();
     void ReconcileReservations();
     [[nodiscard]] bool ReservationActive(const ReservationTable& table,
