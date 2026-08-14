@@ -1,6 +1,10 @@
 #pragma once
 
-#include "model.h"
+#include "image_resources.h"
+#include "pipeline_types.h"
+#include "win32_handle.h"
+
+#include <dxgi1_6.h>
 
 namespace pv {
 
@@ -12,16 +16,14 @@ public:
     Graphics(const Graphics&) = delete;
     Graphics& operator=(const Graphics&) = delete;
 
-    void Initialize(HWND window);
     void InitializeDirect3D(HWND window);
     void InitializeDirect2D();
     void InitializeSwapChain();
     void InitializeBackBufferTarget();
     void Resize(UINT width, UINT height);
 
-    void PrepareDecodeStaging(DecodeStaging& staging, UINT width, UINT height);
-    void MapDecodeStaging(DecodeStaging& staging, UINT width, UINT height,
-                          std::size_t decoded_bytes);
+    void PrepareDecodeStaging(DecodeStaging& staging);
+    void MapDecodeStaging(DecodeStaging& staging);
     void UnmapDecodeStaging(DecodeStaging& staging) noexcept;
     void CopyDecodedToStaging(DecodeStaging& staging);
     UploadTicket SubmitUpload(std::size_t index, std::uint64_t generation,
@@ -35,14 +37,14 @@ public:
     [[nodiscard]] std::uint64_t DrawCount() const noexcept;
     [[nodiscard]] std::uint64_t DrawNanoseconds() const noexcept;
 
-    [[nodiscard]] HANDLE FrameWaitableObject() const noexcept { return frame_waitable_; }
-    [[nodiscard]] HANDLE FenceEvent() const noexcept { return fence_event_; }
+    [[nodiscard]] HANDLE FrameWaitableObject() const noexcept {
+        return frame_waitable_.Get();
+    }
+    [[nodiscard]] HANDLE FenceEvent() const noexcept { return fence_event_.Get(); }
     [[nodiscard]] UINT64 CompletedFenceValue() const noexcept;
     void ArmFence(UINT64 value);
 
 private:
-    void InitializeDevice(HWND window);
-    void InitializeSurface();
     void CreateDirect3DResources();
     void CreateDirect2DResources();
     void CreateSwapChain();
@@ -57,11 +59,11 @@ private:
     ComPtr<ID3D11DeviceContext4> context_;
     ComPtr<ID3D11Fence> fence_;
     UINT64 next_fence_value_ = 1;
-    HANDLE fence_event_ = nullptr;
+    UniqueHandle fence_event_;
 
     ComPtr<IDXGIFactory2> dxgi_factory_;
     ComPtr<IDXGISwapChain2> swap_chain_;
-    HANDLE frame_waitable_ = nullptr;
+    UniqueHandle frame_waitable_;
 
     ComPtr<ID2D1Factory3> d2d_factory_;
     ComPtr<ID2D1Device2> d2d_device_;

@@ -1,5 +1,5 @@
 #include "app.h"
-#include "common.h"
+#include "win32_support.h"
 #include "config.h"
 
 int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,

@@ -1,25 +1,14 @@
 #include "graphics.h"
 
-#include "common.h"
+#include "win32_support.h"
 
+#include <chrono>
 #include <cstring>
 
 namespace pv {
 
 Graphics::~Graphics() {
     if (d2d_context_) d2d_context_->SetTarget(nullptr);
-    if (frame_waitable_) CloseHandle(frame_waitable_);
-    if (fence_event_) CloseHandle(fence_event_);
-}
-
-void Graphics::Initialize(const HWND window) {
-    InitializeDevice(window);
-    InitializeSurface();
-}
-
-void Graphics::InitializeDevice(const HWND window) {
-    InitializeDirect3D(window);
-    InitializeDirect2D();
 }
 
 void Graphics::InitializeDirect3D(const HWND window) {
@@ -36,11 +25,6 @@ void Graphics::InitializeDirect2D() {
         throw std::logic_error("invalid Direct2D initialization");
     }
     CreateDirect2DResources();
-}
-
-void Graphics::InitializeSurface() {
-    InitializeSwapChain();
-    InitializeBackBufferTarget();
 }
 
 void Graphics::InitializeSwapChain() {
@@ -74,7 +58,7 @@ void Graphics::CreateDirect3DResources() {
     CheckHr(base_context.As(&context_), "Query ID3D11DeviceContext4");
     CheckHr(device_->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)),
             "ID3D11Device5::CreateFence");
-    fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    fence_event_.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     if (!fence_event_) ThrowLastError("CreateEvent fence");
 
     ComPtr<IDXGIDevice> dxgi_device;
@@ -126,7 +110,7 @@ void Graphics::CreateSwapChain() {
             "CreateSwapChainForHwnd");
     CheckHr(base_swap_chain.As(&swap_chain_), "Query IDXGISwapChain2");
     CheckHr(swap_chain_->SetMaximumFrameLatency(1), "SetMaximumFrameLatency");
-    frame_waitable_ = swap_chain_->GetFrameLatencyWaitableObject();
+    frame_waitable_.Reset(swap_chain_->GetFrameLatencyWaitableObject());
     if (!frame_waitable_) ThrowLastError("GetFrameLatencyWaitableObject");
     dxgi_factory_->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER);
 }
@@ -160,36 +144,21 @@ void Graphics::Resize(const UINT width, const UINT height) {
     CreateBackBufferTarget();
 }
 
-void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
-                                    const UINT height) {
+void Graphics::PrepareDecodeStaging(DecodeStaging& staging) {
     if (!device_) {
         throw std::logic_error("Direct3D device is not initialized");
     }
-    if (staging.mapped || width == 0 || height == 0) {
+    const PngResourcePlan& plan = staging.resource_plan;
+    if (staging.mapped || plan.texture_width == 0 ||
+        plan.texture_height == 0) {
         throw std::invalid_argument("invalid decode staging preparation");
     }
-    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
-        throw std::invalid_argument("PNG dimensions exceed D3D11 limits");
-    }
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-    const std::size_t extra_rows =
-        (static_cast<std::size_t>(height) + row_bytes - 1) / row_bytes;
-    UINT texture_width = width;
-    UINT texture_height = height;
-    if (extra_rows <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION - height) {
-        texture_height += static_cast<UINT>(extra_rows);
-    } else if (width < D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
-        ++texture_width;
-    } else {
-        throw std::invalid_argument("PNG dimensions leave no filter workspace");
-    }
-    if (!staging.texture || staging.texture_width < texture_width ||
-        staging.texture_height < texture_height) {
+    if (!staging.texture || staging.texture_width < plan.texture_width ||
+        staging.texture_height < plan.texture_height) {
         staging.texture.Reset();
         D3D11_TEXTURE2D_DESC description{};
-        description.Width = texture_width;
-        description.Height = texture_height;
+        description.Width = plan.texture_width;
+        description.Height = plan.texture_height;
         description.MipLevels = 1;
         description.ArraySize = 1;
         description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -199,27 +168,25 @@ void Graphics::PrepareDecodeStaging(DecodeStaging& staging, const UINT width,
                                      D3D11_CPU_ACCESS_WRITE;
         CheckHr(device_->CreateTexture2D(&description, nullptr, &staging.texture),
                 "Create decode staging texture");
-        staging.texture_width = texture_width;
-        staging.texture_height = texture_height;
+        staging.texture_width = plan.texture_width;
+        staging.texture_height = plan.texture_height;
     }
 }
 
-void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
-                                const UINT height,
-                                const std::size_t decoded_bytes) {
-    if (staging.mapped || decoded_bytes == 0) {
+void Graphics::MapDecodeStaging(DecodeStaging& staging) {
+    const PngResourcePlan& plan = staging.resource_plan;
+    if (staging.mapped || plan.decoded_bytes == 0) {
         throw std::invalid_argument("invalid decode staging map");
     }
     staging.ReleaseCpuAllocation();
-    PrepareDecodeStaging(staging, width, height);
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
+    PrepareDecodeStaging(staging);
     D3D11_MAPPED_SUBRESOURCE mapped{};
     CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped),
             "Map decode staging texture");
     const std::size_t mapped_bytes = static_cast<std::size_t>(mapped.RowPitch) *
                                      staging.texture_height;
-    const std::size_t filtered_bytes = decoded_bytes + height;
-    if (!mapped.pData || mapped.RowPitch < row_bytes ||
+    const std::size_t filtered_bytes = plan.decoded_bytes + plan.height;
+    if (!mapped.pData || mapped.RowPitch < plan.row_bytes ||
         mapped_bytes < filtered_bytes) {
         context_->Unmap(staging.texture.Get(), 0);
         throw std::runtime_error("decode staging mapping is too small");
@@ -227,9 +194,9 @@ void Graphics::MapDecodeStaging(DecodeStaging& staging, const UINT width,
     staging.mapped = true;
     staging.surface.pixels = static_cast<std::byte*>(mapped.pData);
     staging.surface.allocation_bytes = mapped_bytes;
-    staging.surface.byte_size = decoded_bytes;
-    staging.surface.width = width;
-    staging.surface.height = height;
+    staging.surface.byte_size = plan.decoded_bytes;
+    staging.surface.width = plan.width;
+    staging.surface.height = plan.height;
     staging.surface.stride = mapped.RowPitch;
 }
 
@@ -246,12 +213,12 @@ void Graphics::CopyDecodedToStaging(DecodeStaging& staging) {
     if (!staging.cpu_surface || !source.pixels || source.ByteSize() == 0) {
         throw std::invalid_argument("invalid decoded CPU source");
     }
-    PrepareDecodeStaging(staging, source.width, source.height);
-    const std::size_t row_bytes = static_cast<std::size_t>(source.width) * 4;
+    PrepareDecodeStaging(staging);
+    const PngResourcePlan& plan = staging.resource_plan;
     D3D11_MAPPED_SUBRESOURCE mapped{};
     CheckHr(context_->Map(staging.texture.Get(), 0, D3D11_MAP_WRITE, 0, &mapped),
             "Map staging texture for decoded copy");
-    if (!mapped.pData || mapped.RowPitch < row_bytes) {
+    if (!mapped.pData || mapped.RowPitch < plan.row_bytes) {
         context_->Unmap(staging.texture.Get(), 0);
         throw std::runtime_error("decode staging row pitch is too small");
     }
@@ -259,10 +226,10 @@ void Graphics::CopyDecodedToStaging(DecodeStaging& staging) {
     if (mapped.RowPitch == source.stride) {
         std::memcpy(destination, source.pixels, source.ByteSize());
     } else {
-        for (UINT row = 0; row < source.height; ++row) {
+        for (UINT row = 0; row < plan.height; ++row) {
             std::memcpy(destination + static_cast<std::size_t>(row) * mapped.RowPitch,
                         source.pixels + static_cast<std::size_t>(row) * source.stride,
-                        row_bytes);
+                        plan.row_bytes);
         }
     }
     context_->Unmap(staging.texture.Get(), 0);
@@ -279,12 +246,13 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
                                     GpuImage& destination) {
     const auto begin = metrics_enabled_ ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
+    const PngResourcePlan& plan = source.resource_plan;
     if (!source.texture || source.surface.ByteSize() == 0) {
         throw std::invalid_argument("invalid decoded staging source");
     }
     D3D11_TEXTURE2D_DESC description{};
-    description.Width = source.surface.width;
-    description.Height = source.surface.height;
+    description.Width = plan.width;
+    description.Height = plan.height;
     description.MipLevels = 1;
     description.ArraySize = 1;
     description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -296,23 +264,22 @@ UploadTicket Graphics::SubmitUpload(const std::size_t index,
     ticket.index = index;
     ticket.generation = generation;
     ticket.staging_slot = staging_slot;
-    ticket.bytes = source.surface.ByteSize();
+    ticket.bytes = plan.gpu_reservation_bytes;
     const bool reusable = destination.texture &&
-                          destination.width == source.surface.width &&
-                          destination.height == source.surface.height;
+                          destination.width == plan.width &&
+                          destination.height == plan.height;
     if (!reusable) {
         destination = {};
         CheckHr(device_->CreateTexture2D(&description, nullptr, &destination.texture),
                 "Create GPU image texture");
     }
 
-    const D3D11_BOX source_box{0, 0, 0, source.surface.width,
-                              source.surface.height, 1};
+    const D3D11_BOX source_box{0, 0, 0, plan.width, plan.height, 1};
     context_->CopySubresourceRegion(destination.texture.Get(), 0, 0, 0, 0,
                                     source.texture.Get(), 0, &source_box);
-    destination.width = source.surface.width;
-    destination.height = source.surface.height;
-    destination.bytes = source.surface.ByteSize();
+    destination.width = plan.width;
+    destination.height = plan.height;
+    destination.bytes = plan.gpu_reservation_bytes;
     ticket.fence_value = next_fence_value_++;
     CheckHr(context_->Signal(fence_.Get(), ticket.fence_value),
             "ID3D11DeviceContext4::Signal");
@@ -392,7 +359,7 @@ UINT64 Graphics::CompletedFenceValue() const noexcept {
 }
 
 void Graphics::ArmFence(const UINT64 value) {
-    CheckHr(fence_->SetEventOnCompletion(value, fence_event_),
+    CheckHr(fence_->SetEventOnCompletion(value, fence_event_.Get()),
             "ID3D11Fence::SetEventOnCompletion");
 }
 

@@ -1,6 +1,8 @@
 #include "catalog.h"
 
-#include "common.h"
+#include "catalog_shutdown.h"
+#include "win32_support.h"
+#include "win32_handle.h"
 
 #include <array>
 #include <cstring>
@@ -97,49 +99,45 @@ struct AsyncCatalog::Impl {
         static_assert(sizeof(query) == sizeof(address));
         std::memcpy(&query, &address, sizeof(query));
 
-        completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        completion_event.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         if (!completion_event) ThrowLastError("CreateEventW(catalog)");
 
-        directory = CreateFileW(
+        directory.Reset(CreateFileW(
             directory_path.c_str(), FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-            nullptr);
-        if (directory == INVALID_HANDLE_VALUE) {
-            const DWORD error = GetLastError();
-            CloseHandle(completion_event);
-            completion_event = nullptr;
-            SetLastError(error);
-            ThrowLastError("CreateFileW(directory)");
-        }
-        try {
-            if (!Submit()) {
-                FinalizeCatalog(catalog, absolute);
-                completed = true;
-            }
-        } catch (...) {
-            CloseHandle(directory);
-            directory = INVALID_HANDLE_VALUE;
-            CloseHandle(completion_event);
-            completion_event = nullptr;
-            throw;
+            nullptr));
+        if (!directory) ThrowLastError("CreateFileW(directory)");
+        if (!Submit()) {
+            FinalizeCatalog(catalog, absolute);
+            completed = true;
         }
     }
 
-    ~Impl() {
-        if (in_flight) {
-            CancelIoEx(directory, nullptr);
-            WaitForSingleObject(completion_event, INFINITE);
-        }
-        if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
-        if (completion_event) CloseHandle(completion_event);
+    ~Impl() = default;
+
+    [[nodiscard]] bool CancelAndWaitForShutdown(
+        const DWORD timeout_ms) noexcept {
+        const bool drained = DrainCatalogQueryForShutdown(
+            in_flight, io_status.value.status == kStatusPending,
+            [&] {
+                if (CancelIoEx(directory.Get(), nullptr)) return true;
+                return GetLastError() == ERROR_NOT_FOUND;
+            },
+            [&](const std::uint32_t remaining_ms) {
+                return WaitForSingleObject(completion_event.Get(),
+                                           remaining_ms) == WAIT_OBJECT_0;
+            },
+            timeout_ms);
+        if (drained) in_flight = false;
+        return drained;
     }
 
     [[nodiscard]] bool Submit() {
         io_status = {};
         in_flight = true;
         const LONG status = query(
-            directory, completion_event, nullptr, nullptr, &io_status,
+            directory.Get(), completion_event.Get(), nullptr, nullptr, &io_status,
             buffer.data(), static_cast<ULONG>(buffer.size()),
             kFileDirectoryInformation, restart_scan ? kRestartScan : 0,
             nullptr);
@@ -207,8 +205,8 @@ struct AsyncCatalog::Impl {
 
     std::filesystem::path absolute;
     std::filesystem::path directory_path;
-    HANDLE directory = INVALID_HANDLE_VALUE;
-    HANDLE completion_event = nullptr;
+    UniqueHandle directory;
+    UniqueHandle completion_event;
     NtQueryDirectoryFileExFn query = nullptr;
     NativeIoStatusBlock io_status{};
     alignas(8) std::array<std::byte, 64 * 1024> buffer{};
@@ -221,12 +219,20 @@ struct AsyncCatalog::Impl {
 AsyncCatalog::AsyncCatalog(const std::filesystem::path& initial_image)
     : impl_(std::make_unique<Impl>(initial_image)) {}
 
-AsyncCatalog::~AsyncCatalog() = default;
+AsyncCatalog::~AsyncCatalog() noexcept {
+    constexpr DWORD shutdown_timeout_ms = 5000;
+    if (impl_ && !impl_->CancelAndWaitForShutdown(shutdown_timeout_ms)) {
+        // The kernel may still reference Impl::buffer and io_status. Keep the
+        // entire request alive until process teardown instead of hanging or
+        // freeing storage that an outstanding directory query can still use.
+        (void)impl_.release();
+    }
+}
 
 bool AsyncCatalog::Advance() { return impl_->Advance(); }
 
 HANDLE AsyncCatalog::CompletionEvent() const noexcept {
-    return impl_->completion_event;
+    return impl_->completion_event.Get();
 }
 
 Catalog AsyncCatalog::TakeCatalog() {

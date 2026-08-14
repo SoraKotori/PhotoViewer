@@ -19,8 +19,28 @@
     <ClCompile><WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><UseStandardPreprocessor>true</UseStandardPreprocessor><LanguageStandard>stdcpp20</LanguageStandard><ExceptionHandling>Sync</ExceptionHandling><MultiProcessorCompilation>true</MultiProcessorCompilation><Optimization>MaxSpeed</Optimization><IntrinsicFunctions>true</IntrinsicFunctions><EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;WINVER=0x0A00;_WIN32_WINNT=0x0A00;NDEBUG;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions></ClCompile>
     <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>d2d1.lib;d3d11.lib;dxgi.lib;ole32.lib;user32.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="tests\runtime_tests.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\spng_decoder.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="src\common.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\model.h" /><ClInclude Include="src\spng_decoder.h" /><ClInclude Include="src\work_queue.h" /></ItemGroup>
+  <ItemGroup><ClCompile Include="tests\runtime_tests.cpp" /><ClCompile Include="src\catalog.cpp" /><ClCompile Include="src\decode_stage.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\iocp_transport.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\decode_pipeline.cpp" /><ClCompile Include="src\pipeline_diagnostics.cpp" /><ClCompile Include="src\graphics_pipeline.cpp" /><ClCompile Include="src\pipeline_model.cpp" /><ClCompile Include="src\pipeline_resources.cpp" /><ClCompile Include="src\pipeline_resource_size.cpp" /><ClCompile Include="src\pipeline_state.cpp" /><ClCompile Include="src\pipeline_types.cpp" /><ClCompile Include="src\presentation_controller.cpp" /><ClCompile Include="src\pipeline_runtime.cpp" /><ClCompile Include="src\pipeline_scheduler.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\pipeline_limits.cpp" /><ClCompile Include="src\reservation_planner.cpp" /><ClCompile Include="src\resource_slots.cpp" /><ClCompile Include="src\png_rgba8_decoder.cpp" /><ClCompile Include="src\spng_decoder.cpp" /><ClCompile Include="src\storage_pipeline.cpp" /><ClCompile Include="src\viewer_window.cpp" /><ClCompile Include="src\upload_ledger.cpp" /><ClCompile Include="src\work_queue.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="src\catalog.h" /><ClInclude Include="src\config.h" /><ClInclude Include="src\decode_pipeline.h" /><ClInclude Include="src\decode_stage.h" /><ClInclude Include="src\decode_surface.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\iocp_transport.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\graphics_pipeline.h" /><ClInclude Include="src\image_resources.h" /><ClInclude Include="src\io_request.h" /><ClInclude Include="src\navigation.h" /><ClInclude Include="src\pipeline_limits.h" /><ClInclude Include="src\pipeline_model.h" /><ClInclude Include="src\pipeline_observer.h" /><ClInclude Include="src\pipeline_resources.h" /><ClInclude Include="src\pipeline_resource_size.h" /><ClInclude Include="src\presentation_controller.h" /><ClInclude Include="src\pipeline_runtime.h" /><ClInclude Include="src\pipeline_types.h" /><ClInclude Include="src\png_validation.h" /><ClInclude Include="src\reservation.h" /><ClInclude Include="src\reservation_planner.h" /><ClInclude Include="src\resource_slots.h" /><ClInclude Include="src\presentation_order.h" /><ClInclude Include="src\runtime_telemetry.h" /><ClInclude Include="src\png_rgba8_decoder.h" /><ClInclude Include="src\spng_decoder.h" /><ClInclude Include="src\viewer_window.h" /><ClInclude Include="src\win32_handle.h" /><ClInclude Include="src\win32_support.h" /><ClInclude Include="src\upload_ledger.h" /><ClInclude Include="src\work_queue.h" /></ItemGroup>
   <ItemGroup><ProjectReference Include="PhotoViewer.PngCodec.vcxproj"><Project>{55A9D4F1-5B69-4D89-AE99-80361473B839}</Project></ProjectReference></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_unfilter.cpp" /></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_paeth_wavefront.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\resource_slots_compressed.cpp" />
+    <ClCompile Include="src\resource_slots_staging.cpp" />
+    <ClCompile Include="src\resource_slots_gpu.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\storage_pipeline_completion.cpp" />
+    <ClCompile Include="src\storage_pipeline_submission.cpp" />
+    <ClCompile Include="src\storage_pipeline_shutdown.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\pipeline_scheduler_gpu.inl" />
+    <None Include="src\pipeline_scheduler_staging.inl" />
+    <None Include="src\pipeline_scheduler_compressed.inl" />
+  </ItemGroup>
+  <ItemGroup><ClInclude Include="src\png_unfilter.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="src\catalog_shutdown.h" /><ClInclude Include="src\linear_capability.h" /><ClInclude Include="src\storage_shutdown.h" /><ClInclude Include="src\scheduler_reservation_policy.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemGroup><ClInclude Include="src\pipeline_scheduler.h" /></ItemGroup>
 </Project>

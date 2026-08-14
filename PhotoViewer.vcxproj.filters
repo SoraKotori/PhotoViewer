@@ -7,29 +7,98 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\app.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\decode_pipeline.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_diagnostics.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\graphics_pipeline.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_state.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_limits.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_model.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_types.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_resources.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_resource_size.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\presentation_controller.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_scheduler.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\validation_harness.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\catalog.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\config.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\decoder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\decode_stage.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\iocp_transport.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\graphics.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\main.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\navigation.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\png.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\processor_topology.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\spng_decoder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\png_rgba8_decoder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\reservation_planner.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pipeline_runtime.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\viewer_window.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\work_queue.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\upload_ledger.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\catalog.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="src\common.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\win32_support.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\config.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\decoder.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\decode_pipeline.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\decode_stage.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\iocp_transport.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\decode_surface.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\graphics.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="src\model.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\graphics_pipeline.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\image_resources.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\io_request.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\navigation.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_limits.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_model.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_observer.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_resources.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_resource_size.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\presentation_controller.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\png.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\png_validation.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\processor_topology.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_types.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_state.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\storage_pipeline.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_runtime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\pipeline_scheduler.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\reservation_planner.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\spng_decoder.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\png_rgba8_decoder.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\validation.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\runtime_telemetry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\presentation_order.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\validation_harness.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\viewer_window.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\win32_handle.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\work_queue.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\upload_ledger.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\png_unfilter.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\png_paeth_wavefront.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_compressed.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_staging.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\resource_slots_gpu.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_completion.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_submission.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\storage_pipeline_shutdown.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClInclude Include="src\png_unfilter.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\linear_capability.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\storage_shutdown.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\scheduler_reservation_policy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\catalog_shutdown.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\pipeline_scheduler_gpu.inl"><Filter>Source Files</Filter></None>
+    <None Include="src\pipeline_scheduler_staging.inl"><Filter>Source Files</Filter></None>
+    <None Include="src\pipeline_scheduler_compressed.inl"><Filter>Source Files</Filter></None>
   </ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest"><Filter>Resource Files</Filter></Manifest></ItemGroup>
 </Project>

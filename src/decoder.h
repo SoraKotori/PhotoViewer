@@ -1,5 +1,6 @@
 #pragma once
 
+#include "png_validation.h"
 #include "resource_slots.h"
 #include "work_queue.h"
 
@@ -10,7 +11,8 @@ namespace pv {
 class DecoderPool {
 public:
     DecoderPool(std::size_t worker_count, WorkQueue& work_queue,
-                CompletionQueue& completion_queue, ResourceSlots& slots);
+                CompletionQueue& completion_queue, DecodeSlotView& slots,
+                PngValidationOptions validation);
     ~DecoderPool();
 
     void ResetMetrics() noexcept;
@@ -41,7 +43,8 @@ private:
 
     WorkQueue& work_queue_;
     CompletionQueue& completion_queue_;
-    ResourceSlots& slots_;
+    DecodeSlotView& slots_;
+    const PngValidationOptions validation_;
     // Constructed once at the configured size and never resized. This keeps
     // the runtime-sized, cache-line-aligned sequence off the main stack.
     std::vector<WorkerMetrics> worker_metrics_;

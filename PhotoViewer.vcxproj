@@ -30,12 +30,40 @@
     <Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences><AdditionalDependencies>d2d1.lib;d3d11.lib;dxgi.lib;ole32.lib;shell32.lib;user32.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\app.cpp" /><ClCompile Include="src\catalog.cpp" /><ClCompile Include="src\config.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\main.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\processor_topology.cpp" /><ClCompile Include="src\spng_decoder.cpp" />
+    <ClCompile Include="src\app.cpp" /><ClCompile Include="src\catalog.cpp" /><ClCompile Include="src\config.cpp" /><ClCompile Include="src\decode_stage.cpp" /><ClCompile Include="src\decoder.cpp" /><ClCompile Include="src\iocp_transport.cpp" /><ClCompile Include="src\graphics.cpp" /><ClCompile Include="src\main.cpp" /><ClCompile Include="src\navigation.cpp" /><ClCompile Include="src\decode_pipeline.cpp" /><ClCompile Include="src\pipeline_diagnostics.cpp" /><ClCompile Include="src\graphics_pipeline.cpp" /><ClCompile Include="src\pipeline_model.cpp" /><ClCompile Include="src\pipeline_resources.cpp" /><ClCompile Include="src\pipeline_resource_size.cpp" /><ClCompile Include="src\pipeline_state.cpp" /><ClCompile Include="src\pipeline_types.cpp" /><ClCompile Include="src\presentation_controller.cpp" /><ClCompile Include="src\pipeline_runtime.cpp" /><ClCompile Include="src\pipeline_scheduler.cpp" /><ClCompile Include="src\png.cpp" /><ClCompile Include="src\processor_topology.cpp" /><ClCompile Include="src\pipeline_limits.cpp" /><ClCompile Include="src\reservation_planner.cpp" /><ClCompile Include="src\resource_slots.cpp" /><ClCompile Include="src\png_rgba8_decoder.cpp" /><ClCompile Include="src\spng_decoder.cpp" /><ClCompile Include="src\storage_pipeline.cpp" /><ClCompile Include="src\validation_harness.cpp" /><ClCompile Include="src\viewer_window.cpp" /><ClCompile Include="src\upload_ledger.cpp" /><ClCompile Include="src\work_queue.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\app.h" /><ClInclude Include="src\catalog.h" /><ClInclude Include="src\common.h" /><ClInclude Include="src\config.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\model.h" /><ClInclude Include="src\navigation.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\processor_topology.h" /><ClInclude Include="src\reservation.h" /><ClInclude Include="src\resource_slots.h" /><ClInclude Include="src\spng_decoder.h" /><ClInclude Include="src\work_queue.h" />
+    <ClInclude Include="src\app.h" /><ClInclude Include="src\catalog.h" /><ClInclude Include="src\config.h" /><ClInclude Include="src\decode_pipeline.h" /><ClInclude Include="src\decode_stage.h" /><ClInclude Include="src\decode_surface.h" /><ClInclude Include="src\decoder.h" /><ClInclude Include="src\iocp_transport.h" /><ClInclude Include="src\graphics.h" /><ClInclude Include="src\graphics_pipeline.h" /><ClInclude Include="src\image_resources.h" /><ClInclude Include="src\io_request.h" /><ClInclude Include="src\navigation.h" /><ClInclude Include="src\pipeline_limits.h" /><ClInclude Include="src\pipeline_model.h" /><ClInclude Include="src\pipeline_observer.h" /><ClInclude Include="src\pipeline_resources.h" /><ClInclude Include="src\pipeline_resource_size.h" /><ClInclude Include="src\pipeline_state.h" /><ClInclude Include="src\presentation_controller.h" /><ClInclude Include="src\pipeline_runtime.h" /><ClInclude Include="src\pipeline_types.h" /><ClInclude Include="src\png.h" /><ClInclude Include="src\png_validation.h" /><ClInclude Include="src\processor_topology.h" /><ClInclude Include="src\reservation.h" /><ClInclude Include="src\reservation_planner.h" /><ClInclude Include="src\resource_slots.h" /><ClInclude Include="src\presentation_order.h" /><ClInclude Include="src\runtime_telemetry.h" /><ClInclude Include="src\png_rgba8_decoder.h" /><ClInclude Include="src\spng_decoder.h" /><ClInclude Include="src\storage_pipeline.h" /><ClInclude Include="src\validation.h" /><ClInclude Include="src\validation_harness.h" /><ClInclude Include="src\viewer_window.h" /><ClInclude Include="src\win32_handle.h" /><ClInclude Include="src\win32_support.h" /><ClInclude Include="src\upload_ledger.h" /><ClInclude Include="src\work_queue.h" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="PhotoViewer.PngCodec.vcxproj"><Project>{55A9D4F1-5B69-4D89-AE99-80361473B839}</Project></ProjectReference></ItemGroup>
   <ItemGroup><Manifest Include="PhotoViewer.manifest" /></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_unfilter.cpp" /></ItemGroup>
+  <ItemGroup><ClCompile Include="src\png_paeth_wavefront.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\resource_slots_compressed.cpp" />
+    <ClCompile Include="src\resource_slots_staging.cpp" />
+    <ClCompile Include="src\resource_slots_gpu.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\storage_pipeline_completion.cpp" />
+    <ClCompile Include="src\storage_pipeline_submission.cpp" />
+    <ClCompile Include="src\storage_pipeline_shutdown.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\pipeline_scheduler_gpu.inl" />
+    <None Include="src\pipeline_scheduler_staging.inl" />
+    <None Include="src\pipeline_scheduler_compressed.inl" />
+  </ItemGroup>
+  <ItemGroup><ClInclude Include="src\png_unfilter.h" /></ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\linear_capability.h" />
+    <ClInclude Include="src\storage_shutdown.h" />
+    <ClInclude Include="src\scheduler_reservation_policy.h" />
+    <ClInclude Include="src\catalog_shutdown.h" />
+  </ItemGroup>
+  <Target Name="CheckThreadPriorityPolicy" AfterTargets="Link">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\check-thread-priority.ps1&quot; -ProjectRoot &quot;$(ProjectDir).&quot; -Binary &quot;$(TargetPath)&quot; -Dumpbin &quot;$(VCToolsInstallDir)bin\Hostx64\x64\dumpbin.exe&quot;" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemGroup><ClInclude Include="src\pipeline_scheduler.h" /></ItemGroup>
 </Project>

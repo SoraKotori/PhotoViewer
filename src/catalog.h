@@ -1,16 +1,17 @@
 #pragma once
 
-#include "common.h"
+#include "win32_support.h"
 #include "png.h"
 
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 namespace pv {
 
 struct CatalogItem {
     std::filesystem::path path;
-    PngInfo png;
+    PngResourcePlan resource_plan;
     std::uint64_t file_bytes = 0;
     bool file_size_known = false;
     bool header_valid = false;
@@ -28,7 +29,7 @@ Catalog BuildCatalogFromList(const std::filesystem::path& list_file,
 class AsyncCatalog {
 public:
     explicit AsyncCatalog(const std::filesystem::path& initial_image);
-    ~AsyncCatalog();
+    ~AsyncCatalog() noexcept;
 
     AsyncCatalog(const AsyncCatalog&) = delete;
     AsyncCatalog& operator=(const AsyncCatalog&) = delete;

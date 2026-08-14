@@ -1,6 +1,8 @@
 #include "config.h"
 
-#include "common.h"
+#include "win32_support.h"
+
+#include <shellapi.h>
 
 #include <charconv>
 
@@ -32,6 +34,20 @@ std::size_t ParseMibOption(std::wstring_view argument, std::wstring_view prefix)
         throw std::invalid_argument("invalid MiB option");
     }
     return MiB(*parsed);
+}
+
+PngChunkCrcMode ParseChunkCrcMode(const std::wstring_view value) {
+    if (value == L"all") return PngChunkCrcMode::All;
+    if (value == L"critical") return PngChunkCrcMode::Critical;
+    if (value == L"non-idat") return PngChunkCrcMode::NonIdat;
+    if (value == L"none") return PngChunkCrcMode::None;
+    throw std::invalid_argument("invalid PNG chunk CRC mode");
+}
+
+bool ParseOnOff(const std::wstring_view value, const char* const error) {
+    if (value == L"on") return true;
+    if (value == L"off") return false;
+    throw std::invalid_argument(error);
 }
 
 }  // namespace
@@ -135,6 +151,14 @@ Config ParseConfig() {
                 throw std::invalid_argument("invalid worker count");
             }
             config.worker_count = *value;
+        } else if (argument.starts_with(L"--png-chunk-crc=")) {
+            config.png_validation.chunk_crc = ParseChunkCrcMode(
+                argument.substr(
+                    std::wstring_view(L"--png-chunk-crc=").size()));
+        } else if (argument.starts_with(L"--png-adler32=")) {
+            config.png_validation.adler32 = ParseOnOff(
+                argument.substr(std::wstring_view(L"--png-adler32=").size()),
+                "invalid PNG Adler-32 mode");
         } else if (argument.starts_with(L"--")) {
             throw std::invalid_argument("unknown option");
         } else if (config.initial_image.empty()) {
