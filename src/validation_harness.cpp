@@ -108,7 +108,7 @@ void ValidationHarness::InjectValidationNavigation(
     session_.navigation_cursor = 0;
     session_.navigation_started = std::chrono::steady_clock::now();
     session_.navigation_injection_finished = {};
-    WriteReport(pipeline, "warmup-complete", true);
+    WriteReport(pipeline, "navigation-started", true);
     telemetry_.BeginNavigation(session_.navigation_started);
 
     FILETIME created{};
@@ -235,10 +235,11 @@ std::optional<int> ValidationHarness::OnFramePresented(
 
     if (!config_.validation_navigation.empty() &&
         !session_.script_injected) {
-        if (config_.validation_warmup_ms != 0) {
+        if (config_.validation_navigation_start_delay_ms != 0) {
             if (!session_.script_scheduled) {
                 session_.script_scheduled = true;
-                SetTimer(window.Handle(), 2, config_.validation_warmup_ms,
+                SetTimer(window.Handle(), 2,
+                         config_.validation_navigation_start_delay_ms,
                          nullptr);
             }
         } else {

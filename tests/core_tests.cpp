@@ -104,7 +104,7 @@ void Check(const bool condition, const char* message) {
     }
 }
 
-void ConfigDefaultTests() {
+void TestConfigDefaults() {
     const pv::Config config;
     Check(config.worker_count == 0,
           "application default must select workers from physical cores");
@@ -130,7 +130,7 @@ public:
     void Set(const int value) { Target() = value; }
 };
 
-void LinearCapabilityTests() {
+void TestLinearCapability() {
     int target = 0;
     CapabilityProbe source(target);
     CapabilityProbe destination(std::move(source));
@@ -168,7 +168,7 @@ struct FakeShutdownTransport {
     }
 };
 
-void StorageShutdownTests() {
+void TestStorageShutdown() {
     const auto request_at = [](pv::IoRequest* const request) {
         return [request](const std::size_t index) {
             return index == 0 ? request : nullptr;
@@ -223,7 +223,7 @@ void StorageShutdownTests() {
           "unexpected completion must not release backing");
 }
 
-void CatalogShutdownTests() {
+void TestCatalogShutdown() {
     std::size_t cancel_count = 0;
     std::size_t wait_count = 0;
     const auto cancel = [&] {
@@ -255,7 +255,7 @@ void CatalogShutdownTests() {
           "catalog wait timeout must preserve query backing");
 }
 
-std::size_t ProcessorTopologyTests() {
+std::size_t TestProcessorTopology() {
     Check(pv::DefaultWorkerCountForPhysicalCores(0) == 1,
           "missing topology must retain one worker");
     Check(pv::DefaultWorkerCountForPhysicalCores(1) == 1,
@@ -282,7 +282,7 @@ std::size_t PresentNext(pv::NavigationState& navigation) {
     return *next;
 }
 
-void NavigationTests() {
+void TestNavigation() {
     pv::NavigationState navigation;
     navigation.Reset(5, 20);
     Check(PresentNext(navigation) == 5, "initial image must be presented first");
@@ -367,7 +367,7 @@ void NavigationTests() {
           "a rejected boundary step must not replace the last effective direction");
 }
 
-void ReservationPlannerTests() {
+void TestReservationPlanner() {
     pv::Config config;
     config.compressed_slot_count = 4;
     config.staging_slot_count = 3;
@@ -429,7 +429,7 @@ std::array<std::byte, pv::kPngHeaderBytes> MakePngHeader(
     return header;
 }
 
-void PngTests() {
+void TestPngResourcePlan() {
     auto header = MakePngHeader(7680, 4320);
     const auto parsed = pv::ParsePngResourcePlan(header);
     Check(parsed.has_value(), "valid PNG IHDR");
@@ -457,7 +457,7 @@ void PngTests() {
     Check(!pv::ParsePngResourcePlan(header), "invalid signature must fail");
 }
 
-void ResourceSlotTests() {
+void TestResourceSlots() {
     pv::ResourceSlots slots(2, 2, 2, 8192, 8192);
     Check(slots.CompressedCount() == 2 && slots.FreeCompressedCount() == 2,
           "compressed slot storage and free index must start at configured count");
@@ -584,7 +584,7 @@ void ResourceSlotTests() {
           "staging byte budget and slot count must both be enforced");
 }
 
-void ReservationTests() {
+void TestReservationTable() {
     pv::ReservationTable table;
     table.Reset(2);
     std::vector<std::size_t> released;
@@ -631,6 +631,9 @@ void ReservationTests() {
               table.FindFrame(20) != pv::kInvalidReservation,
           "one retiring owner must not block independently released capacity");
 
+}
+
+void TestWorkQueue() {
     pv::WorkQueue queue(4);
     pv::DecodeWork work{3, 7, 1, 2};
     Check(queue.TryPush(work), "decode work must enter queue");
@@ -676,7 +679,7 @@ void ReservationTests() {
           "work queue must reject work beyond its fixed slot capacity");
 }
 
-void CompletionQueueTests() {
+void TestCompletionQueue() {
     pv::CompletionQueue queue(2);
     Check(WaitForSingleObject(queue.CompletionEvent(), 0) == WAIT_TIMEOUT,
           "completion event must initially be clear");
@@ -701,7 +704,7 @@ void CompletionQueueTests() {
           "completion queue must remain reusable after a batch drain");
 }
 
-void RuntimeTelemetryTests() {
+void TestRuntimeTelemetry() {
     pv::RuntimeTelemetry telemetry(std::chrono::steady_clock::now());
     telemetry.BeginNavigation(std::chrono::steady_clock::now());
     const int measured = telemetry.Measure(
@@ -715,7 +718,7 @@ void RuntimeTelemetryTests() {
           "zero begin time must not record process uptime as an operation");
 }
 
-void ReservationByteBudgetTests() {
+void TestReservationByteBudgets() {
     pv::CatalogItem compressed;
     compressed.file_size_known = true;
     compressed.file_bytes = 4097;
@@ -789,7 +792,7 @@ void ReservationByteBudgetTests() {
           "making its peer immediately redeemable");
 }
 
-void ControlledCompletionOrderingTests() {
+void TestControlledCompletionOrdering() {
     pv::NavigationState navigation;
     navigation.Reset(0, 4);
     navigation.Step(1, false);
@@ -853,20 +856,21 @@ void ControlledCompletionOrderingTests() {
 }  // namespace
 
 int main() {
-    LinearCapabilityTests();
-    StorageShutdownTests();
-    CatalogShutdownTests();
-    ConfigDefaultTests();
-    const std::size_t physical_core_count = ProcessorTopologyTests();
-    NavigationTests();
-    ReservationPlannerTests();
-    PngTests();
-    ResourceSlotTests();
-    ReservationTests();
-    CompletionQueueTests();
-    RuntimeTelemetryTests();
-    ReservationByteBudgetTests();
-    ControlledCompletionOrderingTests();
+    TestLinearCapability();
+    TestStorageShutdown();
+    TestCatalogShutdown();
+    TestConfigDefaults();
+    const std::size_t physical_core_count = TestProcessorTopology();
+    TestNavigation();
+    TestReservationPlanner();
+    TestPngResourcePlan();
+    TestResourceSlots();
+    TestReservationTable();
+    TestWorkQueue();
+    TestCompletionQueue();
+    TestRuntimeTelemetry();
+    TestReservationByteBudgets();
+    TestControlledCompletionOrdering();
     std::cout << "PASS: core tests physical_core_count=" << physical_core_count
               << " default_worker_count=" << pv::DefaultWorkerCount() << '\n';
     return 0;

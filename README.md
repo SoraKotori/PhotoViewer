@@ -89,6 +89,6 @@
 | `--gpu-reverse-slot-count=` | 1 |
 | `--gpu-forward-slot-count=` | 2 |
 
-驗收使用 7680 × 4320、8-bit RGBA、non-interlaced PNG。導覽開始延遲由私有測試設定指定；第一張作為初始圖片並獨立記錄，後續圖片的可呈現時間必須符合設定的時限。
+驗收使用 7680 × 4320、8-bit RGBA、non-interlaced PNG。導覽開始延遲設為 0；第一張作為初始圖片並獨立記錄，後續圖片的可呈現時間必須符合每秒 30 張所推導的時限。
 
 效能改進必須實際降低端到端資源成本；成本在程式、OS、驅動程式與執行緒之間的轉移不視為改進。底層執行緒、I/O、解碼與資源所有權設計統一記錄於 [runtime-design.md](docs/runtime-design.md)。

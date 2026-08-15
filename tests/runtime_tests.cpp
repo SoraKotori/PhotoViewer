@@ -13,8 +13,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <latch>
 #include <limits>
@@ -690,13 +688,13 @@ void TestFusedDeflateUnfilterObservability() {
         [](const std::uint64_t total, const pv::PngDecodeTimings& timing) {
             return total + timing.fused_output_bytes;
         });
-    std::cout << "FusedAcceptance workers=" << workers
+    std::cout << "METRIC: fused_decode workers=" << workers
               << " fused_rows=" << fused_rows
               << " fused_output_bytes=" << fused_output_bytes
               << " result=exact canaries=intact\n";
 }
 
-void TestSpng() {
+void TestSpngDecodeAndFallback() {
     const std::array<unsigned char, 70> raw{
         0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
         0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
@@ -843,7 +841,7 @@ void TestPipelineInitialFailureState() {
           "failed initial content must never publish frame callbacks");
 }
 
-void TestManagedStagingUpload() {
+void TestStagingTextureUploadRetainsCopiedPixels() {
     pv::ComPtr<ID3D11Device> device;
     pv::ComPtr<ID3D11DeviceContext> context;
     D3D_FEATURE_LEVEL feature_level{};
@@ -853,7 +851,7 @@ void TestManagedStagingUpload() {
                     nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
                     feature_levels.data(), static_cast<UINT>(feature_levels.size()),
                     D3D11_SDK_VERSION, &device, &feature_level, &context),
-                "Create D3D11 device for managed staging test");
+                "Create D3D11 device for staging texture upload retention test");
 
     constexpr UINT width = 16;
     constexpr UINT height = 16;
@@ -877,18 +875,18 @@ void TestManagedStagingUpload() {
     description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     pv::ComPtr<ID3D11Texture2D> texture;
     pv::CheckHr(device->CreateTexture2D(&description, nullptr, &texture),
-                "Create destination texture for managed staging test");
+                "Create destination texture for staging texture upload retention test");
 
     description.Usage = D3D11_USAGE_STAGING;
     description.BindFlags = 0;
     description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     pv::ComPtr<ID3D11Texture2D> upload;
     pv::CheckHr(device->CreateTexture2D(&description, nullptr, &upload),
-                "Create managed upload staging texture");
+                "Create upload staging texture");
     D3D11_MAPPED_SUBRESOURCE upload_mapping{};
     pv::CheckHr(context->Map(upload.Get(), 0, D3D11_MAP_WRITE, 0,
                             &upload_mapping),
-                "Map managed upload staging texture");
+                "Map upload staging texture");
     for (UINT row = 0; row < height; ++row) {
         std::memcpy(static_cast<std::byte*>(upload_mapping.pData) +
                         static_cast<std::size_t>(row) * upload_mapping.RowPitch,
@@ -903,21 +901,22 @@ void TestManagedStagingUpload() {
     description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     pv::ComPtr<ID3D11Texture2D> readback;
     pv::CheckHr(device->CreateTexture2D(&description, nullptr, &readback),
-                "Create readback staging texture for managed staging test");
+                "Create readback staging texture for upload retention test");
     context->CopyResource(readback.Get(), texture.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
     pv::CheckHr(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped),
-                "Read texture uploaded through managed staging");
+                "Read texture copied from upload staging texture");
     const auto* const pixel = static_cast<const std::byte*>(mapped.pData);
     const bool retained = pixel[0] == std::byte{0x12} &&
                           pixel[1] == std::byte{0x34} &&
                           pixel[2] == std::byte{0x56} &&
                           pixel[3] == std::byte{0xFF};
     context->Unmap(readback.Get(), 0);
-    Check(retained, "managed staging upload must preserve source pixels");
+    Check(retained,
+          "staging texture upload must retain copied pixels after source changes");
 }
 
-void TestGraphics(const HINSTANCE instance) {
+void TestGraphicsUploadAndPresentation(const HINSTANCE instance) {
     constexpr wchar_t class_name[] = L"PhotoViewer.RuntimeTest";
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = DefWindowProcW;
@@ -986,347 +985,15 @@ std::uint32_t ReadBigEndian(const std::byte* const data) {
            static_cast<std::uint32_t>(data[3]);
 }
 
-std::vector<std::byte> ReadFileBytes(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    Check(input.good(), "open PNG for full pixel verification");
-    const std::streamsize length = input.tellg();
-    Check(length >= 29, "PNG verification input is too small");
-    std::vector<std::byte> bytes(static_cast<std::size_t>(length));
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(bytes.data()), length);
-    Check(input.good(), "read PNG for full pixel verification");
-    return bytes;
-}
-
-std::vector<std::byte> DecodeReferenceSpng(
-    const std::span<const std::byte> compressed,
-    const std::uint32_t width, const std::uint32_t height) {
-    std::unique_ptr<spng_ctx, decltype(&spng_ctx_free)> context(
-        spng_ctx_new(0), &spng_ctx_free);
-    Check(context != nullptr, "create reference libspng context");
-    Check(spng_set_crc_action(context.get(), SPNG_CRC_USE, SPNG_CRC_USE) ==
-              SPNG_OK,
-          "configure reference libspng CRC validation");
-    Check(spng_set_png_buffer(context.get(), compressed.data(), compressed.size()) ==
-              SPNG_OK,
-          "set reference libspng input");
-    spng_ihdr header{};
-    Check(spng_get_ihdr(context.get(), &header) == SPNG_OK &&
-              header.width == width && header.height == height &&
-              header.bit_depth == 8 &&
-              header.color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA &&
-              header.interlace_method == SPNG_INTERLACE_NONE,
-          "reference PNG must be non-interlaced RGBA8");
-    std::size_t decoded_size = 0;
-    Check(spng_decoded_image_size(context.get(), SPNG_FMT_PNG, &decoded_size) ==
-              SPNG_OK &&
-              decoded_size == static_cast<std::size_t>(width) * height * 4,
-          "reference libspng decoded size");
-    std::vector<std::byte> decoded(decoded_size);
-    Check(spng_decode_image(context.get(), decoded.data(), decoded.size(),
-                            SPNG_FMT_PNG, 0) == SPNG_OK,
-          "reference libspng full decode");
-    return decoded;
-}
-
-int VerifyFullPixels(const std::filesystem::path& start_path,
-                     const std::size_t requested) {
-    std::vector<std::filesystem::path> files;
-    for (const auto& entry :
-         std::filesystem::directory_iterator(start_path.parent_path())) {
-        if (entry.is_regular_file() && entry.path().extension() == L".png") {
-            files.push_back(entry.path());
-        }
-    }
-    std::sort(files.begin(), files.end());
-    const auto first = std::find(files.begin(), files.end(), start_path);
-    Check(first != files.end(), "find starting PNG for full pixel verification");
-    std::size_t verified = 0;
-    for (auto file = first; file != files.end() && verified < requested; ++file) {
-        const std::vector<std::byte> original = ReadFileBytes(*file);
-        const std::uint32_t width = ReadBigEndian(original.data() + 16);
-        const std::uint32_t height = ReadBigEndian(original.data() + 20);
-        if (original[24] != std::byte{8} || original[25] != std::byte{6} ||
-            original[28] != std::byte{0}) {
-            continue;
-        }
-        const std::vector<std::byte> reference = DecodeReferenceSpng(
-            original, width, height);
-        std::vector<std::byte> mutable_png = original;
-        constexpr std::size_t guard_bytes = 64;
-        const std::size_t decoded_bytes = reference.size();
-        const std::size_t allocation_bytes = decoded_bytes + height;
-        std::vector<std::byte> storage(
-            guard_bytes + allocation_bytes + guard_bytes, std::byte{0x5A});
-        pv::DecodeSurface surface{storage.data() + guard_bytes, allocation_bytes,
-                                  decoded_bytes, width, height, width * 4};
-        pv::CheckHr(pv::DecodePngSpng(mutable_png, surface,
-                                      ParsePlan(mutable_png), {}),
-                    "fast-path PNG decode for full pixel verification");
-        const auto mismatch = std::mismatch(reference.begin(), reference.end(),
-                                            surface.pixels);
-        if (mismatch.first != reference.end()) {
-            const std::size_t offset = static_cast<std::size_t>(
-                mismatch.first - reference.begin());
-            std::cerr << "PixelMismatch file=" << file->filename()
-                      << " offset=" << offset
-                      << " row=" << (offset / (width * 4ULL))
-                      << " byte_in_row=" << (offset % (width * 4ULL))
-                      << " expected="
-                      << static_cast<unsigned int>(
-                             static_cast<std::uint8_t>(*mismatch.first))
-                      << " actual="
-                      << static_cast<unsigned int>(
-                             static_cast<std::uint8_t>(*mismatch.second))
-                      << '\n';
-        }
-        Check(mismatch.first == reference.end(),
-              "fast-path pixels must exactly match reference libspng");
-        Check(std::all_of(storage.begin(), storage.begin() + guard_bytes,
-                          [](const std::byte value) {
-                              return value == std::byte{0x5A};
-                          }),
-              "real PNG leading canary");
-        Check(std::all_of(storage.end() - guard_bytes, storage.end(),
-                          [](const std::byte value) {
-                              return value == std::byte{0x5A};
-                          }),
-              "real PNG trailing canary");
-        ++verified;
-    }
-    Check(verified == requested, "not enough compatible PNGs for verification");
-    std::cout << "FullPixelVerify images=" << verified
-              << " reference=libspng result=exact canaries=intact\n";
-    return 0;
-}
-
-int BenchmarkDecode(const std::filesystem::path& path, const std::size_t workers,
-                    const pv::PngValidationOptions validation = {}) {
-    std::vector<std::filesystem::path> files;
-    for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
-        if (entry.is_regular_file() && entry.path().extension() == L".png") {
-            files.push_back(entry.path());
-        }
-    }
-    std::sort(files.begin(), files.end());
-    const auto first = std::find(files.begin(), files.end(), path);
-    Check(first != files.end() && static_cast<std::size_t>(files.end() - first) >= workers,
-          "not enough benchmark PNGs after starting image");
-
-    std::vector<std::vector<std::byte>> compressed_images;
-    compressed_images.reserve(workers);
-    const auto load_begin = std::chrono::steady_clock::now();
-    std::size_t compressed_bytes = 0;
-
-    std::vector<std::vector<std::byte>> pixel_storage;
-    std::vector<pv::DecodeSurface> surfaces;
-    std::vector<pv::PngResourcePlan> plans;
-    pixel_storage.reserve(workers);
-    surfaces.reserve(workers);
-    plans.reserve(workers);
-    for (std::size_t index = 0; index < workers; ++index) {
-        std::ifstream input(*(first + index), std::ios::binary | std::ios::ate);
-        Check(input.good(), "open benchmark PNG");
-        const auto length = input.tellg();
-        Check(length >= 24, "benchmark PNG is too small");
-        std::vector<std::byte> compressed(static_cast<std::size_t>(length));
-        input.seekg(0);
-        input.read(reinterpret_cast<char*>(compressed.data()), length);
-        Check(input.good(), "read benchmark PNG");
-        compressed_bytes += compressed.size();
-        const std::uint32_t width = ReadBigEndian(compressed.data() + 16);
-        const std::uint32_t height = ReadBigEndian(compressed.data() + 20);
-        const std::size_t decoded_bytes = static_cast<std::size_t>(width) * height * 4;
-        pixel_storage.emplace_back(decoded_bytes + height);
-        pv::DecodeSurface surface{pixel_storage.back().data(),
-                                  pixel_storage.back().size(), decoded_bytes,
-                                  width, height, width * 4};
-        plans.push_back(ParsePlan(compressed));
-        compressed_images.push_back(std::move(compressed));
-        surfaces.push_back(surface);
-    }
-    const auto load_elapsed = std::chrono::steady_clock::now() - load_begin;
-
-    std::latch ready(static_cast<std::ptrdiff_t>(workers));
-    std::latch start(1);
-    std::vector<HRESULT> results(workers, E_PENDING);
-    std::vector<double> worker_milliseconds(workers, 0.0);
-    std::vector<pv::PngDecodeTimings> decode_timings(workers);
-    std::vector<std::jthread> threads;
-    threads.reserve(workers);
-    for (std::size_t index = 0; index < workers; ++index) {
-        threads.emplace_back([&, index] {
-            ready.count_down();
-            start.wait();
-            const auto worker_begin = std::chrono::steady_clock::now();
-            results[index] = pv::DecodePngSpng(
-                compressed_images[index], surfaces[index], plans[index], validation,
-                nullptr, nullptr, &decode_timings[index]);
-            worker_milliseconds[index] = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - worker_begin).count();
-        });
-    }
-    ready.wait();
-    const auto begin = std::chrono::steady_clock::now();
-    start.count_down();
-    threads.clear();
-    const auto elapsed = std::chrono::steady_clock::now() - begin;
-    Check(std::all_of(results.begin(), results.end(),
-                      [](const HRESULT result) { return SUCCEEDED(result); }),
-          "PNG benchmark decode");
-    std::uint64_t sampled_digest = 1469598103934665603ULL;
-    for (const auto& surface : surfaces) {
-        for (std::size_t offset = 0; offset < surface.ByteSize(); offset += 4096) {
-            sampled_digest ^= static_cast<std::uint8_t>(surface.pixels[offset]);
-            sampled_digest *= 1099511628211ULL;
-        }
-        sampled_digest ^= static_cast<std::uint8_t>(
-            surface.pixels[surface.ByteSize() - 1]);
-        sampled_digest *= 1099511628211ULL;
-    }
-    std::sort(worker_milliseconds.begin(), worker_milliseconds.end());
-    const auto percentile = [&](const double value) {
-        const std::size_t rank = static_cast<std::size_t>(
-            std::ceil(value * static_cast<double>(worker_milliseconds.size())));
-        return worker_milliseconds[std::min(worker_milliseconds.size() - 1,
-                                            std::max<std::size_t>(1, rank) - 1)];
-    };
-    const double seconds = std::chrono::duration<double>(elapsed).count();
-    const double load_seconds = std::chrono::duration<double>(load_elapsed).count();
-    pv::PngDecodeTimings total_timings;
-    for (const auto& timing : decode_timings) {
-        total_timings.header_nanoseconds += timing.header_nanoseconds;
-        total_timings.chunk_scan_nanoseconds += timing.chunk_scan_nanoseconds;
-        total_timings.idat_compaction_nanoseconds += timing.idat_compaction_nanoseconds;
-        total_timings.deflate_nanoseconds += timing.deflate_nanoseconds;
-        total_timings.unfilter_nanoseconds += timing.unfilter_nanoseconds;
-        total_timings.fused_output_bytes += timing.fused_output_bytes;
-        total_timings.fused_rows += timing.fused_rows;
-        total_timings.deferred_rows += timing.deferred_rows;
-        for (std::size_t filter = 0; filter < total_timings.filter_rows.size(); ++filter) {
-            total_timings.filter_rows[filter] += timing.filter_rows[filter];
-        }
-    }
-    const auto average_ms = [workers](const std::uint64_t nanoseconds) {
-        return static_cast<double>(nanoseconds) / static_cast<double>(workers) / 1.0e6;
-    };
-    std::cout << "FileRead images=" << workers
-              << " elapsed_ms=" << (load_seconds * 1000.0)
-              << " mib_per_second=" << ((compressed_bytes / 1048576.0) / load_seconds)
-              << '\n';
-    std::cout << "LibdeflateDecode"
-              << " workers=" << workers << " images=" << workers
-              << " batch_elapsed_ms=" << (seconds * 1000.0)
-              << " images_per_second=" << (workers / seconds)
-              << " p50_worker_ms=" << percentile(0.50)
-              << " p95_worker_ms=" << percentile(0.95)
-              << " max_worker_ms=" << worker_milliseconds.back() << '\n';
-    std::cout << "DecodeStages"
-              << " header_ms=" << average_ms(total_timings.header_nanoseconds)
-              << " chunk_scan_ms=" << average_ms(total_timings.chunk_scan_nanoseconds)
-              << " idat_compaction_ms="
-              << average_ms(total_timings.idat_compaction_nanoseconds)
-              << " deflate_ms=" << average_ms(total_timings.deflate_nanoseconds)
-              << " unfilter_ms=" << average_ms(total_timings.unfilter_nanoseconds)
-              << " unfilter_inside_deflate=1"
-              << " fused_rows=" << total_timings.fused_rows
-              << " deferred_rows=" << total_timings.deferred_rows
-              << " fused_output_mib="
-              << (static_cast<double>(total_timings.fused_output_bytes) /
-                  1048576.0)
-              << " filter_none=" << total_timings.filter_rows[0]
-              << " filter_sub=" << total_timings.filter_rows[1]
-              << " filter_up=" << total_timings.filter_rows[2]
-              << " filter_average=" << total_timings.filter_rows[3]
-              << " filter_paeth=" << total_timings.filter_rows[4]
-              << " sampled_digest=" << sampled_digest << '\n';
-    return 0;
-}
-
-int BenchmarkGraphics(const HINSTANCE instance) {
-    constexpr wchar_t class_name[] = L"PhotoViewer.GraphicsBenchmark";
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = DefWindowProcW;
-    window_class.hInstance = instance;
-    window_class.lpszClassName = class_name;
-    Check(RegisterClassW(&window_class) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS,
-          "register graphics benchmark window");
-    HWND window = CreateWindowExW(0, class_name, L"graphics-benchmark",
-                                  WS_OVERLAPPEDWINDOW, 0, 0, 1920, 1080,
-                                  nullptr, nullptr, instance, nullptr);
-    Check(window != nullptr, "create graphics benchmark window");
-
-    pv::Graphics graphics;
-    graphics.InitializeDirect3D(window);
-    graphics.InitializeDirect2D();
-    graphics.InitializeSwapChain();
-    graphics.InitializeBackBufferTarget();
-    pv::DecodeStaging staging;
-    constexpr UINT width = 7680;
-    constexpr UINT height = 4320;
-    staging.Configure(TestRgba8Plan(width, height));
-    graphics.MapDecodeStaging(staging);
-    for (UINT row = 0; row < height; ++row) {
-        std::memset(staging.surface.pixels +
-                        static_cast<std::size_t>(row) * staging.surface.stride,
-                    0x80, static_cast<std::size_t>(width) * 4);
-    }
-    graphics.UnmapDecodeStaging(staging);
-    Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
-          "initial graphics benchmark frame credit");
-
-    constexpr std::size_t frames = 30;
-    const auto begin = std::chrono::steady_clock::now();
-    for (std::size_t index = 0; index < frames; ++index) {
-        pv::GpuImage image;
-        pv::UploadTicket ticket = graphics.SubmitUpload(index, 1, 0, staging, image);
-        graphics.ArmFence(ticket.fence_value);
-        Check(WaitForSingleObject(graphics.FenceEvent(), 5000) == WAIT_OBJECT_0,
-              "graphics benchmark upload fence");
-        graphics.FinishUpload(image);
-        (void)graphics.Draw(image);
-        if (index + 1 < frames) {
-            Check(WaitForSingleObject(graphics.FrameWaitableObject(), 5000) == WAIT_OBJECT_0,
-                  "graphics benchmark frame credit");
-        }
-    }
-    const double seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - begin).count();
-    std::cout << "Graphics8K frames=" << frames
-              << " elapsed_ms=" << (seconds * 1000.0)
-              << " frames_per_second=" << (frames / seconds) << '\n';
-    if (window) DestroyWindow(window);
-    return 0;
-}
-
 }  // namespace
 
-int wmain(const int argc, wchar_t** const argv) {
+int wmain() {
     try {
-        if (argc == 2 && std::wstring_view(argv[1]) == L"--graphics-benchmark") {
-            return BenchmarkGraphics(GetModuleHandleW(nullptr));
-        }
-        if (argc == 4 &&
-            (std::wstring_view(argv[1]) == L"--decode-benchmark" ||
-             std::wstring_view(argv[1]) == L"--decode-benchmark-fast")) {
-            const std::size_t workers = std::stoull(argv[3]);
-            Check(workers > 0 && workers <= 64, "invalid benchmark worker count");
-            const pv::PngValidationOptions validation =
-                std::wstring_view(argv[1]) == L"--decode-benchmark-fast"
-                    ? pv::PngValidationOptions{pv::PngChunkCrcMode::None, false}
-                    : pv::PngValidationOptions{};
-            return BenchmarkDecode(argv[2], workers, validation);
-        }
-        if (argc == 4 && std::wstring_view(argv[1]) == L"--verify-full-pixels") {
-            const std::size_t images = std::stoull(argv[3]);
-            Check(images > 0 && images <= 256, "invalid full pixel verification count");
-            return VerifyFullPixels(argv[2], images);
-        }
         const auto run = [](const char* const name, auto&& test) {
             std::cerr << "RUN: " << name << '\n';
             test();
         };
-        run("spng", TestSpng);
+        run("spng decode and fallback", TestSpngDecodeAndFallback);
         run("mixed filters and bounds", TestMixedFiltersAndBounds);
         run("Paeth wavefront differential", TestPaethWavefrontDifferential);
         run("malformed deflate and output bounds",
@@ -1336,9 +1003,16 @@ int wmain(const int argc, wchar_t** const argv) {
         run("rejected work releases input", TestRejectedWorkReleasesInput);
         run("presentation lifecycle", TestPresentationControllerLifecycle);
         run("pipeline initial failure", TestPipelineInitialFailureState);
-        run("managed staging upload", TestManagedStagingUpload);
-        run("graphics", [] { TestGraphics(GetModuleHandleW(nullptr)); });
-        std::cout << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, malformed input and guarded output bounds, rejected-work input release, libspng fallback, managed D3D11 staging upload/fence, Direct2D draw, DXGI present\n";
+        run("staging texture upload retains copied pixels",
+            TestStagingTextureUploadRetainsCopiedPixels);
+        run("graphics upload and presentation", [] {
+            TestGraphicsUploadAndPresentation(GetModuleHandleW(nullptr));
+        });
+        std::cout
+            << "PASS: four-worker fused DEFLATE/unfilter, mixed PNG filters, "
+               "malformed input and guarded output bounds, rejected-work input "
+               "release, libspng fallback, D3D11 staging texture upload "
+               "retention, graphics upload fence, Direct2D draw, DXGI present\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

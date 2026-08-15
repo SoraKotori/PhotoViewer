@@ -102,13 +102,18 @@ Config ParseConfig() {
                 throw std::invalid_argument("invalid validation timeout");
             }
             config.validation_timeout_ms = static_cast<std::uint32_t>(*value);
-        } else if (argument.starts_with(L"--validation-warmup-ms=")) {
+        } else if (argument.starts_with(
+                       L"--validation-navigation-start-delay-ms=")) {
             const auto value = ParsePositive(argument.substr(
-                std::wstring_view(L"--validation-warmup-ms=").size()));
+                std::wstring_view(
+                    L"--validation-navigation-start-delay-ms=")
+                    .size()));
             if (!value || *value > 60000) {
-                throw std::invalid_argument("invalid validation warmup");
+                throw std::invalid_argument(
+                    "invalid validation navigation start delay");
             }
-            config.validation_warmup_ms = static_cast<std::uint32_t>(*value);
+            config.validation_navigation_start_delay_ms =
+                static_cast<std::uint32_t>(*value);
         } else if (argument.starts_with(L"--validation-navigation-interval-ms=")) {
             const auto value = ParsePositive(argument.substr(
                 std::wstring_view(L"--validation-navigation-interval-ms=").size()));

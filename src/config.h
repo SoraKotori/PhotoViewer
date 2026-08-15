@@ -29,7 +29,7 @@ struct Config {
     std::filesystem::path validation_file_list;
     std::filesystem::path validation_report;
     std::uint32_t validation_timeout_ms = 10000;
-    std::uint32_t validation_warmup_ms = 0;
+    std::uint32_t validation_navigation_start_delay_ms = 0;
     std::uint32_t validation_navigation_interval_ms = 0;
 
     [[nodiscard]] std::size_t GpuSlotCount() const noexcept {
