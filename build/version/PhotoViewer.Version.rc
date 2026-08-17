@@ -1,0 +1,50 @@
+#include <windows.h>
+#include "PhotoViewer.Version.generated.h"
+
+#if PV_IS_PRERELEASE
+#define PV_PRERELEASE_FLAG VS_FF_PRERELEASE
+#else
+#define PV_PRERELEASE_FLAG 0
+#endif
+
+#if PV_IS_PRIVATE_BUILD
+#define PV_PRIVATE_BUILD_FLAG VS_FF_PRIVATEBUILD
+#else
+#define PV_PRIVATE_BUILD_FLAG 0
+#endif
+
+#if PV_IS_DEBUG
+#define PV_DEBUG_FLAG VS_FF_DEBUG
+#else
+#define PV_DEBUG_FLAG 0
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION PV_VERSION_QUAD
+ PRODUCTVERSION PV_VERSION_QUAD
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS (PV_PRERELEASE_FLAG | PV_PRIVATE_BUILD_FLAG | PV_DEBUG_FLAG)
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "PhotoViewer\0"
+            VALUE "FileVersion", PV_VERSION_TEXT
+            VALUE "InternalName", "PhotoViewer\0"
+            VALUE "OriginalFilename", "PhotoViewer.exe\0"
+            VALUE "ProductName", "PhotoViewer\0"
+            VALUE "ProductVersion", PV_VERSION_TEXT
+#if PV_IS_PRIVATE_BUILD
+            VALUE "PrivateBuild", PV_PRIVATE_BUILD_TEXT
+#endif
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

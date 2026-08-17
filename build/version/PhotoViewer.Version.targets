@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="ValidatePhotoViewerVersion" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(PVGitTag)' != '' and '$(PVTagIsValid)' != 'True'"
+           Text="Unsupported PhotoViewer release tag '$(PVGitTag)'. Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-(alpha|beta|rc).NUMBER without leading zeroes." />
+    <Error Condition="'$(PVTagIsValid)' == 'True' and '$(PVVersionMajor)' &gt; '65535'"
+           Text="PhotoViewer major version must be between 0 and 65535." />
+    <Error Condition="'$(PVTagIsValid)' == 'True' and '$(PVVersionMinor)' &gt; '65535'"
+           Text="PhotoViewer minor version must be between 0 and 65535." />
+    <Error Condition="'$(PVTagIsValid)' == 'True' and '$(PVVersionPatch)' &gt; '65535'"
+           Text="PhotoViewer patch version must be between 0 and 65535." />
+    <Error Condition="'$(PVTagIsValid)' == 'True' and '$(PVPrereleaseNumber)' != '' and '$(PVPrereleaseNumber)' &gt; '65535'"
+           Text="PhotoViewer prerelease sequence must be between 0 and 65535." />
+    <Error Condition="'$(PVGitTag)' != '' and '$(PVCommitIsValid)' != 'True'"
+           Text="A tagged PhotoViewer build requires PVGitCommit to contain a hexadecimal Git object ID." />
+    <Error Condition="'$(PVGitTag)' != '' and '$(Configuration)' != 'Release'"
+           Text="A tagged PhotoViewer build must use the Release configuration." />
+    <Error Condition="'$(PVGitTag)' != '' and '$(Platform)' != 'x64'"
+           Text="A tagged PhotoViewer build must use the x64 platform." />
+  </Target>
+
+  <Target Name="GeneratePhotoViewerVersionHeader"
+          BeforeTargets="ResourceCompile"
+          DependsOnTargets="ValidatePhotoViewerVersion">
+    <MakeDir Directories="$(PVVersionHeaderDirectory)" />
+    <ItemGroup>
+      <_PVVersionHeaderLine Include="#pragma once" />
+      <_PVVersionHeaderLine Include="#define PV_VERSION_QUAD $(PVVersionQuad)" />
+      <_PVVersionHeaderLine Include="#define PV_VERSION_TEXT &quot;$(PVVersionText)\0&quot;" />
+      <_PVVersionHeaderLine Include="#define PV_IS_PRERELEASE $(PVIsPrerelease)" />
+      <_PVVersionHeaderLine Include="#define PV_IS_PRIVATE_BUILD $(PVIsPrivateBuild)" />
+      <_PVVersionHeaderLine Include="#define PV_IS_DEBUG $(PVIsDebug)" />
+      <_PVVersionHeaderLine Include="#define PV_PRIVATE_BUILD_TEXT &quot;$(PVGitCommit)\0&quot;" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(PVVersionHeaderPath)"
+                      Lines="@(_PVVersionHeaderLine)"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true"
+                      Encoding="UTF-8" />
+  </Target>
+</Project>

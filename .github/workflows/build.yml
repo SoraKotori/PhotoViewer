@@ -1,0 +1,42 @@
+name: Build PhotoViewer
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Release x64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+        with:
+          msbuild-architecture: x64
+
+      - name: Build PhotoViewer
+        shell: cmd
+        env:
+          PVGitCommit: ${{ github.sha }}
+        run: >-
+          msbuild PhotoViewer.vcxproj /m /t:Build
+          /p:Configuration=Release /p:Platform=x64 /v:minimal
+
+      - name: Upload PhotoViewer executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: out/build/x64/Release/app/PhotoViewer.exe
+          archive: false
+          if-no-files-found: error

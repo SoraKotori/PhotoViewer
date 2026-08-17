@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PVGitCommit Condition="'$(PVGitCommit)' == ''">unknown</PVGitCommit>
+    <PVTagPattern>^v(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})(?:-(alpha|beta|rc)\.(0|[1-9][0-9]{0,4}))?$</PVTagPattern>
+    <PVTagIsValid Condition="'$(PVGitTag)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(PVGitTag)', '$(PVTagPattern)'))</PVTagIsValid>
+    <PVTagIsValid Condition="'$(PVTagIsValid)' == ''">False</PVTagIsValid>
+    <PVCommitIsValid>$([System.Text.RegularExpressions.Regex]::IsMatch('$(PVGitCommit)', '^[0-9a-fA-F]{7,64}$'))</PVCommitIsValid>
+
+    <PVVersionMajor Condition="'$(PVTagIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitTag)', '$(PVTagPattern)', '$1'))</PVVersionMajor>
+    <PVVersionMinor Condition="'$(PVTagIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitTag)', '$(PVTagPattern)', '$2'))</PVVersionMinor>
+    <PVVersionPatch Condition="'$(PVTagIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitTag)', '$(PVTagPattern)', '$3'))</PVVersionPatch>
+    <PVPrereleaseLabel Condition="'$(PVTagIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitTag)', '$(PVTagPattern)', '$4'))</PVPrereleaseLabel>
+    <PVPrereleaseNumber Condition="'$(PVTagIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitTag)', '$(PVTagPattern)', '$5'))</PVPrereleaseNumber>
+
+    <PVIsPrerelease Condition="'$(PVGitTag)' == '' or '$(PVPrereleaseLabel)' != ''">1</PVIsPrerelease>
+    <PVIsPrerelease Condition="'$(PVIsPrerelease)' == ''">0</PVIsPrerelease>
+    <PVIsPrivateBuild Condition="'$(PVGitTag)' == ''">1</PVIsPrivateBuild>
+    <PVIsPrivateBuild Condition="'$(PVIsPrivateBuild)' == ''">0</PVIsPrivateBuild>
+    <PVIsDebug Condition="'$(Configuration)' == 'Debug'">1</PVIsDebug>
+    <PVIsDebug Condition="'$(PVIsDebug)' == ''">0</PVIsDebug>
+
+    <PVShortCommit Condition="'$(PVGitCommit)' != 'unknown'">$([System.Text.RegularExpressions.Regex]::Replace('$(PVGitCommit)', '^(.{12}).*$', '$1'))</PVShortCommit>
+    <PVShortCommit Condition="'$(PVShortCommit)' == ''">unknown</PVShortCommit>
+    <PVNumericVersion>0.0.0.0</PVNumericVersion>
+    <PVVersionQuad>0,0,0,0</PVVersionQuad>
+    <PVVersionText Condition="'$(PVGitCommit)' == 'unknown'">0.0.0-dev+unknown</PVVersionText>
+    <PVVersionText Condition="'$(PVGitCommit)' != 'unknown'">0.0.0-dev+g$(PVShortCommit)</PVVersionText>
+    <PVNumericVersion Condition="'$(PVTagIsValid)' == 'True'">$(PVVersionMajor).$(PVVersionMinor).$(PVVersionPatch).0</PVNumericVersion>
+    <PVVersionQuad Condition="'$(PVTagIsValid)' == 'True'">$(PVVersionMajor),$(PVVersionMinor),$(PVVersionPatch),0</PVVersionQuad>
+    <PVVersionText Condition="'$(PVTagIsValid)' == 'True' and '$(PVPrereleaseLabel)' == ''">$(PVVersionMajor).$(PVVersionMinor).$(PVVersionPatch)</PVVersionText>
+    <PVVersionText Condition="'$(PVTagIsValid)' == 'True' and '$(PVPrereleaseLabel)' != ''">$(PVVersionMajor).$(PVVersionMinor).$(PVVersionPatch)-$(PVPrereleaseLabel).$(PVPrereleaseNumber)</PVVersionText>
+    <PVVersionHeaderDirectory>$(IntDir)generated\</PVVersionHeaderDirectory>
+    <PVVersionHeaderPath>$(PVVersionHeaderDirectory)PhotoViewer.Version.generated.h</PVVersionHeaderPath>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(PVVersionHeaderDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Manifest>
+      <AssemblyIdentity>PhotoViewer,processorArchitecture=amd64,version=$(PVNumericVersion),type=win32</AssemblyIdentity>
+    </Manifest>
+  </ItemDefinitionGroup>
+</Project>
