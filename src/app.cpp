@@ -3,9 +3,51 @@
 #include "win32_support.h"
 #include "processor_topology.h"
 
+#include <shobjidl.h>
+
 #include <array>
 
 namespace pv {
+namespace {
+
+std::optional<std::filesystem::path> SelectInitialImage() {
+    ComPtr<IFileOpenDialog> dialog;
+    CheckHr(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                             CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)),
+            "CoCreateInstance(CLSID_FileOpenDialog)");
+
+    constexpr COMDLG_FILTERSPEC filters[] = {
+        {L"PNG images (*.png)", L"*.png"},
+    };
+    CheckHr(dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters),
+            "IFileOpenDialog::SetFileTypes");
+    CheckHr(dialog->SetFileTypeIndex(1),
+            "IFileOpenDialog::SetFileTypeIndex");
+    CheckHr(dialog->SetTitle(L"Open PNG image"),
+            "IFileOpenDialog::SetTitle");
+
+    FILEOPENDIALOGOPTIONS options{};
+    CheckHr(dialog->GetOptions(&options), "IFileOpenDialog::GetOptions");
+    options = static_cast<FILEOPENDIALOGOPTIONS>(
+        options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST |
+        FOS_PATHMUSTEXIST);
+    CheckHr(dialog->SetOptions(options), "IFileOpenDialog::SetOptions");
+
+    const HRESULT shown = dialog->Show(nullptr);
+    if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return std::nullopt;
+    CheckHr(shown, "IFileOpenDialog::Show");
+
+    ComPtr<IShellItem> item;
+    CheckHr(dialog->GetResult(&item), "IFileOpenDialog::GetResult");
+    PWSTR raw_path = nullptr;
+    CheckHr(item->GetDisplayName(SIGDN_FILESYSPATH, &raw_path),
+            "IShellItem::GetDisplayName");
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> path(
+        raw_path, &CoTaskMemFree);
+    return std::filesystem::path(path.get());
+}
+
+}  // namespace
 
 App::ComApartment::ComApartment() {
     CheckHr(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED), "CoInitializeEx");
@@ -25,12 +67,17 @@ App::~App() {
 }
 
 int App::Run(const HINSTANCE instance, const int show_command) {
-    if (!config_.initial_image.empty()) OpenInitialImage();
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
         GetLastError() != ERROR_ACCESS_DENIED) {
         ThrowLastError("SetProcessDpiAwarenessContext");
     }
     com_apartment_.emplace();
+    if (config_.prompt_for_initial_image) {
+        const auto selected = SelectInitialImage();
+        if (!selected) return 0;
+        config_.initial_image = *selected;
+    }
+    if (!config_.initial_image.empty()) OpenInitialImage();
     window_.Create(instance, &App::WindowProcedure, this);
     validation_.MarkWindowReady();
     if (config_.worker_count == 0) config_.worker_count = DefaultWorkerCount();

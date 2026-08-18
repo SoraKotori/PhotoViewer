@@ -12,6 +12,7 @@ namespace pv {
 
 struct Config {
     std::filesystem::path initial_image;
+    bool prompt_for_initial_image = false;
     std::size_t staging_cache_bytes = std::numeric_limits<std::size_t>::max();
     std::size_t gpu_cache_bytes = std::numeric_limits<std::size_t>::max();
     std::size_t compressed_budget_bytes = std::numeric_limits<std::size_t>::max();

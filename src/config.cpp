@@ -59,6 +59,7 @@ Config ParseConfig() {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &count);
     if (!argv) ThrowLastError("CommandLineToArgvW");
     const std::unique_ptr<wchar_t*, decltype(&LocalFree)> holder(argv, &LocalFree);
+    config.prompt_for_initial_image = count == 1;
 
     for (int index = 1; index < count; ++index) {
         const std::wstring_view argument(argv[index]);
